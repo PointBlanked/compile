@@ -1,7 +1,7 @@
 // swift-tools-version: 5.10
-// Owner: Maxwell (infrastructure). One target per co-founder so nobody edits
-// another person's target, plus a small shared Contracts target that every
-// engine depends on and nobody else imports across.
+// Owner: Maxwell (infrastructure). Targets split by engine; ownership between the two
+// co-founders is in .github/CODEOWNERS. Engines only meet through the shared
+// Contracts target, so two people never edit the same file.
 import PackageDescription
 
 let package = Package(
@@ -25,12 +25,12 @@ let package = Package(
         ),
     ],
     targets: [
-        // Shared types and protocols. Changes here need review from all four owners.
+        // Shared types and protocols. Changes here need review from both owners.
         .target(
             name: "EchoGuideContracts",
             path: "EchoGuide/Core/Contracts"
         ),
-        // James: camera feed, frame delta, local vision, digital fence.
+        // Camera, frame delta, local vision (Maxwell); digital fence (Bryan).
         .target(
             name: "EchoGuideVision",
             dependencies: ["EchoGuideContracts"],
@@ -38,7 +38,7 @@ let package = Package(
             exclude: ["Contracts", "Haptics", "Depth", "Audio", "Automation", "Cognitive", "Plugins", "Router"],
             sources: ["Camera", "Vision", "Fence"]
         ),
-        // Lily: haptics, LiDAR depth, spatial audio.
+        // Haptics, spatial audio (Bryan); LiDAR depth (Maxwell).
         .target(
             name: "EchoGuideSpatial",
             dependencies: ["EchoGuideContracts"],

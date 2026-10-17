@@ -66,7 +66,7 @@ struct StubProvider: ReasoningProvider {
     }
 }
 
-// MARK: - James: frame delta
+// MARK: - Maxwell: frame delta
 
 @Suite struct FrameDeltaTests {
     @Test func staticSceneIsSkipped() {
@@ -128,7 +128,7 @@ struct StubProvider: ReasoningProvider {
     }
 }
 
-// MARK: - James: vision geometry + digital fence
+// MARK: - Maxwell + Bryan: vision geometry + digital fence
 
 @Suite struct VisionAndFenceTests {
     @Test func visionBoxFlipsToTopLeft() {
@@ -177,7 +177,7 @@ struct StubProvider: ReasoningProvider {
     }
 }
 
-// MARK: - Lily: haptics, depth, audio math
+// MARK: - Bryan + Maxwell: haptics, depth, audio math
 
 @Suite struct SpatialTests {
     @Test func alignedMeansConfirm() {

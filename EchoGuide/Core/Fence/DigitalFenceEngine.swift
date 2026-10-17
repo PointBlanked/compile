@@ -1,4 +1,4 @@
-// Owner: James. The digital fence, in two layers:
+// Owner: Bryan. The digital fence, in two layers:
 //
 //  1. Spatial fence: hazard zones the camera can see (hob, oven door, stair
 //     edge, knife block). Zones come from a detected label ("oven") or a fixed

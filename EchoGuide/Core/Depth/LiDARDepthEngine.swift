@@ -1,8 +1,8 @@
-// Owner: Lily. 60 FPS ARKit smoothedSceneDepth. Keeps only the latest depth
+// Owner: Maxwell. 60 FPS ARKit smoothedSceneDepth. Keeps only the latest depth
 // map (256x192 Float32 metres + confidence) and answers point queries with a
 // confidence-filtered 3x3 median, so one noisy pixel never moves a cue.
 // While running, ARKit owns the back camera: the captured image of every
-// ARFrame is forwarded to `onFrame` so James's frame-delta path still runs.
+// ARFrame is forwarded to `onFrame` so the frame-delta path still runs.
 
 import Foundation
 import EchoGuideContracts

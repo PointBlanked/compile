@@ -1,4 +1,4 @@
-// Owner: Lily. Turns "target minus fingertip" into transient CoreHaptics
+// Owner: Bryan. Turns "target minus fingertip" into transient CoreHaptics
 // pulses, like a parking sensor in the hand:
 //   * pulse rate and intensity rise as the finger closes on the target
 //   * sharpness encodes vertical: crisp = move up, dull = move down

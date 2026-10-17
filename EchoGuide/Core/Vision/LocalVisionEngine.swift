@@ -1,4 +1,4 @@
-// Owner: James. On-device inference for frames FrameDeltaEngine let through:
+// Owner: Maxwell. On-device inference for frames FrameDeltaEngine let through:
 //   * YOLOv8n / YOLO11n INT8 Core ML (exported with nms=True) on the Neural Engine
 //   * VNDetectHumanHandPoseRequest for the index fingertip (target alignment)
 //   * VNRecognizeTextRequest, .fast level, offline (only on OCR frames)

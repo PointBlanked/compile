@@ -1,5 +1,5 @@
 // Shared vocabulary for every engine. Owned jointly: a change here needs a
-// review from all four owners (see .github/CODEOWNERS).
+// review from both owners (see .github/CODEOWNERS).
 //
 // Coordinate convention, used everywhere in the pipeline: normalized space of
 // the *upright portrait* image the user is holding up, origin top-left, x to

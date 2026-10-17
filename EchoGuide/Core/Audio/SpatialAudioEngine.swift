@@ -1,4 +1,4 @@
-// Owner: Lily. Directional earcons through AVAudioEngine's environment node
+// Owner: Bryan. Directional earcons through AVAudioEngine's environment node
 // (HRTF on headphones, equal-power pan on the speaker) plus on-device speech.
 // Everything here works in Airplane Mode; cloud TTS is an optional upgrade
 // layered on top, never a dependency.

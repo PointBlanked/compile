@@ -15,21 +15,21 @@ camera ─► FrameDeltaEngine ─► LocalVisionEngine ─► DigitalFence ─�
 
 ## Team and ownership
 
-Each person owns one SwiftPM target. Code crosses targets only through `EchoGuideContracts`, so two people never edit the same file. Ownership is enforced in `.github/CODEOWNERS`.
+Two owners. Engines meet only through `EchoGuideContracts`, so the two never edit the same file. Ownership is enforced in `.github/CODEOWNERS`.
 
-| Owner | Role | Target | Paths | Files |
-|---|---|---|---|---|
-| James | ML & edge vision | `EchoGuideVision` | `EchoGuide/Core/Camera/`, `Vision/`, `Fence/` | `FrameDeltaEngine`, `CameraFeed`, `LocalVisionEngine`, `DigitalFenceEngine` |
-| Lily | Haptics, LiDAR, audio | `EchoGuideSpatial` | `EchoGuide/Core/Haptics/`, `Depth/`, `Audio/` | `SpatialHapticEngine`, `LiDARDepthEngine`, `SpatialAudioEngine` |
-| Bryan | Accessibility & cognitive UX | `EchoGuideAutomation` | `EchoGuide/Core/Automation/`, `Cognitive/`, `EchoGuide/UI/` | `AutomationEngine`, `CognitiveTaskIsolation`, `GuidanceView` |
-| Maxwell | Infra, router, plugins | `EchoGuideInfra` | `EchoGuide/Core/Plugins/`, `Router/`, `.github/`, `EchoGuideTests/`, `Package.swift`, `plugins/` | `PluginRegistry`, `CloudReasoningRouter`, CI, tests |
-| All four | Shared contracts | `EchoGuideContracts` | `EchoGuide/Core/Contracts/` | `Contracts.swift` (needs four approvals) |
+| Owner | Area | Paths | Files |
+|---|---|---|---|
+| Maxwell | Perception + infrastructure: what the phone senses, and the plumbing | `EchoGuide/Core/Camera/`, `Vision/`, `Depth/`, `Plugins/`, `Router/`, `.github/`, `EchoGuideTests/`, `Package.swift`, `plugins/` | `FrameDeltaEngine`, `CameraFeed`, `LocalVisionEngine`, `LiDARDepthEngine`, `PluginRegistry`, `CloudReasoningRouter`, CI, tests |
+| Bryan | Experience + safety: everything the user feels, hears and sees | `EchoGuide/Core/Fence/`, `Haptics/`, `Audio/`, `Automation/`, `Cognitive/`, `EchoGuide/UI/` | `DigitalFenceEngine`, `SpatialHapticEngine`, `SpatialAudioEngine`, `AutomationEngine`, `CognitiveTaskIsolation`, `GuidanceView` |
+| Both | Shared contracts | `EchoGuide/Core/Contracts/` | `Contracts.swift` (needs both approvals) |
+
+The split follows the pipeline: Maxwell owns everything up to "a detection with a confidence and a depth"; Bryan owns everything from "what one step does the user take, and how do they feel it".
 
 ### Branches
 
-`feature/james-vision`, `feature/james-fence`, `feature/lily-haptics`, `feature/bryan-automation`, `feature/maxwell-plugins`. Each branch opens a PR into `main`. CI must pass and the owner of every path the PR touches must approve.
+`feature/maxwell-vision`, `feature/maxwell-plugins`, `feature/bryan-automation`, `feature/bryan-haptics`, `feature/bryan-fence`. Each branch opens a PR into `main`. CI must pass and the owner of every path the PR touches must approve.
 
-## Digital fence (James)
+## Digital fence (Bryan)
 
 There are two layers. Each one only reports a `FenceEvent`, and `AutomationEngine` decides how the user hears or feels it.
 

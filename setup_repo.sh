@@ -4,29 +4,35 @@
 set -euo pipefail
 
 TARGET="${1:-auto-vision-audio-engine}"
-REMOTE_URL="${REMOTE_URL:-https://github.com/bbyycc1/compile.git}"
+REMOTE_URL="${REMOTE_URL:-https://github.com/PointBlanked/compile.git}"
 
 mkdir -p .github .github/workflows EchoGuide/Core/Audio EchoGuide/Core/Automation EchoGuide/Core/Camera EchoGuide/Core/Cognitive EchoGuide/Core/Contracts EchoGuide/Core/Depth EchoGuide/Core/Fence EchoGuide/Core/Haptics EchoGuide/Core/Plugins EchoGuide/Core/Router EchoGuide/Core/Vision EchoGuide/UI EchoGuideTests plugins
 
 cat > '.github/CODEOWNERS' <<'EOF_AVAE'
-# Each path has one owner. PRs touching a path need that owner's review.
-/EchoGuide/Core/Camera/      @james
-/EchoGuide/Core/Vision/      @james
-/EchoGuide/Core/Fence/       @james
-/EchoGuide/Core/Haptics/     @lily
-/EchoGuide/Core/Depth/       @lily
-/EchoGuide/Core/Audio/       @lily
-/EchoGuide/Core/Automation/  @bryan
-/EchoGuide/Core/Cognitive/   @bryan
-/EchoGuide/UI/               @bryan
+# Two owners. PRs touching a path need that owner's review.
+# Replace @maxwell / @bryan with real GitHub usernames.
+
+# Maxwell: perception + infrastructure
+/EchoGuide/Core/Camera/      @maxwell
+/EchoGuide/Core/Vision/      @maxwell
+/EchoGuide/Core/Depth/       @maxwell
 /EchoGuide/Core/Plugins/     @maxwell
 /EchoGuide/Core/Router/      @maxwell
 /EchoGuideTests/             @maxwell
 /.github/                    @maxwell
 /Package.swift               @maxwell
 /plugins/                    @maxwell
-# Shared contracts: everyone signs off.
-/EchoGuide/Core/Contracts/   @james @lily @bryan @maxwell
+
+# Bryan: everything the user feels, hears and sees
+/EchoGuide/Core/Fence/       @bryan
+/EchoGuide/Core/Haptics/     @bryan
+/EchoGuide/Core/Audio/       @bryan
+/EchoGuide/Core/Automation/  @bryan
+/EchoGuide/Core/Cognitive/   @bryan
+/EchoGuide/UI/               @bryan
+
+# Shared contracts: both sign off.
+/EchoGuide/Core/Contracts/   @maxwell @bryan
 EOF_AVAE
 
 cat > '.github/workflows/swift-ci.yml' <<'EOF_AVAE'
@@ -89,7 +95,7 @@ __pycache__/
 EOF_AVAE
 
 cat > 'EchoGuide/Core/Audio/SpatialAudioEngine.swift' <<'EOF_AVAE'
-// Owner: Lily. Directional earcons through AVAudioEngine's environment node
+// Owner: Bryan. Directional earcons through AVAudioEngine's environment node
 // (HRTF on headphones, equal-power pan on the speaker) plus on-device speech.
 // Everything here works in Airplane Mode; cloud TTS is an optional upgrade
 // layered on top, never a dependency.
@@ -446,7 +452,7 @@ public actor AutomationEngine {
 EOF_AVAE
 
 cat > 'EchoGuide/Core/Camera/CameraFeed.swift' <<'EOF_AVAE'
-// Owner: James. Continuous back-camera feed for devices or modes without
+// Owner: Maxwell. Continuous back-camera feed for devices or modes without
 // LiDAR. When LiDARDepthEngine is running, ARKit owns the camera and its
 // ARFrame.capturedImage is fed into the same handler instead; iOS will not
 // run AVCaptureSession and ARSession on the back camera at the same time.
@@ -510,7 +516,7 @@ public final class CameraFeed: NSObject, AVCaptureVideoDataOutputSampleBufferDel
 EOF_AVAE
 
 cat > 'EchoGuide/Core/Camera/FrameDeltaEngine.swift' <<'EOF_AVAE'
-// Owner: James. Decides, per camera frame, whether full inference is worth
+// Owner: Maxwell. Decides, per camera frame, whether full inference is worth
 // running. Samples the luma plane on a coarse grid (768 points by default),
 // compares to the previous grid and only fires on real change. Sub-millisecond
 // per frame; that is what lets the expensive models sleep most of the time.
@@ -841,7 +847,7 @@ EOF_AVAE
 
 cat > 'EchoGuide/Core/Contracts/Contracts.swift' <<'EOF_AVAE'
 // Shared vocabulary for every engine. Owned jointly: a change here needs a
-// review from all four owners (see .github/CODEOWNERS).
+// review from both owners (see .github/CODEOWNERS).
 //
 // Coordinate convention, used everywhere in the pipeline: normalized space of
 // the *upright portrait* image the user is holding up, origin top-left, x to
@@ -1145,11 +1151,11 @@ public struct CameraFrame: @unchecked Sendable {
 EOF_AVAE
 
 cat > 'EchoGuide/Core/Depth/LiDARDepthEngine.swift' <<'EOF_AVAE'
-// Owner: Lily. 60 FPS ARKit smoothedSceneDepth. Keeps only the latest depth
+// Owner: Maxwell. 60 FPS ARKit smoothedSceneDepth. Keeps only the latest depth
 // map (256x192 Float32 metres + confidence) and answers point queries with a
 // confidence-filtered 3x3 median, so one noisy pixel never moves a cue.
 // While running, ARKit owns the back camera: the captured image of every
-// ARFrame is forwarded to `onFrame` so James's frame-delta path still runs.
+// ARFrame is forwarded to `onFrame` so the frame-delta path still runs.
 
 import Foundation
 import EchoGuideContracts
@@ -1261,7 +1267,7 @@ public final class LiDARDepthEngine: NSObject, ARSessionDelegate, DepthProviding
 EOF_AVAE
 
 cat > 'EchoGuide/Core/Fence/DigitalFenceEngine.swift' <<'EOF_AVAE'
-// Owner: James. The digital fence, in two layers:
+// Owner: Bryan. The digital fence, in two layers:
 //
 //  1. Spatial fence: hazard zones the camera can see (hob, oven door, stair
 //     edge, knife block). Zones come from a detected label ("oven") or a fixed
@@ -1473,7 +1479,7 @@ public final class LocationFenceMonitor: NSObject, CLLocationManagerDelegate, @u
 EOF_AVAE
 
 cat > 'EchoGuide/Core/Haptics/SpatialHapticEngine.swift' <<'EOF_AVAE'
-// Owner: Lily. Turns "target minus fingertip" into transient CoreHaptics
+// Owner: Bryan. Turns "target minus fingertip" into transient CoreHaptics
 // pulses, like a parking sensor in the hand:
 //   * pulse rate and intensity rise as the finger closes on the target
 //   * sharpness encodes vertical: crisp = move up, dull = move down
@@ -2164,7 +2170,7 @@ public final class PathConnectivity: Connectivity, @unchecked Sendable {
 EOF_AVAE
 
 cat > 'EchoGuide/Core/Vision/LocalVisionEngine.swift' <<'EOF_AVAE'
-// Owner: James. On-device inference for frames FrameDeltaEngine let through:
+// Owner: Maxwell. On-device inference for frames FrameDeltaEngine let through:
 //   * YOLOv8n / YOLO11n INT8 Core ML (exported with nms=True) on the Neural Engine
 //   * VNDetectHumanHandPoseRequest for the index fingertip (target alignment)
 //   * VNRecognizeTextRequest, .fast level, offline (only on OCR frames)
@@ -2441,7 +2447,7 @@ struct StubProvider: ReasoningProvider {
     }
 }
 
-// MARK: - James: frame delta
+// MARK: - Maxwell: frame delta
 
 @Suite struct FrameDeltaTests {
     @Test func staticSceneIsSkipped() {
@@ -2503,7 +2509,7 @@ struct StubProvider: ReasoningProvider {
     }
 }
 
-// MARK: - James: vision geometry + digital fence
+// MARK: - Maxwell + Bryan: vision geometry + digital fence
 
 @Suite struct VisionAndFenceTests {
     @Test func visionBoxFlipsToTopLeft() {
@@ -2552,7 +2558,7 @@ struct StubProvider: ReasoningProvider {
     }
 }
 
-// MARK: - Lily: haptics, depth, audio math
+// MARK: - Bryan + Maxwell: haptics, depth, audio math
 
 @Suite struct SpatialTests {
     @Test func alignedMeansConfirm() {
@@ -2794,9 +2800,9 @@ EOF_AVAE
 
 cat > 'Package.swift' <<'EOF_AVAE'
 // swift-tools-version: 5.10
-// Owner: Maxwell (infrastructure). One target per co-founder so nobody edits
-// another person's target, plus a small shared Contracts target that every
-// engine depends on and nobody else imports across.
+// Owner: Maxwell (infrastructure). Targets split by engine; ownership between the two
+// co-founders is in .github/CODEOWNERS. Engines only meet through the shared
+// Contracts target, so two people never edit the same file.
 import PackageDescription
 
 let package = Package(
@@ -2820,12 +2826,12 @@ let package = Package(
         ),
     ],
     targets: [
-        // Shared types and protocols. Changes here need review from all four owners.
+        // Shared types and protocols. Changes here need review from both owners.
         .target(
             name: "EchoGuideContracts",
             path: "EchoGuide/Core/Contracts"
         ),
-        // James: camera feed, frame delta, local vision, digital fence.
+        // Camera, frame delta, local vision (Maxwell); digital fence (Bryan).
         .target(
             name: "EchoGuideVision",
             dependencies: ["EchoGuideContracts"],
@@ -2833,7 +2839,7 @@ let package = Package(
             exclude: ["Contracts", "Haptics", "Depth", "Audio", "Automation", "Cognitive", "Plugins", "Router"],
             sources: ["Camera", "Vision", "Fence"]
         ),
-        // Lily: haptics, LiDAR depth, spatial audio.
+        // Haptics, spatial audio (Bryan); LiDAR depth (Maxwell).
         .target(
             name: "EchoGuideSpatial",
             dependencies: ["EchoGuideContracts"],
@@ -2890,21 +2896,21 @@ camera ─► FrameDeltaEngine ─► LocalVisionEngine ─► DigitalFence ─�
 
 ## Team and ownership
 
-Each person owns one SwiftPM target. Code crosses targets only through `EchoGuideContracts`, so two people never edit the same file. Ownership is enforced in `.github/CODEOWNERS`.
+Two owners. Engines meet only through `EchoGuideContracts`, so the two never edit the same file. Ownership is enforced in `.github/CODEOWNERS`.
 
-| Owner | Role | Target | Paths | Files |
-|---|---|---|---|---|
-| James | ML & edge vision | `EchoGuideVision` | `EchoGuide/Core/Camera/`, `Vision/`, `Fence/` | `FrameDeltaEngine`, `CameraFeed`, `LocalVisionEngine`, `DigitalFenceEngine` |
-| Lily | Haptics, LiDAR, audio | `EchoGuideSpatial` | `EchoGuide/Core/Haptics/`, `Depth/`, `Audio/` | `SpatialHapticEngine`, `LiDARDepthEngine`, `SpatialAudioEngine` |
-| Bryan | Accessibility & cognitive UX | `EchoGuideAutomation` | `EchoGuide/Core/Automation/`, `Cognitive/`, `EchoGuide/UI/` | `AutomationEngine`, `CognitiveTaskIsolation`, `GuidanceView` |
-| Maxwell | Infra, router, plugins | `EchoGuideInfra` | `EchoGuide/Core/Plugins/`, `Router/`, `.github/`, `EchoGuideTests/`, `Package.swift`, `plugins/` | `PluginRegistry`, `CloudReasoningRouter`, CI, tests |
-| All four | Shared contracts | `EchoGuideContracts` | `EchoGuide/Core/Contracts/` | `Contracts.swift` (needs four approvals) |
+| Owner | Area | Paths | Files |
+|---|---|---|---|
+| Maxwell | Perception + infrastructure: what the phone senses, and the plumbing | `EchoGuide/Core/Camera/`, `Vision/`, `Depth/`, `Plugins/`, `Router/`, `.github/`, `EchoGuideTests/`, `Package.swift`, `plugins/` | `FrameDeltaEngine`, `CameraFeed`, `LocalVisionEngine`, `LiDARDepthEngine`, `PluginRegistry`, `CloudReasoningRouter`, CI, tests |
+| Bryan | Experience + safety: everything the user feels, hears and sees | `EchoGuide/Core/Fence/`, `Haptics/`, `Audio/`, `Automation/`, `Cognitive/`, `EchoGuide/UI/` | `DigitalFenceEngine`, `SpatialHapticEngine`, `SpatialAudioEngine`, `AutomationEngine`, `CognitiveTaskIsolation`, `GuidanceView` |
+| Both | Shared contracts | `EchoGuide/Core/Contracts/` | `Contracts.swift` (needs both approvals) |
+
+The split follows the pipeline: Maxwell owns everything up to "a detection with a confidence and a depth"; Bryan owns everything from "what one step does the user take, and how do they feel it".
 
 ### Branches
 
-`feature/james-vision`, `feature/james-fence`, `feature/lily-haptics`, `feature/bryan-automation`, `feature/maxwell-plugins`. Each branch opens a PR into `main`. CI must pass and the owner of every path the PR touches must approve.
+`feature/maxwell-vision`, `feature/maxwell-plugins`, `feature/bryan-automation`, `feature/bryan-haptics`, `feature/bryan-fence`. Each branch opens a PR into `main`. CI must pass and the owner of every path the PR touches must approve.
 
-## Digital fence (James)
+## Digital fence (Bryan)
 
 There are two layers. Each one only reports a `FenceEvent`, and `AutomationEngine` decides how the user hears or feels it.
 

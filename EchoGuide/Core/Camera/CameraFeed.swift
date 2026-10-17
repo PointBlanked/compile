@@ -1,4 +1,4 @@
-// Owner: James. Continuous back-camera feed for devices or modes without
+// Owner: Maxwell. Continuous back-camera feed for devices or modes without
 // LiDAR. When LiDARDepthEngine is running, ARKit owns the camera and its
 // ARFrame.capturedImage is fed into the same handler instead; iOS will not
 // run AVCaptureSession and ARSession on the back camera at the same time.

@@ -1,4 +1,4 @@
-// Owner: James. Decides, per camera frame, whether full inference is worth
+// Owner: Maxwell. Decides, per camera frame, whether full inference is worth
 // running. Samples the luma plane on a coarse grid (768 points by default),
 // compares to the previous grid and only fires on real change. Sub-millisecond
 // per frame; that is what lets the expensive models sleep most of the time.
