@@ -36,7 +36,7 @@ public enum AgentMode: String, Sendable, CaseIterable, Codable {
 }
 
 public struct AgentLine: Sendable, Equatable {
-    public enum Source: String, Sendable, Codable { case narrator, reader, describe, fence, system }
+    public enum Source: String, Sendable, Codable { case narrator, reader, describe, scene, fence, system }
     public var text: String
     public var source: Source
     public var at: Date
@@ -49,6 +49,8 @@ public struct AgentTelemetry: Sendable, Equatable {
     public var describeLocal = 0
     public var describeP50Ms: Double = 0
     public var describeP95Ms: Double = 0
+    /// Unprompted scene descriptions spoken in Explore.
+    public var sceneDescriptions = 0
 }
 
 public actor AgentCore {
@@ -59,6 +61,10 @@ public actor AgentCore {
     private let router: ReasoningRouting?
     private var narrator: SceneNarrator
     private var reader = TextReader()
+    private var scene = SceneIntelligence()
+    private var sceneInFlight = false
+    /// Supplies the current camera frame as JPEG when the scene is worth describing.
+    private let jpegProvider: (@Sendable () -> Data?)?
     private var lastFrame: VisionFrameResult?
     private var lastFenceWarning: [String: TimeInterval] = [:]
     private var busyUntil: TimeInterval = 0
@@ -68,13 +74,16 @@ public actor AgentCore {
     private let clock: @Sendable () -> TimeInterval
 
     public init(audio: SpatialAudioCueing, haptics: HapticCueing, depth: DepthProviding? = nil, router: ReasoningRouting? = nil,
-                narrator: NarratorConfig = NarratorConfig(),
+                narrator: NarratorConfig = NarratorConfig(), scene: SceneIntelligenceConfig = SceneIntelligenceConfig(),
+                jpegProvider: (@Sendable () -> Data?)? = nil,
                 clock: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSince1970 }) {
         self.audio = audio
         self.haptics = haptics
         self.depth = depth
         self.router = router
         self.narrator = SceneNarrator(config: narrator)
+        self.scene = SceneIntelligence(config: scene)
+        self.jpegProvider = jpegProvider
         self.clock = clock
     }
 
@@ -100,6 +109,7 @@ public actor AgentCore {
         mode = m
         narrator.reset()
         reader.reset()
+        scene.reset()
         busyUntil = 0
         await haptics.stop()
         if announce { await say(m.spokenHelp, source: .system, urgent: true) }
@@ -128,6 +138,16 @@ public actor AgentCore {
                 for (i, d) in ranked { depths[i] = await depth.depth(at: d.box.mid) }
                 ahead = await depth.depth(at: .center)
             }
+            // Scene intelligence: when the scene turns over, ask the vision
+            // model what is going on. Runs off the frame path so perception
+            // and hazards never wait on the network.
+            if router != nil, let jpegProvider, !sceneInFlight, scene.wantsScene(frame) {
+                let labels = scene.labels(in: frame)
+                scene.asked(at: frame.timestamp, labels: labels)
+                sceneInFlight = true
+                let snapshot = frame
+                Task { await self.describeScene(snapshot, jpeg: jpegProvider()) }
+            }
             guard let a = narrator.observe(frame, depths: depths, aheadMetres: ahead) else { return false }
             if !a.urgent, clock() < busyUntil { return false }
             telemetry.announcements += 1
@@ -142,6 +162,28 @@ public actor AgentCore {
             break
         }
         return false
+    }
+
+    /// Unprompted: one or two sentences about the place and what is happening,
+    /// from the vision model. Spoken only if it came from the model; the
+    /// on-device fallback would just repeat what the narrator already said.
+    private func describeScene(_ frame: VisionFrameResult, jpeg: Data?) async {
+        defer { sceneInFlight = false }
+        guard let router, mode == .explore else { return }
+        let outcome = await router.resolve(ReasoningQuery(
+            question: SceneIntelligence.question,
+            detections: frame.detections.filter { $0.kind != .fingertip },
+            localConfidence: 0,
+            jpeg: jpeg,
+            maxWords: 32,
+            timeout: 10
+        ))
+        guard outcome.source == .cloud, !outcome.answer.isEmpty, mode == .explore else { return }
+        telemetry.sceneDescriptions += 1
+        // Wait for whatever is being said, then speak.
+        let wait = busyUntil - clock()
+        if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(min(wait, 4) * 1_000_000_000)) }
+        await say(outcome.answer, source: .scene)
     }
 
     /// The Describe button: what is in front of me, all of it, in a few sentences.
@@ -164,7 +206,7 @@ public actor AgentCore {
         var text = local
         if let router {
             let outcome = await router.resolve(ReasoningQuery(
-                question: "Describe what is in front of the camera for someone who cannot see it.",
+                question: "Describe what is in front of the camera for someone who cannot see it: the kind of place, what is happening, the main things with their colours and where they are, and anything hazardous.",
                 detections: frame.detections.filter { $0.kind != .fingertip },
                 localConfidence: 0,
                 jpeg: jpeg,

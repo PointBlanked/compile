@@ -1,11 +1,25 @@
 {
   "goal": null,
   "kokoroURL": "https://echoguide-voice.style.dev",
-  "plugins": { "productLookup": true },
+  "visionURL": "https://echoguide-vision.style.dev",
+  "plugins": {
+    "productLookup": true
+  },
   "fence": {
     "zones": [
-      { "name": "hob", "anchor": { "label": "oven" } },
-      { "name": "knife", "anchor": { "label": "knife" }, "warningMargin": 0.05 }
+      {
+        "name": "hob",
+        "anchor": {
+          "label": "oven"
+        }
+      },
+      {
+        "name": "knife",
+        "anchor": {
+          "label": "knife"
+        },
+        "warningMargin": 0.05
+      }
     ]
   }
 }

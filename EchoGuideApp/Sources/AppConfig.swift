@@ -16,6 +16,10 @@ struct AppConfig: Decodable {
     var fence: FenceConfig?
     /// Optional better voice: an OpenAI-compatible Kokoro server.
     var kokoroURL: URL?
+    /// Optional scene intelligence: an OpenAI-compatible vision-language
+    /// server you run (llama.cpp on a Freestyle VM). Used by the cloud router
+    /// when no key proxy is configured; photos go to your own server.
+    var visionURL: URL?
     /// Start narrowed to one task ("start"), nil for open scanning.
     var goal: String?
 

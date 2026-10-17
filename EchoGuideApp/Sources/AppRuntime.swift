@@ -44,6 +44,8 @@ final class AppRuntime {
     private(set) var hasLiDAR = false
     private(set) var hasModel = false
     let cloudConfigured = AppSettings.proxyBase != nil
+    /// A vision-language model is reachable (key proxy or self-hosted server).
+    private(set) var visionConfigured = false
     private(set) var online = false
     private(set) var cameraError: String?
     private(set) var benchmarkSummary: String?
@@ -62,8 +64,8 @@ final class AppRuntime {
         var parts: [String] = []
         parts.append(hasLiDAR ? "LiDAR" : "Camera")
         parts.append(hasModel ? "objects on" : "no object model")
-        if cloudConfigured && online {
-            parts.append(AppSettings.imageConsent ? "cloud photos on" : "cloud text only")
+        if visionConfigured && online {
+            parts.append(cloudConfigured ? (AppSettings.imageConsent ? "cloud photos on" : "cloud text only") : "scene AI on")
         } else {
             parts.append("on-device only")
         }
@@ -105,8 +107,19 @@ final class AppRuntime {
         let connectivity = PathConnectivity()
         let deviceToken: @Sendable () async -> String? = { Keychain.read("device_token") }
         var routerConfig = CloudRouterConfig()
-        routerConfig.imageConsent = AppSettings.imageConsent
-        let provider: ReasoningProvider? = AppSettings.proxyBase.map { GeminiProvider(proxyBase: $0, deviceToken: deviceToken) }
+        // Photos to a server you run yourself need no separate consent; a
+        // third-party proxy keeps the opt-in toggle.
+        routerConfig.imageConsent = AppSettings.imageConsent || (AppSettings.proxyBase == nil && config.visionURL != nil)
+        routerConfig.timeout = 8
+        let provider: ReasoningProvider?
+        if let proxy = AppSettings.proxyBase {
+            provider = GeminiProvider(proxyBase: proxy, deviceToken: deviceToken)
+        } else if let vision = config.visionURL {
+            provider = OpenAIProvider(proxyBase: vision, model: "vlm", deviceToken: { nil })
+        } else {
+            provider = nil
+        }
+        visionConfigured = provider != nil
         let router = ObservedRouter(CloudReasoningRouter(config: routerConfig, provider: provider, connectivity: connectivity)) {
             Task { await trials.noteCloudCall() }
         }
@@ -120,7 +133,9 @@ final class AppRuntime {
         self.automation = automation
         guidance.bind(to: automation)
         await automation.setGoal(config.goal)
-        let agent = AgentCore(audio: audio, haptics: haptics, depth: lidar, router: router)
+        let latestForScene = self.latest
+        let agent = AgentCore(audio: audio, haptics: haptics, depth: lidar, router: router,
+                              jpegProvider: { latestForScene.jpeg(maxSide: 512) })
         self.agent = agent
 
         // Pipeline: frame -> detections -> fence -> agent (and automation in Find).

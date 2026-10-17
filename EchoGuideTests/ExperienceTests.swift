@@ -717,3 +717,75 @@ struct StubListener: GoalListening {
         #expect(HUDGeometry.transform(viewSize: .zero, imageAspect: 1).scale == 1)
     }
 }
+
+// MARK: - Scene intelligence policy
+
+@Suite struct SceneIntelligenceTests {
+    func objects(_ labels: [String], t: TimeInterval) -> VisionFrameResult {
+        frame(labels.enumerated().map { i, l in det(l, x: 0.2 + Float(i) * 0.2, y: 0.5, conf: 0.9) }, t: t)
+    }
+
+    @Test func firstDescriptionWaitsForWarmupThenFiresOnce() {
+        var s = SceneIntelligence()
+        s.reset(at: 0)
+        let warming = s.wantsScene(objects(["chair"], t: 1))
+        let empty = s.wantsScene(objects([], t: 2.5))
+        let first = s.wantsScene(objects(["chair"], t: 3))
+        #expect(!warming)
+        #expect(!empty)
+        #expect(first)
+        s.asked(at: 3, labels: ["chair"])
+        let soon = s.wantsScene(objects(["chair"], t: 4))
+        let sameLater = s.wantsScene(objects(["chair"], t: 30))
+        #expect(!soon)
+        #expect(!sameLater)
+    }
+
+    @Test func materialChangeAfterIntervalAsksAgain() {
+        var s = SceneIntelligence()
+        s.reset(at: 0)
+        _ = s.wantsScene(objects(["chair", "laptop"], t: 3))
+        s.asked(at: 3, labels: ["chair", "laptop"])
+        let inside = s.wantsScene(objects(["chair", "microwave"], t: 10))     // inside the interval
+        let halfTurnedOver = s.wantsScene(objects(["chair", "microwave"], t: 20)) // distance 2/3
+        #expect(!inside)
+        #expect(halfTurnedOver)
+        s.asked(at: 20, labels: ["chair", "microwave"])
+        let sameScene = s.wantsScene(objects(["microwave", "chair"], t: 40))
+        let newRoom = s.wantsScene(objects(["bed", "tv"], t: 41))
+        #expect(!sameScene)
+        #expect(newRoom)
+    }
+
+    @Test func lowConfidenceAndSilentLabelsDoNotDefineTheScene() {
+        let s = SceneIntelligence()
+        let f = frame([det("chair", x: 0.5, y: 0.5, conf: 0.3), det("text", x: 0.2, y: 0.2, kind: .text, text: "EXIT"), tip(x: 0.1, y: 0.1), det("cup", x: 0.7, y: 0.5, conf: 0.8)], t: 0)
+        #expect(s.labels(in: f) == ["cup"])
+    }
+
+    @Test func agentAsksTheRouterWithThePhotoAndSpeaksTheScene() async {
+        struct SceneRouter: ReasoningRouting {
+            let seen: Counter
+            func resolve(_ q: ReasoningQuery) async -> ReasoningOutcome {
+                if q.jpeg != nil { await seen.inc() }
+                return ReasoningOutcome(answer: "A small kitchen. A red kettle sits on the white counter ahead.", source: .cloud, latencyMs: 900)
+            }
+        }
+        let seen = Counter(), a = RecordingAudio()
+        var cfg = SceneIntelligenceConfig()
+        cfg.warmup = 0
+        let agent = AgentCore(audio: a, haptics: RecordingHaptics(), router: SceneRouter(seen: seen), scene: cfg,
+                              jpegProvider: { Data([0xFF, 0xD8]) }, clock: { 100 })
+        await agent.setMode(.explore, announce: false)
+        await agent.ingest(frame([det("kettle", x: 0.5, y: 0.5, conf: 0.9)], t: 0.1), fence: nil)
+        await agent.ingest(frame([det("kettle", x: 0.5, y: 0.5, conf: 0.9)], t: 0.2), fence: nil)
+        var spokenScene = false
+        for _ in 0..<200 where !spokenScene {
+            spokenScene = await a.spoken.contains { $0.hasPrefix("A small kitchen") }
+            if !spokenScene { try? await Task.sleep(nanoseconds: 5_000_000) }
+        }
+        #expect(spokenScene)
+        #expect(await seen.value == 1)
+        #expect(await agent.stats.sceneDescriptions == 1)
+    }
+}
