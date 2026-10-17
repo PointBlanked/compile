@@ -62,17 +62,20 @@ public struct ToolClaim: Sendable, Equatable {
     /// Case-insensitive substrings of recognised text ("start", "defrost").
     public var textContains: [String] = []
     public var barcodePrefixes: [String] = []
+    /// Claim every barcode (product lookup).
+    public var anyBarcode = false
 
-    public init(labels: Set<String> = [], textContains: [String] = [], barcodePrefixes: [String] = []) {
+    public init(labels: Set<String> = [], textContains: [String] = [], barcodePrefixes: [String] = [], anyBarcode: Bool = false) {
         self.labels = labels
         self.textContains = textContains
         self.barcodePrefixes = barcodePrefixes
+        self.anyBarcode = anyBarcode
     }
 
     func claims(_ d: Detection) -> Bool {
         if labels.contains(d.label) { return true }
         guard let text = d.text?.lowercased() else { return false }
-        if d.kind == .barcode { return barcodePrefixes.contains { text.hasPrefix($0.lowercased()) } }
+        if d.kind == .barcode { return anyBarcode || barcodePrefixes.contains { text.hasPrefix($0.lowercased()) } }
         return textContains.contains { text.contains($0.lowercased()) }
     }
 }
@@ -126,8 +129,10 @@ public actor PluginRegistry: ToolInvoking {
     /// Pull every tool from a remote MCP server and proxy calls to it.
     /// Remote tools claim detections through `claims`, keyed by tool name,
     /// because MCP has no notion of "what this tool can see".
-    public func registerRemote(_ client: MCPHTTPClient, claims: [String: ToolClaim], sideEffects: [String: ToolSideEffect] = [:]) async throws {
-        for remote in try await client.listTools() {
+    /// Names in `skipping` are never replaced (built-ins win over remote tools).
+    public func registerRemote(_ client: MCPHTTPClient, claims: [String: ToolClaim], sideEffects: [String: ToolSideEffect] = [:],
+                               skipping: Set<String> = []) async throws {
+        for remote in try await client.listTools() where !skipping.contains(remote.name) {
             register(ToolDescriptor(
                 name: remote.name,
                 description: remote.description,

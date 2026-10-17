@@ -113,10 +113,13 @@ public struct GeminiProvider: ReasoningProvider {
     public var proxyBase: URL
     public var model: String
     public var deviceToken: @Sendable () async -> String?
+    public var transport: HTTPTransport
 
-    public init(proxyBase: URL, model: String = "gemini-2.5-flash", deviceToken: @escaping @Sendable () async -> String?) {
+    public init(proxyBase: URL, model: String = "gemini-2.5-flash", transport: HTTPTransport = URLSessionTransport(),
+                deviceToken: @escaping @Sendable () async -> String?) {
         self.proxyBase = proxyBase
         self.model = model
+        self.transport = transport
         self.deviceToken = deviceToken
     }
 
@@ -130,7 +133,7 @@ public struct GeminiProvider: ReasoningProvider {
             "generationConfig": ["maxOutputTokens": 40, "temperature": 0.2],
         ]
         let url = proxyBase.appendingPathComponent("v1beta/models/\(model):generateContent")
-        let json = try await HTTP.postJSON(url, body: body, token: await deviceToken())
+        let json = try await transport.postJSON(url, body: body, bearer: await deviceToken())
         let candidates = json["candidates"] as? [[String: Any]]
         let content = candidates?.first?["content"] as? [String: Any]
         let textParts = content?["parts"] as? [[String: Any]]
@@ -144,10 +147,13 @@ public struct OpenAIProvider: ReasoningProvider {
     public var proxyBase: URL
     public var model: String
     public var deviceToken: @Sendable () async -> String?
+    public var transport: HTTPTransport
 
-    public init(proxyBase: URL, model: String = "gpt-4o", deviceToken: @escaping @Sendable () async -> String?) {
+    public init(proxyBase: URL, model: String = "gpt-4o", transport: HTTPTransport = URLSessionTransport(),
+                deviceToken: @escaping @Sendable () async -> String?) {
         self.proxyBase = proxyBase
         self.model = model
+        self.transport = transport
         self.deviceToken = deviceToken
     }
 
@@ -157,7 +163,7 @@ public struct OpenAIProvider: ReasoningProvider {
             content.append(["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(jpeg.base64EncodedString())", "detail": "low"]])
         }
         let body: [String: Any] = ["model": model, "max_tokens": 40, "temperature": 0.2, "messages": [["role": "user", "content": content]]]
-        let json = try await HTTP.postJSON(proxyBase.appendingPathComponent("v1/chat/completions"), body: body, token: await deviceToken())
+        let json = try await transport.postJSON(proxyBase.appendingPathComponent("v1/chat/completions"), body: body, bearer: await deviceToken())
         let choices = json["choices"] as? [[String: Any]]
         let message = choices?.first?["message"] as? [String: Any]
         return message?["content"] as? String ?? ""
@@ -174,21 +180,6 @@ enum Prompt {
         On-device vision saw: \(seen). \(q.question) \
         Answer in one short plain sentence, no lists, under eight words.
         """
-    }
-}
-
-enum HTTP {
-    static func postJSON(_ url: URL, body: [String: Any], token: String?) async throws -> [String: Any] {
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if let token { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, response) = try await URLSession.shared.data(for: req)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw URLError(.badServerResponse)
-        }
-        return (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
     }
 }
 

@@ -2,6 +2,7 @@
 //   * YOLOv8n / YOLO11n INT8 Core ML (exported with nms=True) on the Neural Engine
 //   * VNDetectHumanHandPoseRequest for the index fingertip (target alignment)
 //   * VNRecognizeTextRequest, .fast level, offline (only on OCR frames)
+//   * VNDetectBarcodesRequest for product codes and QR (same cadence as OCR)
 //
 // Budget: object + hand under ~12 ms on A17-class hardware. OCR is the
 // expensive one (roughly 10-35 ms), so it runs on a cadence, not every frame.
@@ -16,12 +17,22 @@ public struct LocalVisionConfig: Sendable {
     /// Run OCR on every Nth inferred frame (1 = always, 0 = never).
     public var ocrEveryNthFrame = 3
     public var detectFingertip = true
+    /// Barcodes ride the OCR cadence: both are "read the label" work.
+    public var detectBarcodes = true
     /// Keep at most this many detections; cognitive isolation picks one anyway.
     public var maxDetections = 12
     public var budgetMs: Double = 12
 
     public init() {}
 }
+
+#if canImport(CoreVideo)
+/// Anything that turns a camera frame into detections. LocalVisionEngine in
+/// the app, a fake in tests; PerceptionPipeline only knows this.
+public protocol FrameInferring: Sendable {
+    func infer(_ frame: CameraFrame) async -> VisionFrameResult
+}
+#endif
 
 public enum VisionGeometry {
     /// Vision boxes are bottom-left origin; the pipeline is top-left (see Contracts).
@@ -82,6 +93,10 @@ public actor LocalVisionEngine {
         let runOCR = config.ocrEveryNthFrame > 0 && frameCount % UInt64(config.ocrEveryNthFrame) == 0
         if runOCR { requests.append(text) }
 
+        let barcode = VNDetectBarcodesRequest()
+        barcode.symbologies = [.ean13, .ean8, .upce, .code128, .qr]
+        if runOCR && config.detectBarcodes { requests.append(barcode) }
+
         let handler = VNImageRequestHandler(cvPixelBuffer: frame.pixelBuffer, orientation: orientation)
         do {
             try handler.perform(requests)
@@ -115,6 +130,20 @@ public actor LocalVisionEngine {
             }
         }
 
+        if runOCR && config.detectBarcodes {
+            for obs in barcode.results ?? [] {
+                guard let payload = obs.payloadStringValue else { continue }
+                let b = obs.boundingBox
+                detections.append(Detection(
+                    label: "barcode",
+                    confidence: obs.confidence,
+                    box: VisionGeometry.topLeft(x: b.minX, y: b.minY, width: b.width, height: b.height),
+                    kind: .barcode,
+                    text: payload
+                ))
+            }
+        }
+
         detections.sort { $0.confidence > $1.confidence }
         if detections.count > config.maxDetections { detections.removeLast(detections.count - config.maxDetections) }
 
@@ -134,5 +163,8 @@ public actor LocalVisionEngine {
         if ms > config.budgetMs { overBudgetFrames += 1 }
         return VisionFrameResult(frameIndex: frame.index, timestamp: frame.timestamp, detections: detections, inferenceMs: ms)
     }
+}
+extension LocalVisionEngine: FrameInferring {
+    public func infer(_ frame: CameraFrame) async -> VisionFrameResult { process(frame) }
 }
 #endif

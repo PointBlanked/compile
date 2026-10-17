@@ -680,6 +680,122 @@ public final class FrameDeltaEngine {
 }
 EOF_AVAE
 
+cat > 'EchoGuide/Core/Camera/PerceptionPipeline.swift' <<'EOF_AVAE'
+// Owner: Maxwell. The one path from camera to detections:
+//
+//   frame (camera queue) -> FrameDeltaEngine -> [skip]
+//                                     \-> LocalVisionEngine -> onResult
+//
+// Back-pressure: at most one inference in flight. A frame that arrives while
+// the model is busy is dropped, never queued, so latency cannot pile up
+// behind a slow frame. Every stage is timed; `stats` is what the benchmark
+// HUD and the "< 15 ms local" claim are measured against.
+
+#if canImport(CoreVideo)
+import CoreVideo
+import Foundation
+import EchoGuideContracts
+
+public struct PipelineTiming: Sendable, Equatable {
+    /// FrameDeltaEngine analysis of this frame.
+    public var deltaMs: Double
+    /// Submit to the start of inference (task hop).
+    public var queueMs: Double
+    public var inferenceMs: Double
+    /// Submit to detections ready, handed to `onResult`. `stats` additionally
+    /// includes the time `onResult` took (the cue the consumer fired).
+    public var totalMs: Double
+}
+
+public struct PipelineStats: Sendable, Equatable {
+    public var framesSeen: UInt64 = 0
+    public var framesSkipped: UInt64 = 0
+    public var framesDroppedBusy: UInt64 = 0
+    public var framesInferred: UInt64 = 0
+    public var totalP50Ms: Double = 0
+    public var totalP95Ms: Double = 0
+
+    /// Share of frames that never reached the model.
+    public var computeSaved: Double {
+        framesSeen == 0 ? 0 : Double(framesSkipped + framesDroppedBusy) / Double(framesSeen)
+    }
+}
+
+/// `submit` is called from the camera / ARKit delegate queue only.
+public final class PerceptionPipeline: @unchecked Sendable {
+    public typealias ResultHandler = @Sendable (VisionFrameResult, PipelineTiming) async -> Void
+
+    private let delta: FrameDeltaEngine
+    private let vision: FrameInferring
+    private let onResult: ResultHandler
+    private let lock = NSLock()
+    private var busy = false
+    private var counters = PipelineStats()
+    private var totals = LatencyWindow()
+
+    public init(vision: FrameInferring, delta: FrameDeltaEngine = FrameDeltaEngine(), onResult: @escaping ResultHandler) {
+        self.vision = vision
+        self.delta = delta
+        self.onResult = onResult
+    }
+
+    public var stats: PipelineStats {
+        lock.withLock {
+            var s = counters
+            s.totalP50Ms = totals.percentile(0.5)
+            s.totalP95Ms = totals.percentile(0.95)
+            return s
+        }
+    }
+
+    /// Ask for a fresh look on the next frame (step completed, user tapped).
+    public func forceNextFrame() {
+        lock.withLock { delta.forceNextFrame() }
+    }
+
+    /// Returns the decision so callers (and tests) can see what happened.
+    @discardableResult
+    public func submit(_ frame: CameraFrame) -> FrameDeltaDecision {
+        let submitted = FrameTimer()
+        let (decision, deltaMs, accepted): (FrameDeltaDecision, Double, Bool) = lock.withLock {
+            counters.framesSeen += 1
+            let d = delta.analyze(frame.pixelBuffer, timestamp: frame.timestamp)
+            guard d.shouldInfer else {
+                counters.framesSkipped += 1
+                return (d, delta.lastAnalysisMs, false)
+            }
+            guard !busy else {
+                counters.framesDroppedBusy += 1
+                // The motion is still there next frame; make sure it is not lost.
+                delta.forceNextFrame()
+                return (d, delta.lastAnalysisMs, false)
+            }
+            busy = true
+            counters.framesInferred += 1
+            return (d, delta.lastAnalysisMs, true)
+        }
+        guard accepted else { return decision }
+
+        Task(priority: .userInitiated) { [vision, onResult] in
+            let queueMs = submitted.elapsedMs
+            let result = await vision.infer(frame)
+            let timing = PipelineTiming(deltaMs: deltaMs, queueMs: queueMs, inferenceMs: result.inferenceMs, totalMs: submitted.elapsedMs)
+            await onResult(result, timing)
+            self.finish(endToEndMs: submitted.elapsedMs)
+        }
+        return decision
+    }
+
+    private func finish(endToEndMs: Double) {
+        lock.withLock {
+            totals.record(endToEndMs)
+            busy = false
+        }
+    }
+}
+#endif
+EOF_AVAE
+
 cat > 'EchoGuide/Core/Cognitive/CognitiveTaskIsolation.swift' <<'EOF_AVAE'
 // Owner: Bryan. Step-anchoring for dementia and cognitive accessibility.
 // A frame can hold a dozen detections; the user gets exactly one. Rules:
@@ -1624,6 +1740,400 @@ public actor SpatialHapticEngine: HapticCueing {
 #endif
 EOF_AVAE
 
+cat > 'EchoGuide/Core/Plugins/BuiltInPlugins.swift' <<'EOF_AVAE'
+// Owner: Maxwell. The first real tools, chosen for the differentiation plan:
+//
+//  * HomeAssistantPlugin   press the button for the user (microwave, kettle,
+//                          lights, thermostat) through one Home Assistant hub,
+//                          which already integrates thousands of appliances.
+//  * CaregiverAlerts       tell the carer when the location fence trips. Alerts
+//                          are written to a disk outbox first, so one sent
+//                          offline is delivered when the phone reconnects.
+//  * ProductLookupPlugin   barcode -> product name and allergens (Open Food Facts).
+
+import Foundation
+import EchoGuideContracts
+#if canImport(CryptoKit)
+import CryptoKit
+#endif
+
+/// Looks up a secret (token, signing key) by name. Keychain in the app; a
+/// dictionary in tests. Secrets never live in the manifest.
+public typealias SecretProvider = @Sendable (String) async -> String?
+
+// MARK: - Home Assistant
+
+public struct HomeAssistantEntity: Sendable, Equatable, Codable {
+    /// Tool name, e.g. "microwave_start".
+    public var name: String
+    /// What the user hears after it worked: "Microwave started."
+    public var doneSentence: String
+    public var entityId: String
+    /// Home Assistant service, "domain.service", e.g. "switch.turn_on".
+    public var service: String
+    public var labels: [String]?
+    public var textContains: [String]?
+    public var sideEffect: ToolSideEffect
+
+    public init(name: String, doneSentence: String, entityId: String, service: String,
+                labels: [String]? = nil, textContains: [String]? = nil, sideEffect: ToolSideEffect = .physical) {
+        self.name = name
+        self.doneSentence = doneSentence
+        self.entityId = entityId
+        self.service = service
+        self.labels = labels
+        self.textContains = textContains
+        self.sideEffect = sideEffect
+    }
+}
+
+public enum HomeAssistantPlugin {
+    /// One tool per entity. Calls `POST {base}/api/services/{domain}/{service}`
+    /// with a long-lived access token.
+    public static func tools(baseURL: URL, entities: [HomeAssistantEntity], transport: HTTPTransport,
+                             token: @escaping @Sendable () async -> String?) -> [ToolDescriptor] {
+        entities.compactMap { e in
+            let parts = e.service.split(separator: ".", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { return nil }
+            let url = baseURL.appendingPathComponent("api/services/\(parts[0])/\(parts[1])")
+            return ToolDescriptor(
+                name: e.name,
+                description: "Home Assistant \(e.service) on \(e.entityId)",
+                sideEffect: e.sideEffect,
+                claim: ToolClaim(labels: Set(e.labels ?? []), textContains: e.textContains ?? [])
+            ) { _ in
+                _ = try await transport.postJSON(url, body: ["entity_id": e.entityId], bearer: await token())
+                return e.doneSentence
+            }
+        }
+    }
+}
+
+// MARK: - Caregiver alerts
+
+public struct CaregiverAlert: Sendable, Equatable, Codable {
+    public var id: UUID
+    public var event: String
+    public var region: String
+    public var at: Date
+}
+
+/// Thrown when the alert is safely queued but not yet delivered, so the caller
+/// does not tell the user "your carer has been told" when that is not true yet.
+public struct CaregiverAlertQueued: Error, Equatable {}
+
+public actor CaregiverAlerts {
+    private let webhook: URL
+    private let transport: HTTPTransport
+    private let outboxURL: URL?
+    private let signingSecret: String?
+    private var outbox: [CaregiverAlert]
+
+    /// `outboxURL` persists undelivered alerts across app launches; nil keeps
+    /// them in memory only (tests).
+    public init(webhook: URL, transport: HTTPTransport, outboxURL: URL?, signingSecret: String? = nil) {
+        self.webhook = webhook
+        self.transport = transport
+        self.outboxURL = outboxURL
+        self.signingSecret = signingSecret
+        if let outboxURL, let data = try? Data(contentsOf: outboxURL),
+           let saved = try? Self.decoder.decode([CaregiverAlert].self, from: data) {
+            outbox = saved
+        } else {
+            outbox = []
+        }
+    }
+
+    public var pending: Int { outbox.count }
+
+    /// Queue, then try to deliver everything queued. True when this alert went out.
+    @discardableResult
+    public func send(event: String, region: String, at date: Date = Date()) async -> Bool {
+        let alert = CaregiverAlert(id: UUID(), event: event, region: region, at: date)
+        outbox.append(alert)
+        save()
+        await flush()
+        return !outbox.contains(alert)
+    }
+
+    /// Call on reconnect (NWPathMonitor) and on app launch.
+    public func flush() async {
+        var remaining: [CaregiverAlert] = []
+        for alert in outbox {
+            do {
+                try await deliver(alert)
+            } catch {
+                remaining.append(alert)
+            }
+        }
+        outbox = remaining
+        save()
+    }
+
+    public var tool: ToolDescriptor {
+        ToolDescriptor(name: "notify_caregiver", description: "Tell the carer the user left a safe area",
+                       sideEffect: .none, parameters: ["region"]) { [self] args in
+            let delivered = await self.send(event: "left_safe_area", region: args["region"] ?? "safe area")
+            if !delivered { throw CaregiverAlertQueued() }
+            return "Your carer has been told."
+        }
+    }
+
+    private func deliver(_ alert: CaregiverAlert) async throws {
+        var req = URLRequest(url: webhook)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 5
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // The receiver dedupes on this, so a retry after a lost response is safe.
+        req.setValue(alert.id.uuidString, forHTTPHeaderField: "Idempotency-Key")
+        let body = try Self.encoder.encode(alert)
+        req.httpBody = body
+        if let signingSecret { req.setValue(Self.signature(body, secret: signingSecret), forHTTPHeaderField: "X-EchoGuide-Signature") }
+        let (_, http) = try await transport.send(req)
+        guard (200..<300).contains(http.statusCode) else { throw HTTPStatusError(status: http.statusCode) }
+    }
+
+    private func save() {
+        guard let outboxURL, let data = try? Self.encoder.encode(outbox) else { return }
+        try? data.write(to: outboxURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+    }
+
+    /// Hex HMAC-SHA256 of the body, so the receiver can reject forged alerts.
+    static func signature(_ body: Data, secret: String) -> String {
+        #if canImport(CryptoKit)
+        let mac = HMAC<SHA256>.authenticationCode(for: body, using: SymmetricKey(data: Data(secret.utf8)))
+        return "sha256=" + mac.map { String(format: "%02x", $0) }.joined()
+        #else
+        return ""
+        #endif
+    }
+
+    static let encoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.dateEncodingStrategy = .iso8601
+        e.outputFormatting = .sortedKeys
+        return e
+    }()
+
+    static let decoder: JSONDecoder = {
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .iso8601
+        return d
+    }()
+}
+
+// MARK: - Product lookup
+
+public actor ProductLookupPlugin {
+    private let transport: HTTPTransport
+    private let base: URL
+    private var cache: [String: String] = [:]
+
+    public init(transport: HTTPTransport, base: URL = URL(string: "https://world.openfoodfacts.org")!) {
+        self.transport = transport
+        self.base = base
+    }
+
+    public var tool: ToolDescriptor {
+        ToolDescriptor(name: "lookup_product", description: "Say the product name and allergens for a barcode",
+                       sideEffect: .none, claim: ToolClaim(anyBarcode: true), parameters: ["text"]) { [self] args in
+            await self.describe(args["text"] ?? "")
+        }
+    }
+
+    public func describe(_ code: String) async -> String {
+        // QR codes and other payloads are not product codes; never send them off-device.
+        guard (8...14).contains(code.count), code.allSatisfy(\.isNumber) else {
+            if let host = URL(string: code)?.host { return "QR code for \(host)." }
+            return "This code is not a product barcode."
+        }
+        if let hit = cache[code] { return hit }
+
+        let url = base.appendingPathComponent("api/v2/product/\(code)")
+        var comps = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+        comps.queryItems = [URLQueryItem(name: "fields", value: "product_name,brands,allergens_tags")]
+        do {
+            let json = try await transport.getJSON(comps.url!, headers: ["User-Agent": "EchoGuide/0.1 (accessibility app)"])
+            guard let product = json["product"] as? [String: Any], let name = product["product_name"] as? String, !name.isEmpty else {
+                return "I could not find this product."
+            }
+            let brand = (product["brands"] as? String)?.split(separator: ",").first.map { String($0).trimmingCharacters(in: .whitespaces) }
+            var sentence = [brand, name].compactMap { $0 }.joined(separator: " ") + "."
+            let allergens = (product["allergens_tags"] as? [String] ?? []).map { $0.split(separator: ":").last.map(String.init) ?? $0 }
+            if !allergens.isEmpty { sentence += " Contains \(allergens.prefix(4).joined(separator: ", "))." }
+            cache[code] = sentence
+            return sentence
+        } catch {
+            return "I cannot look this up right now."
+        }
+    }
+}
+EOF_AVAE
+
+cat > 'EchoGuide/Core/Plugins/HTTPTransport.swift' <<'EOF_AVAE'
+// Owner: Maxwell. One HTTP seam for every network call in Infra (cloud
+// providers, plugins), so tests run against a stub and the app can add
+// certificate pinning or a proxy in one place.
+
+import Foundation
+
+public protocol HTTPTransport: Sendable {
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse)
+}
+
+public struct URLSessionTransport: HTTPTransport {
+    public var session: URLSession
+
+    public init(session: URLSession = .shared) { self.session = session }
+
+    public func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        return (data, http)
+    }
+}
+
+public struct HTTPStatusError: Error, Equatable {
+    public var status: Int
+}
+
+extension HTTPTransport {
+    /// POST a JSON object, expect 2xx, return the decoded object (empty for no body).
+    func postJSON(_ url: URL, body: [String: Any], bearer: String?, timeout: TimeInterval = 4) async throws -> [String: Any] {
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = timeout
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let bearer { req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization") }
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, http) = try await send(req)
+        guard (200..<300).contains(http.statusCode) else { throw HTTPStatusError(status: http.statusCode) }
+        guard !data.isEmpty else { return [:] }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+    }
+
+    func getJSON(_ url: URL, timeout: TimeInterval = 4, headers: [String: String] = [:]) async throws -> [String: Any] {
+        var req = URLRequest(url: url)
+        req.timeoutInterval = timeout
+        for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+        let (data, http) = try await send(req)
+        guard (200..<300).contains(http.statusCode) else { throw HTTPStatusError(status: http.statusCode) }
+        return (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+    }
+}
+EOF_AVAE
+
+cat > 'EchoGuide/Core/Plugins/PluginManifest.swift' <<'EOF_AVAE'
+// Owner: Maxwell. One JSON file per home sets up its tools, so a care
+// provider can configure a new home without a code change. Secrets are named
+// here, never stored here: the app resolves them from the Keychain.
+//
+// {
+//   "homeAssistant": { "baseURL": "http://homeassistant.local:8123", "tokenSecret": "ha_token",
+//     "entities": [ { "name": "microwave_start", "doneSentence": "Microwave started.",
+//                     "entityId": "switch.microwave", "service": "switch.turn_on",
+//                     "textContains": ["start"], "sideEffect": "physical" } ] },
+//   "caregiver": { "webhookURL": "https://care.example.com/alerts", "signingSecret": "care_hmac" },
+//   "productLookup": true,
+//   "remoteServers": [ { "endpoint": "https://plugins.example.com/mcp",
+//                        "claims": { "thermostat_set": { "labels": ["thermostat"] } },
+//                        "sideEffects": { "thermostat_set": "reversible" } } ]
+// }
+
+import Foundation
+import EchoGuideContracts
+
+public struct PluginManifest: Sendable, Codable, Equatable {
+    public struct HomeAssistant: Sendable, Codable, Equatable {
+        public var baseURL: URL
+        public var tokenSecret: String
+        public var entities: [HomeAssistantEntity]
+    }
+
+    public struct Caregiver: Sendable, Codable, Equatable {
+        public var webhookURL: URL
+        public var signingSecret: String?
+    }
+
+    public struct Claim: Sendable, Codable, Equatable {
+        public var labels: [String]?
+        public var textContains: [String]?
+        public var barcodePrefixes: [String]?
+
+        var toolClaim: ToolClaim {
+            ToolClaim(labels: Set(labels ?? []), textContains: textContains ?? [], barcodePrefixes: barcodePrefixes ?? [])
+        }
+    }
+
+    public struct RemoteServer: Sendable, Codable, Equatable {
+        public var endpoint: URL
+        public var claims: [String: Claim]?
+        public var sideEffects: [String: ToolSideEffect]?
+        /// Name of a secret sent as `Authorization: Bearer`.
+        public var tokenSecret: String?
+    }
+
+    public var homeAssistant: HomeAssistant?
+    public var caregiver: Caregiver?
+    public var productLookup: Bool?
+    public var remoteServers: [RemoteServer]?
+
+    public static func load(_ data: Data) throws -> PluginManifest {
+        try JSONDecoder().decode(PluginManifest.self, from: data)
+    }
+}
+
+public struct InstalledPlugins: Sendable {
+    /// Keep a handle so the app can `flush()` on reconnect and launch.
+    public var caregiver: CaregiverAlerts?
+    /// Remote servers that could not be reached; their tools are missing until retried.
+    public var failedRemotes: [URL]
+}
+
+extension PluginRegistry {
+    /// Registers every tool the manifest describes. Local tools first, so a
+    /// remote server cannot shadow a built-in by registering the same name.
+    @discardableResult
+    public func install(_ manifest: PluginManifest, secrets: @escaping SecretProvider,
+                        transport: HTTPTransport = URLSessionTransport(), outboxURL: URL? = nil) async -> InstalledPlugins {
+        var installed = InstalledPlugins(caregiver: nil, failedRemotes: [])
+
+        if let ha = manifest.homeAssistant {
+            let secret = ha.tokenSecret
+            for tool in HomeAssistantPlugin.tools(baseURL: ha.baseURL, entities: ha.entities, transport: transport,
+                                                  token: { await secrets(secret) }) {
+                register(tool)
+            }
+        }
+
+        if let c = manifest.caregiver {
+            let signing: String? = if let name = c.signingSecret { await secrets(name) } else { nil }
+            let alerts = CaregiverAlerts(webhook: c.webhookURL, transport: transport, outboxURL: outboxURL, signingSecret: signing)
+            register(await alerts.tool)
+            installed.caregiver = alerts
+        }
+
+        if manifest.productLookup == true {
+            register(await ProductLookupPlugin(transport: transport).tool)
+        }
+
+        let local = Set(toolNames)
+        for server in manifest.remoteServers ?? [] {
+            var headers: [String: String] = [:]
+            if let name = server.tokenSecret, let token = await secrets(name) { headers["Authorization"] = "Bearer \(token)" }
+            let client = MCPHTTPClient(endpoint: server.endpoint, headers: headers)
+            do {
+                try await registerRemote(client, claims: (server.claims ?? [:]).mapValues(\.toolClaim),
+                                         sideEffects: server.sideEffects ?? [:], skipping: local)
+            } catch {
+                installed.failedRemotes.append(server.endpoint)
+            }
+        }
+        return installed
+    }
+}
+EOF_AVAE
+
 cat > 'EchoGuide/Core/Plugins/PluginRegistry.swift' <<'EOF_AVAE'
 // Owner: Maxwell. Tool layer speaking the Model Context Protocol.
 //
@@ -1689,17 +2199,20 @@ public struct ToolClaim: Sendable, Equatable {
     /// Case-insensitive substrings of recognised text ("start", "defrost").
     public var textContains: [String] = []
     public var barcodePrefixes: [String] = []
+    /// Claim every barcode (product lookup).
+    public var anyBarcode = false
 
-    public init(labels: Set<String> = [], textContains: [String] = [], barcodePrefixes: [String] = []) {
+    public init(labels: Set<String> = [], textContains: [String] = [], barcodePrefixes: [String] = [], anyBarcode: Bool = false) {
         self.labels = labels
         self.textContains = textContains
         self.barcodePrefixes = barcodePrefixes
+        self.anyBarcode = anyBarcode
     }
 
     func claims(_ d: Detection) -> Bool {
         if labels.contains(d.label) { return true }
         guard let text = d.text?.lowercased() else { return false }
-        if d.kind == .barcode { return barcodePrefixes.contains { text.hasPrefix($0.lowercased()) } }
+        if d.kind == .barcode { return anyBarcode || barcodePrefixes.contains { text.hasPrefix($0.lowercased()) } }
         return textContains.contains { text.contains($0.lowercased()) }
     }
 }
@@ -1753,8 +2266,10 @@ public actor PluginRegistry: ToolInvoking {
     /// Pull every tool from a remote MCP server and proxy calls to it.
     /// Remote tools claim detections through `claims`, keyed by tool name,
     /// because MCP has no notion of "what this tool can see".
-    public func registerRemote(_ client: MCPHTTPClient, claims: [String: ToolClaim], sideEffects: [String: ToolSideEffect] = [:]) async throws {
-        for remote in try await client.listTools() {
+    /// Names in `skipping` are never replaced (built-ins win over remote tools).
+    public func registerRemote(_ client: MCPHTTPClient, claims: [String: ToolClaim], sideEffects: [String: ToolSideEffect] = [:],
+                               skipping: Set<String> = []) async throws {
+        for remote in try await client.listTools() where !skipping.contains(remote.name) {
             register(ToolDescriptor(
                 name: remote.name,
                 description: remote.description,
@@ -2064,10 +2579,13 @@ public struct GeminiProvider: ReasoningProvider {
     public var proxyBase: URL
     public var model: String
     public var deviceToken: @Sendable () async -> String?
+    public var transport: HTTPTransport
 
-    public init(proxyBase: URL, model: String = "gemini-2.5-flash", deviceToken: @escaping @Sendable () async -> String?) {
+    public init(proxyBase: URL, model: String = "gemini-2.5-flash", transport: HTTPTransport = URLSessionTransport(),
+                deviceToken: @escaping @Sendable () async -> String?) {
         self.proxyBase = proxyBase
         self.model = model
+        self.transport = transport
         self.deviceToken = deviceToken
     }
 
@@ -2081,7 +2599,7 @@ public struct GeminiProvider: ReasoningProvider {
             "generationConfig": ["maxOutputTokens": 40, "temperature": 0.2],
         ]
         let url = proxyBase.appendingPathComponent("v1beta/models/\(model):generateContent")
-        let json = try await HTTP.postJSON(url, body: body, token: await deviceToken())
+        let json = try await transport.postJSON(url, body: body, bearer: await deviceToken())
         let candidates = json["candidates"] as? [[String: Any]]
         let content = candidates?.first?["content"] as? [String: Any]
         let textParts = content?["parts"] as? [[String: Any]]
@@ -2095,10 +2613,13 @@ public struct OpenAIProvider: ReasoningProvider {
     public var proxyBase: URL
     public var model: String
     public var deviceToken: @Sendable () async -> String?
+    public var transport: HTTPTransport
 
-    public init(proxyBase: URL, model: String = "gpt-4o", deviceToken: @escaping @Sendable () async -> String?) {
+    public init(proxyBase: URL, model: String = "gpt-4o", transport: HTTPTransport = URLSessionTransport(),
+                deviceToken: @escaping @Sendable () async -> String?) {
         self.proxyBase = proxyBase
         self.model = model
+        self.transport = transport
         self.deviceToken = deviceToken
     }
 
@@ -2108,7 +2629,7 @@ public struct OpenAIProvider: ReasoningProvider {
             content.append(["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(jpeg.base64EncodedString())", "detail": "low"]])
         }
         let body: [String: Any] = ["model": model, "max_tokens": 40, "temperature": 0.2, "messages": [["role": "user", "content": content]]]
-        let json = try await HTTP.postJSON(proxyBase.appendingPathComponent("v1/chat/completions"), body: body, token: await deviceToken())
+        let json = try await transport.postJSON(proxyBase.appendingPathComponent("v1/chat/completions"), body: body, bearer: await deviceToken())
         let choices = json["choices"] as? [[String: Any]]
         let message = choices?.first?["message"] as? [String: Any]
         return message?["content"] as? String ?? ""
@@ -2125,21 +2646,6 @@ enum Prompt {
         On-device vision saw: \(seen). \(q.question) \
         Answer in one short plain sentence, no lists, under eight words.
         """
-    }
-}
-
-enum HTTP {
-    static func postJSON(_ url: URL, body: [String: Any], token: String?) async throws -> [String: Any] {
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if let token { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        let (data, response) = try await URLSession.shared.data(for: req)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw URLError(.badServerResponse)
-        }
-        return (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
     }
 }
 
@@ -2174,6 +2680,7 @@ cat > 'EchoGuide/Core/Vision/LocalVisionEngine.swift' <<'EOF_AVAE'
 //   * YOLOv8n / YOLO11n INT8 Core ML (exported with nms=True) on the Neural Engine
 //   * VNDetectHumanHandPoseRequest for the index fingertip (target alignment)
 //   * VNRecognizeTextRequest, .fast level, offline (only on OCR frames)
+//   * VNDetectBarcodesRequest for product codes and QR (same cadence as OCR)
 //
 // Budget: object + hand under ~12 ms on A17-class hardware. OCR is the
 // expensive one (roughly 10-35 ms), so it runs on a cadence, not every frame.
@@ -2188,12 +2695,22 @@ public struct LocalVisionConfig: Sendable {
     /// Run OCR on every Nth inferred frame (1 = always, 0 = never).
     public var ocrEveryNthFrame = 3
     public var detectFingertip = true
+    /// Barcodes ride the OCR cadence: both are "read the label" work.
+    public var detectBarcodes = true
     /// Keep at most this many detections; cognitive isolation picks one anyway.
     public var maxDetections = 12
     public var budgetMs: Double = 12
 
     public init() {}
 }
+
+#if canImport(CoreVideo)
+/// Anything that turns a camera frame into detections. LocalVisionEngine in
+/// the app, a fake in tests; PerceptionPipeline only knows this.
+public protocol FrameInferring: Sendable {
+    func infer(_ frame: CameraFrame) async -> VisionFrameResult
+}
+#endif
 
 public enum VisionGeometry {
     /// Vision boxes are bottom-left origin; the pipeline is top-left (see Contracts).
@@ -2254,6 +2771,10 @@ public actor LocalVisionEngine {
         let runOCR = config.ocrEveryNthFrame > 0 && frameCount % UInt64(config.ocrEveryNthFrame) == 0
         if runOCR { requests.append(text) }
 
+        let barcode = VNDetectBarcodesRequest()
+        barcode.symbologies = [.ean13, .ean8, .upce, .code128, .qr]
+        if runOCR && config.detectBarcodes { requests.append(barcode) }
+
         let handler = VNImageRequestHandler(cvPixelBuffer: frame.pixelBuffer, orientation: orientation)
         do {
             try handler.perform(requests)
@@ -2287,6 +2808,20 @@ public actor LocalVisionEngine {
             }
         }
 
+        if runOCR && config.detectBarcodes {
+            for obs in barcode.results ?? [] {
+                guard let payload = obs.payloadStringValue else { continue }
+                let b = obs.boundingBox
+                detections.append(Detection(
+                    label: "barcode",
+                    confidence: obs.confidence,
+                    box: VisionGeometry.topLeft(x: b.minX, y: b.minY, width: b.width, height: b.height),
+                    kind: .barcode,
+                    text: payload
+                ))
+            }
+        }
+
         detections.sort { $0.confidence > $1.confidence }
         if detections.count > config.maxDetections { detections.removeLast(detections.count - config.maxDetections) }
 
@@ -2306,6 +2841,9 @@ public actor LocalVisionEngine {
         if ms > config.budgetMs { overBudgetFrames += 1 }
         return VisionFrameResult(frameIndex: frame.index, timestamp: frame.timestamp, detections: detections, inferenceMs: ms)
     }
+}
+extension LocalVisionEngine: FrameInferring {
+    public func infer(_ frame: CameraFrame) async -> VisionFrameResult { process(frame) }
 }
 #endif
 EOF_AVAE
@@ -2798,6 +3336,257 @@ actor Counter {
 }
 EOF_AVAE
 
+cat > 'EchoGuideTests/PerceptionAndPluginTests.swift' <<'EOF_AVAE'
+// Owner: Maxwell. Perception pipeline back-pressure and the built-in plugins,
+// all against stubs: no camera, no network.
+
+import CoreVideo
+import Foundation
+import Testing
+import EchoGuideContracts
+@testable import EchoGuideInfra
+import EchoGuideVision
+
+// MARK: - Stubs
+
+final class StubTransport: HTTPTransport, @unchecked Sendable {
+    typealias Responder = @Sendable (URLRequest) throws -> (Int, Data)
+    private let lock = NSLock()
+    private var _requests: [URLRequest] = []
+    private var responder: Responder
+
+    init(_ responder: @escaping Responder = { _ in (200, Data("{}".utf8)) }) { self.responder = responder }
+
+    var requests: [URLRequest] { lock.withLock { _requests } }
+    func respond(_ r: @escaping Responder) { lock.withLock { responder = r } }
+
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let r = lock.withLock { _requests.append(request); return responder }
+        let (status, data) = try r(request)
+        return (data, HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!)
+    }
+}
+
+func pixelBuffer(width: Int = 640, height: Int = 480, fill: UInt8 = 100, square: Bool = false) -> CVPixelBuffer {
+    var pb: CVPixelBuffer?
+    CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, nil, &pb)
+    let buffer = pb!
+    CVPixelBufferLockBaseAddress(buffer, [])
+    let bpr = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
+    let base = CVPixelBufferGetBaseAddressOfPlane(buffer, 0)!.assumingMemoryBound(to: UInt8.self)
+    for y in 0..<height {
+        for x in 0..<width {
+            base[y * bpr + x] = square && x > 160 && x < 480 && y > 120 && y < 360 ? 230 : fill
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(buffer, [])
+    return buffer
+}
+
+actor SlowVision: FrameInferring {
+    let delay: TimeInterval
+    var calls = 0
+    init(delay: TimeInterval) { self.delay = delay }
+    func infer(_ frame: CameraFrame) async -> VisionFrameResult {
+        calls += 1
+        try? await Task.sleep(nanoseconds: UInt64(delay * 1e9))
+        return VisionFrameResult(frameIndex: frame.index, timestamp: frame.timestamp, detections: [], inferenceMs: delay * 1000)
+    }
+}
+
+actor ResultBox {
+    var timings: [PipelineTiming] = []
+    func add(_ t: PipelineTiming) { timings.append(t) }
+}
+
+func waitUntil(_ timeout: TimeInterval = 2, _ condition: () async -> Bool) async {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if await condition() { return }
+        try? await Task.sleep(nanoseconds: 5_000_000)
+    }
+}
+
+// MARK: - Pipeline
+
+@Suite struct PerceptionPipelineTests {
+    @Test func skipsStaticAndInfersOnMotion() async {
+        var config = FrameDeltaConfig()
+        config.idleRefresh = nil
+        config.cooldown = 0
+        let vision = SlowVision(delay: 0)
+        let box = ResultBox()
+        let p = PerceptionPipeline(vision: vision, delta: FrameDeltaEngine(config: config)) { _, t in await box.add(t) }
+
+        let still = pixelBuffer(), moved = pixelBuffer(square: true)
+        p.submit(CameraFrame(pixelBuffer: still, timestamp: 0, index: 1))
+        await waitUntil { await box.timings.count == 1 }
+        for i in 2...20 { p.submit(CameraFrame(pixelBuffer: still, timestamp: Double(i) / 30, index: UInt64(i))) }
+        #expect(p.submit(CameraFrame(pixelBuffer: moved, timestamp: 1, index: 21)).shouldInfer)
+        await waitUntil { await box.timings.count == 2 }
+
+        let s = p.stats
+        #expect(s.framesSeen == 21)
+        #expect(s.framesSkipped == 19)
+        #expect(s.framesInferred == 2)
+        #expect(await vision.calls == 2)
+    }
+
+    @Test func dropsFramesWhileBusyAndRecoversMotion() async {
+        var config = FrameDeltaConfig()
+        config.cooldown = 0
+        config.idleRefresh = nil
+        let vision = SlowVision(delay: 0.2)
+        let box = ResultBox()
+        let p = PerceptionPipeline(vision: vision, delta: FrameDeltaEngine(config: config)) { _, t in await box.add(t) }
+
+        p.submit(CameraFrame(pixelBuffer: pixelBuffer(), timestamp: 0, index: 1)) // first frame -> infer (slow)
+        p.submit(CameraFrame(pixelBuffer: pixelBuffer(square: true), timestamp: 0.03, index: 2)) // motion, busy -> dropped
+        #expect(p.stats.framesDroppedBusy == 1)
+
+        await waitUntil { await box.timings.count == 1 }
+        // The dropped motion is not lost: the next frame is forced through.
+        #expect(p.submit(CameraFrame(pixelBuffer: pixelBuffer(square: true), timestamp: 0.5, index: 3)) == .infer(.forced))
+        await waitUntil { await box.timings.count == 2 }
+        #expect(p.stats.computeSaved > 0)
+    }
+
+    @Test func timingIsConsistent() async throws {
+        let box = ResultBox()
+        let p = PerceptionPipeline(vision: SlowVision(delay: 0.01)) { _, t in await box.add(t) }
+        p.submit(CameraFrame(pixelBuffer: pixelBuffer(), timestamp: 0, index: 1))
+        await waitUntil { await box.timings.count == 1 }
+        let t = try #require(await box.timings.first)
+        #expect(t.totalMs >= t.inferenceMs)
+        #expect(t.deltaMs < 5)
+        await waitUntil { p.stats.totalP50Ms > 0 }
+        #expect(p.stats.totalP50Ms >= t.totalMs)
+    }
+}
+
+// MARK: - Plugins
+
+@Suite struct BuiltInPluginTests {
+    @Test func homeAssistantCallsService() async throws {
+        let transport = StubTransport()
+        let tools = HomeAssistantPlugin.tools(
+            baseURL: URL(string: "http://ha.local:8123")!,
+            entities: [HomeAssistantEntity(name: "microwave_start", doneSentence: "Microwave started.",
+                                           entityId: "switch.microwave", service: "switch.turn_on", textContains: ["start"])],
+            transport: transport, token: { "tok" })
+        let registry = PluginRegistry()
+        for t in tools { await registry.register(t) }
+
+        let m = try #require(await registry.match(Detection(label: "text", confidence: 0.9, box: ImageRect(x: 0, y: 0, width: 0.1, height: 0.1),
+                                                            kind: .text, text: "START")))
+        #expect(m.sideEffect == .physical)
+        #expect(try await registry.invoke(m) == "Microwave started.")
+
+        let req = try #require(transport.requests.first)
+        #expect(req.url?.absoluteString == "http://ha.local:8123/api/services/switch/turn_on")
+        #expect(req.value(forHTTPHeaderField: "Authorization") == "Bearer tok")
+        let body = try JSONSerialization.jsonObject(with: req.httpBody!) as? [String: String]
+        #expect(body == ["entity_id": "switch.microwave"])
+    }
+
+    @Test func homeAssistantErrorSurfaces() async {
+        let transport = StubTransport { _ in (401, Data()) }
+        let tool = HomeAssistantPlugin.tools(baseURL: URL(string: "http://ha.local")!,
+                                             entities: [HomeAssistantEntity(name: "x", doneSentence: "ok", entityId: "light.a", service: "light.turn_on")],
+                                             transport: transport, token: { nil })[0]
+        await #expect(throws: HTTPStatusError(status: 401)) { try await tool.handler([:]) }
+    }
+
+    @Test func caregiverAlertQueuesOfflineAndDeliversLater() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let outbox = dir.appendingPathComponent("outbox.json")
+        let transport = StubTransport { _ in throw URLError(.notConnectedToInternet) }
+        let alerts = CaregiverAlerts(webhook: URL(string: "https://care.example/alerts")!, transport: transport,
+                                     outboxURL: outbox, signingSecret: "s3cret")
+
+        // Offline: the tool must not claim the carer was told.
+        let tool = await alerts.tool
+        await #expect(throws: CaregiverAlertQueued()) { try await tool.handler(["region": "home"]) }
+        #expect(await alerts.pending == 1)
+
+        // Survives a relaunch.
+        let relaunched = CaregiverAlerts(webhook: URL(string: "https://care.example/alerts")!, transport: transport,
+                                         outboxURL: outbox, signingSecret: "s3cret")
+        #expect(await relaunched.pending == 1)
+
+        // Back online: delivered once, signed, with an idempotency key.
+        transport.respond { _ in (200, Data()) }
+        await relaunched.flush()
+        #expect(await relaunched.pending == 0)
+        let sent = try #require(transport.requests.last)
+        #expect(sent.value(forHTTPHeaderField: "Idempotency-Key") != nil)
+        #expect(sent.value(forHTTPHeaderField: "X-EchoGuide-Signature")?.hasPrefix("sha256=") == true)
+    }
+
+    @Test func signatureIsStableHMAC() {
+        // RFC 4231-style sanity: same input, same output, 64 hex chars.
+        let a = CaregiverAlerts.signature(Data("x".utf8), secret: "k")
+        #expect(a == CaregiverAlerts.signature(Data("x".utf8), secret: "k"))
+        #expect(a.count == "sha256=".count + 64)
+        #expect(a != CaregiverAlerts.signature(Data("y".utf8), secret: "k"))
+    }
+
+    @Test func productLookupParsesAndCaches() async {
+        let json = #"{"status":1,"product":{"product_name":"Baked Beans","brands":"Heinz, Kraft","allergens_tags":["en:gluten","en:milk"]}}"#
+        let transport = StubTransport { _ in (200, Data(json.utf8)) }
+        let plugin = ProductLookupPlugin(transport: transport)
+        #expect(await plugin.describe("5000157024671") == "Heinz Baked Beans. Contains gluten, milk.")
+        _ = await plugin.describe("5000157024671")
+        #expect(transport.requests.count == 1)
+        #expect(transport.requests[0].value(forHTTPHeaderField: "User-Agent")?.hasPrefix("EchoGuide") == true)
+    }
+
+    @Test func qrCodesNeverLeaveTheDevice() async {
+        let transport = StubTransport()
+        let plugin = ProductLookupPlugin(transport: transport)
+        #expect(await plugin.describe("https://example.com/menu") == "QR code for example.com.")
+        #expect(await plugin.describe("hello") == "This code is not a product barcode.")
+        #expect(transport.requests.isEmpty)
+    }
+
+    @Test func anyBarcodeClaim() {
+        let d = Detection(label: "barcode", confidence: 0.9, box: ImageRect(x: 0, y: 0, width: 0.1, height: 0.1), kind: .barcode, text: "123")
+        #expect(ToolClaim(anyBarcode: true).claims(d))
+        #expect(!ToolClaim().claims(d))
+    }
+}
+
+@Suite struct ManifestTests {
+    let json = #"""
+    {
+      "homeAssistant": { "baseURL": "http://homeassistant.local:8123", "tokenSecret": "ha_token",
+        "entities": [ { "name": "microwave_start", "doneSentence": "Microwave started.",
+                        "entityId": "switch.microwave", "service": "switch.turn_on",
+                        "textContains": ["start"], "sideEffect": "physical" } ] },
+      "caregiver": { "webhookURL": "https://care.example.com/alerts", "signingSecret": "care_hmac" },
+      "productLookup": true,
+      "remoteServers": [ { "endpoint": "http://127.0.0.1:9/mcp" } ]
+    }
+    """#
+
+    @Test func installsEveryToolAndReportsDeadRemotes() async throws {
+        let manifest = try PluginManifest.load(Data(json.utf8))
+        let registry = PluginRegistry()
+        let secrets: SecretProvider = { ["ha_token": "t", "care_hmac": "h"][$0] }
+        let installed = await registry.install(manifest, secrets: secrets, transport: StubTransport())
+        #expect(await registry.toolNames == ["microwave_start", "notify_caregiver", "lookup_product"])
+        #expect(installed.caregiver != nil)
+        #expect(installed.failedRemotes == [URL(string: "http://127.0.0.1:9/mcp")!])
+    }
+
+    @Test func rejectsUnknownSideEffect() {
+        let bad = json.replacingOccurrences(of: "\"physical\"", with: "\"explosive\"")
+        #expect(throws: (any Error).self) { try PluginManifest.load(Data(bad.utf8)) }
+    }
+}
+EOF_AVAE
+
 cat > 'Package.swift' <<'EOF_AVAE'
 // swift-tools-version: 5.10
 // Owner: Maxwell (infrastructure). Targets split by engine; ownership between the two
@@ -2949,11 +3738,13 @@ This package is the engine. An Xcode iOS app target links the `EchoGuide` librar
 
 1. Bundles a YOLO Core ML model and passes it to `LocalVisionEngine(modelURL:)`. Export it with `yolo export model=yolo11n.pt format=coreml int8=True nms=True`. Models are git-ignored.
 2. Sets up the camera feed. With LiDAR, it runs `LiDARDepthEngine` and feeds its `onFrame` into `FrameDeltaEngine`. ARKit owns the camera, so `CameraFeed` cannot run at the same time. Without LiDAR, it uses `CameraFeed`.
-3. Runs each triggered frame through `LocalVisionEngine.process`, then `SpatialFence.evaluate`, then `AutomationEngine.ingest(_:fence:)`.
+3. Builds a `PerceptionPipeline(vision: LocalVisionEngine(...))` and calls `submit` from the camera queue. The pipeline skips static frames, keeps at most one inference in flight (frames that arrive while it is busy are dropped, not queued), and times every stage. In `onResult`, run `SpatialFence.evaluate`, then `AutomationEngine.ingest(_:fence:)`.
 4. Adds `Info.plist` keys: `NSCameraUsageDescription` and `NSLocationAlwaysAndWhenInUseUsageDescription`, plus the `location` background mode for the location fence.
 5. Points `GeminiProvider` / `OpenAIProvider` at a proxy you run. No API keys ship in the app.
 
 ## Plugins (MCP)
+
+Built-in tools: **Home Assistant** (presses the control for the user through one hub that already integrates thousands of appliances), **caregiver alerts** (signed webhook, idempotent, saved to a disk outbox so an alert raised offline is delivered on reconnect; the user is told "your carer has been told" only once it has actually gone out), and **product lookup** (barcode to product name and allergens via Open Food Facts; QR codes never leave the device). A per-home `PluginManifest` JSON sets all of this up without a code change, and secrets come from the Keychain, never from the manifest.
 
 `PluginRegistry` serves MCP `initialize`, `tools/list` and `tools/call` over JSON-RPC 2.0. `MCPHTTPClient` connects to remote MCP servers over Streamable HTTP. An example FastMCP server is in `plugins/smart_home_server.py`.
 
@@ -2963,7 +3754,6 @@ Remote tools are registered as `physical` unless told otherwise. A physical tool
 
 - The WebSocket voice loop (Deepgram STT / ElevenLabs TTS). On-device `AVSpeechSynthesizer` is used for now, so the app works offline.
 - The OpenAI Realtime API (multi-turn). The router uses one-shot Chat Completions.
-- Barcode detection (`VNDetectBarcodesRequest`). The contract and plugin matching already support it.
 - The Xcode app target and the bundled model.
 EOF_AVAE
 

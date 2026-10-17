@@ -68,11 +68,13 @@ This package is the engine. An Xcode iOS app target links the `EchoGuide` librar
 
 1. Bundles a YOLO Core ML model and passes it to `LocalVisionEngine(modelURL:)`. Export it with `yolo export model=yolo11n.pt format=coreml int8=True nms=True`. Models are git-ignored.
 2. Sets up the camera feed. With LiDAR, it runs `LiDARDepthEngine` and feeds its `onFrame` into `FrameDeltaEngine`. ARKit owns the camera, so `CameraFeed` cannot run at the same time. Without LiDAR, it uses `CameraFeed`.
-3. Runs each triggered frame through `LocalVisionEngine.process`, then `SpatialFence.evaluate`, then `AutomationEngine.ingest(_:fence:)`.
+3. Builds a `PerceptionPipeline(vision: LocalVisionEngine(...))` and calls `submit` from the camera queue. The pipeline skips static frames, keeps at most one inference in flight (frames that arrive while it is busy are dropped, not queued), and times every stage. In `onResult`, run `SpatialFence.evaluate`, then `AutomationEngine.ingest(_:fence:)`.
 4. Adds `Info.plist` keys: `NSCameraUsageDescription` and `NSLocationAlwaysAndWhenInUseUsageDescription`, plus the `location` background mode for the location fence.
 5. Points `GeminiProvider` / `OpenAIProvider` at a proxy you run. No API keys ship in the app.
 
 ## Plugins (MCP)
+
+Built-in tools: **Home Assistant** (presses the control for the user through one hub that already integrates thousands of appliances), **caregiver alerts** (signed webhook, idempotent, saved to a disk outbox so an alert raised offline is delivered on reconnect; the user is told "your carer has been told" only once it has actually gone out), and **product lookup** (barcode to product name and allergens via Open Food Facts; QR codes never leave the device). A per-home `PluginManifest` JSON sets all of this up without a code change, and secrets come from the Keychain, never from the manifest.
 
 `PluginRegistry` serves MCP `initialize`, `tools/list` and `tools/call` over JSON-RPC 2.0. `MCPHTTPClient` connects to remote MCP servers over Streamable HTTP. An example FastMCP server is in `plugins/smart_home_server.py`.
 
@@ -82,5 +84,4 @@ Remote tools are registered as `physical` unless told otherwise. A physical tool
 
 - The WebSocket voice loop (Deepgram STT / ElevenLabs TTS). On-device `AVSpeechSynthesizer` is used for now, so the app works offline.
 - The OpenAI Realtime API (multi-turn). The router uses one-shot Chat Completions.
-- Barcode detection (`VNDetectBarcodesRequest`). The contract and plugin matching already support it.
 - The Xcode app target and the bundled model.
