@@ -2,6 +2,8 @@
 
 Hands-free spatial vision for people with visual impairment or dementia. The camera watches. When something changes, the engine works out the **one** next step and guides the hand there with haptic pulses and directional audio. It calls a tool only when the user holds their finger on the target. The phone screen is optional.
 
+* NOT A MEDICAL DEVICE OR FDA APPROVED CURRENTLY JUST FOR TESTING
+
 ```
 camera ─► FrameDeltaEngine ─► LocalVisionEngine ─► DigitalFence ─┐
  (ARKit or AVCapture)  skip ~99% static     YOLO INT8 + hand + OCR       │
