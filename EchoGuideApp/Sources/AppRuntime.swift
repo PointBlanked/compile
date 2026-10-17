@@ -135,8 +135,16 @@ final class AppRuntime {
         self.automation = automation
         guidance.bind(to: automation)
         await automation.setGoal(config.goal)
+        // OCR correction gets a text-only model when configured: it is faster
+        // and better at it than the vision model, and it never needs the photo.
+        var textRouter: ReasoningRouting? = nil
+        if let text = config.textURL {
+            var textConfig = CloudRouterConfig()
+            textConfig.timeout = 3
+            textRouter = CloudReasoningRouter(config: textConfig, provider: OpenAIProvider(proxyBase: text, model: "text", deviceToken: { nil }), connectivity: connectivity)
+        }
         let latestForScene = self.latest
-        let agent = AgentCore(audio: audio, haptics: haptics, depth: lidar, router: router,
+        let agent = AgentCore(audio: audio, haptics: haptics, depth: lidar, router: router, textRouter: textRouter,
                               jpegProvider: { latestForScene.jpeg(maxSide: 512) })
         self.agent = agent
         // What the mic heard: a question about the recent past is answered

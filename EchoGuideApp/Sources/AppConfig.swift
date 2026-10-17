@@ -20,6 +20,9 @@ struct AppConfig: Decodable {
     /// server you run (llama.cpp on a Freestyle VM). Used by the cloud router
     /// when no key proxy is configured; photos go to your own server.
     var visionURL: URL?
+    /// Optional text-only model for OCR correction (faster and better at it
+    /// than a vision model). Falls back to visionURL when absent.
+    var textURL: URL?
     /// Start narrowed to one task ("start"), nil for open scanning.
     var goal: String?
 

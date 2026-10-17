@@ -59,6 +59,8 @@ public actor AgentCore {
     private let haptics: HapticCueing
     private let depth: DepthProviding?
     private let router: ReasoningRouting?
+    /// Text-only model for OCR verification; `router` when nil.
+    private let textRouter: ReasoningRouting?
     private var narrator: SceneNarrator
     private var reader = TextReader()
     private var scene = SceneIntelligence()
@@ -78,6 +80,7 @@ public actor AgentCore {
     private let clock: @Sendable () -> TimeInterval
 
     public init(audio: SpatialAudioCueing, haptics: HapticCueing, depth: DepthProviding? = nil, router: ReasoningRouting? = nil,
+                textRouter: ReasoningRouting? = nil,
                 narrator: NarratorConfig = NarratorConfig(), scene: SceneIntelligenceConfig = SceneIntelligenceConfig(),
                 jpegProvider: (@Sendable () -> Data?)? = nil,
                 clock: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSince1970 }) {
@@ -85,6 +88,7 @@ public actor AgentCore {
         self.haptics = haptics
         self.depth = depth
         self.router = router
+        self.textRouter = textRouter
         self.narrator = SceneNarrator(config: narrator)
         self.scene = SceneIntelligence(config: scene)
         self.jpegProvider = jpegProvider
@@ -163,7 +167,7 @@ public actor AgentCore {
             // OCR -> local gate -> model correction, off the frame path.
             let fresh = TextVerifier.gate(reader.newLines(in: frame))
             guard !fresh.isEmpty else { return false }
-            if router == nil {
+            if textRouter == nil, router == nil {
                 // No model to hand off to: the gate is the whole check, instant.
                 await say(fresh.prefix(3).joined(separator: ". "), source: .reader)
                 return false
@@ -249,7 +253,7 @@ public actor AgentCore {
         while !pendingLines.isEmpty, mode == .read {
             let batch = Array(pendingLines.prefix(3))
             pendingLines.removeFirst(batch.count)
-            let cleaned = await verifier.verify(batch, router: router)
+            let cleaned = await verifier.verify(batch, router: textRouter ?? router)
             guard !cleaned.isEmpty, mode == .read else { continue }
             await say(cleaned.joined(separator: ". "), source: .reader)
         }
@@ -272,7 +276,7 @@ public actor AgentCore {
     @discardableResult
     public func readNow() async -> String {
         guard let frame = lastFrame else { return "" }
-        let lines = await verifier.verify(TextReader.lines(in: frame), router: router)
+        let lines = await verifier.verify(TextReader.lines(in: frame), router: textRouter ?? router)
         let text = lines.isEmpty ? "I cannot see any text. Hold the phone about a foot away and keep still." : lines.prefix(6).joined(separator: ". ")
         await say(text, source: .reader, urgent: true)
         return text

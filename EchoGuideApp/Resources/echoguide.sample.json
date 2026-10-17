@@ -2,6 +2,7 @@
   "goal": null,
   "kokoroURL": "https://echoguide-voice.style.dev",
   "visionURL": "https://echoguide-vision.style.dev",
+  "textURL": "https://echoguide-text.style.dev",
   "plugins": {
     "productLookup": true
   },
