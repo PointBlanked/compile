@@ -54,6 +54,11 @@ public actor AutomationEngine {
     private let depth: DepthProviding?
     private let router: ReasoningRouting?
     private let tools: ToolInvoking?
+    /// Current camera frame as JPEG, for the task guide's orientation checks.
+    private let jpegProvider: (@Sendable () -> Data?)?
+    private var task: TaskGuide?
+    private var checkInFlight = false
+    private var progressContinuations: [UUID: AsyncStream<TaskProgress?>.Continuation] = [:]
 
     private var lastSpokenLabel: String?
     /// Where the last announced target was, so a different OCR reading of the
@@ -82,13 +87,15 @@ public actor AutomationEngine {
         router: ReasoningRouting? = nil,
         tools: ToolInvoking? = nil,
         cognitive: CognitiveTaskIsolation = CognitiveTaskIsolation(),
-        config: AutomationConfig = AutomationConfig()
+        config: AutomationConfig = AutomationConfig(),
+        jpegProvider: (@Sendable () -> Data?)? = nil
     ) {
         self.haptics = haptics
         self.audio = audio
         self.depth = depth
         self.router = router
         self.tools = tools
+        self.jpegProvider = jpegProvider
         self.isolation = cognitive
         self.config = config
     }
@@ -124,7 +131,13 @@ public actor AutomationEngine {
     }
 
     /// Narrow the engine to one task ("start", "microwave"); nil for open scanning.
+    /// A goal that names a multi-step task ("take a photo") starts a TaskPlan instead.
     public func setGoal(_ goal: String?) {
+        if let goal, let plan = TaskPlan.parse(goal) {
+            setPlan(plan)
+            return
+        }
+        setPlan(nil)
         isolation.goal = goal
         isolation.reset()
         completedUntil = [:]
@@ -134,7 +147,44 @@ public actor AutomationEngine {
         onTargetSince = nil
     }
 
-    public var goal: String? { isolation.goal }
+    public var goal: String? { task?.plan.name ?? isolation.goal }
+
+    /// Step n of m for the screen; nil when no task is running.
+    public struct TaskProgress: Sendable, Equatable {
+        public var name: String
+        public var step: Int
+        public var of: Int
+    }
+
+    public var taskProgress: TaskProgress? {
+        guard let task, !task.isFinished else { return nil }
+        return TaskProgress(name: task.plan.name, step: task.progress.step, of: task.progress.of)
+    }
+
+    public func progress() -> AsyncStream<TaskProgress?> {
+        AsyncStream { c in
+            let id = UUID()
+            c.yield(taskProgress)
+            progressContinuations[id] = c
+            c.onTermination = { [weak self] _ in Task { await self?.removeProgressContinuation(id) } }
+        }
+    }
+
+    private func removeProgressContinuation(_ id: UUID) { progressContinuations[id] = nil }
+
+    private func publishProgress() {
+        let p = taskProgress
+        for c in progressContinuations.values { c.yield(p) }
+    }
+
+    /// Run a multi-step physical task; nil stops it and returns to single targets.
+    public func setPlan(_ plan: TaskPlan?) {
+        task = plan.map { TaskGuide(plan: $0) }
+        isolation.goal = nil
+        isolation.reset()
+        checkInFlight = false
+        publishProgress()
+    }
 
     public func start() {
         forgetTarget()
@@ -145,6 +195,8 @@ public actor AutomationEngine {
     public func stop() async {
         forgetTarget()
         setCaution(nil)
+        task = nil
+        publishProgress()
         transition(.idle)
         await haptics.stop()
     }
@@ -164,6 +216,11 @@ public actor AutomationEngine {
 
         if case .approaching(let zone, _)? = fence { setCaution(zone) } else { setCaution(nil) }
         if let fence, await handle(fence, at: now) { return }
+
+        if task != nil {
+            await runTask(frame, at: now)
+            return
+        }
 
         // Recently finished targets are off the menu; prune expired ones.
         completedUntil = completedUntil.filter { $0.value > now }
@@ -232,6 +289,56 @@ public actor AutomationEngine {
     /// Location-fence events arrive without a frame (screen may be off).
     public func ingest(fence: FenceEvent, at time: TimeInterval) async {
         _ = await handle(fence, at: time)
+    }
+
+    // MARK: - Tasks
+
+    private func runTask(_ frame: VisionFrameResult, at now: TimeInterval) async {
+        guard var guide = task else { return }
+        let cues = guide.step(frame, now: now)
+        task = guide
+        await apply(cues, frame: frame, at: now)
+    }
+
+    private func apply(_ cues: [TaskGuide.Cue], frame: VisionFrameResult, at now: TimeInterval) async {
+        for cue in cues {
+            switch cue {
+            case .speak(let line):
+                let step = ActionStep(targetLabel: task?.plan.name ?? "task", instruction: line, guidance: .announce, target: nil)
+                transition(.guiding(step))
+                await audio.speak(line, azimuth: 0)
+                publishProgress()
+            case .guide(let dx, let dy):
+                if dx == 0, dy == 0 { await haptics.stop() } else { await haptics.guide(offset: dx, dy, distanceMetres: nil) }
+            case .confirm:
+                await haptics.confirm()
+            case .check(let question):
+                guard !checkInFlight else { continue }
+                checkInFlight = true
+                let jpeg = jpegProvider?()
+                Task { await self.runCheck(question, jpeg: jpeg, detections: frame.detections) }
+            case .done(let say):
+                await haptics.stop()
+                await audio.speak(say, azimuth: 0)
+                transition(.completed(say))
+                task = nil
+                publishProgress()
+            }
+        }
+    }
+
+    /// Yes/no question to the vision model about the current frame; nil when no model.
+    private func runCheck(_ question: String, jpeg: Data?, detections: [Detection]) async {
+        var answer: Bool?
+        if let router, jpeg != nil {
+            let out = await router.resolve(ReasoningQuery(question: question + " Reply with only yes or no.", detections: detections.filter { $0.kind == .object }, localConfidence: 0, jpeg: jpeg, maxWords: 3, timeout: 10))
+            if out.source == .cloud { answer = out.answer.lowercased().hasPrefix("yes") }
+        }
+        checkInFlight = false
+        guard var guide = task else { return }
+        let cues = guide.checkResult(answer, now: Date().timeIntervalSince1970)
+        task = guide
+        await apply(cues, frame: VisionFrameResult(frameIndex: 0, timestamp: 0, detections: detections, inferenceMs: 0), at: 0)
     }
 
     // MARK: - Steps

@@ -24,6 +24,9 @@ public final class GuidanceModel {
     /// Hazard zone the hand is approaching, for the amber banner.
     public private(set) var caution: String?
     public private(set) var isListening = false
+    /// Step n of m of a running multi-step task, nil for single targets.
+    public private(set) var taskProgress: AutomationEngine.TaskProgress?
+    private var progressTask: Task<Void, Never>?
     /// Short feedback after a listening attempt ("Heard: start", "Did not catch that").
     public private(set) var listenResult: String?
     private var engine: AutomationEngine?
@@ -53,6 +56,12 @@ public final class GuidanceModel {
         cautionTask = Task { [weak self] in
             for await c in await engine.cautions() {
                 self?.caution = c
+            }
+        }
+        progressTask?.cancel()
+        progressTask = Task { [weak self] in
+            for await p in await engine.progress() {
+                self?.taskProgress = p
             }
         }
         Task { [weak self] in
@@ -180,6 +189,20 @@ public struct GuidancePanel: View {
 
     public var body: some View {
         VStack(spacing: 10) {
+            if let p = model.taskProgress {
+                HStack(spacing: 8) {
+                    Text(p.name.capitalizedFirst)
+                        .font(.system(.subheadline, design: .rounded, weight: .bold))
+                    Text("step \(p.step) of \(p.of)")
+                        .font(.system(.subheadline, design: .monospaced, weight: .semibold))
+                        .opacity(0.8)
+                }
+                .foregroundStyle(.black)
+                .padding(.vertical, 6).padding(.horizontal, 12)
+                .background(Color.yellow, in: Capsule())
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityLabel("\(p.name), step \(p.step) of \(p.of)")
+            }
             if let caution = model.cautionLine, !model.isWarning {
                 Label(caution, systemImage: "exclamationmark.triangle.fill")
                     .font(.system(.headline, design: .rounded, weight: .bold))

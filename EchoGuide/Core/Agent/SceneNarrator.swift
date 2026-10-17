@@ -54,7 +54,7 @@ public enum SceneVocabulary {
     ]
 
     /// Never volunteered: the user's own hand, and background clutter.
-    public static let silent: Set<String> = ["fingertip", "text"]
+    public static let silent: Set<String> = ["fingertip", "text", "hand"]
 
     public static func salience(of label: String) -> Int { salience[label] ?? 2 }
 

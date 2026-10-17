@@ -129,7 +129,9 @@ final class AppRuntime {
         if let manifest { await registry.install(manifest, secrets: { Keychain.read($0) }) }
 
         // Decisions.
-        let automation = AutomationEngine(haptics: haptics, audio: audio, depth: lidar, router: router, tools: registry)
+        let latestForTask = self.latest
+        let automation = AutomationEngine(haptics: haptics, audio: audio, depth: lidar, router: router, tools: registry,
+                                          jpegProvider: { latestForTask.jpeg(maxSide: 512) })
         self.automation = automation
         guidance.bind(to: automation)
         await automation.setGoal(config.goal)

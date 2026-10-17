@@ -157,15 +157,29 @@ public actor LocalVisionEngine {
         detections.sort { $0.confidence > $1.confidence }
         if detections.count > config.maxDetections { detections.removeLast(detections.count - config.maxDetections) }
 
-        if config.detectFingertip, let obs = hand.results?.first,
-           let tip = try? obs.recognizedPoint(.indexTip), tip.confidence > 0.3 {
-            let p = VisionGeometry.topLeft(pointX: tip.location.x, pointY: tip.location.y)
-            detections.append(Detection(
-                label: "fingertip",
-                confidence: tip.confidence,
-                box: ImageRect(x: p.x - 0.01, y: p.y - 0.01, width: 0.02, height: 0.02),
-                kind: .fingertip
-            ))
+        if config.detectFingertip, let obs = hand.results?.first {
+            if let tip = try? obs.recognizedPoint(.indexTip), tip.confidence > 0.3 {
+                let p = VisionGeometry.topLeft(pointX: tip.location.x, pointY: tip.location.y)
+                detections.append(Detection(
+                    label: "fingertip",
+                    confidence: tip.confidence,
+                    box: ImageRect(x: p.x - 0.01, y: p.y - 0.01, width: 0.02, height: 0.02),
+                    kind: .fingertip
+                ))
+            }
+            // The whole hand as a box over its confident joints, for reach and
+            // grasp guidance (TaskGuide). Labelled "hand"; YOLO has no such class.
+            if let joints = try? obs.recognizedPoints(.all) {
+                let pts = joints.values.filter { $0.confidence > 0.3 }.map { VisionGeometry.topLeft(pointX: $0.location.x, pointY: $0.location.y) }
+                if pts.count >= 5, let minX = pts.map(\.x).min(), let maxX = pts.map(\.x).max(),
+                   let minY = pts.map(\.y).min(), let maxY = pts.map(\.y).max() {
+                    detections.append(Detection(
+                        label: "hand",
+                        confidence: Float(pts.count) / 21,
+                        box: ImageRect(x: minX, y: minY, width: max(0.02, maxX - minX), height: max(0.02, maxY - minY))
+                    ))
+                }
+            }
         }
 
         let ms = timer.elapsedMs

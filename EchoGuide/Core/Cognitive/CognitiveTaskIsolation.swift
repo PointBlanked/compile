@@ -20,7 +20,7 @@ public struct CognitiveConfig: Sendable {
     public var sameTargetIoU: Float = 0.3
     public var maxInstructionWords = 8
     /// Labels never offered as a step on their own (background clutter).
-    public var ignoredLabels: Set<String> = ["person", "dining table", "chair"]
+    public var ignoredLabels: Set<String> = ["person", "dining table", "chair", "hand"]
 
     public init() {}
 }

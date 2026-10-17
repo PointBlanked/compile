@@ -789,3 +789,99 @@ struct StubListener: GoalListening {
         #expect(await agent.stats.sceneDescriptions == 1)
     }
 }
+
+// MARK: - Multi-step physical tasks
+
+@Suite struct TaskGuideTests {
+    func hand(x: Float, y: Float, size: Float = 0.12) -> Detection { det("hand", x: x, y: y, size: size, conf: 0.8) }
+
+    @Test func goalsThatAreTasks() {
+        #expect(TaskPlan.parse("take a photo of the person") == .photo)
+        #expect(TaskPlan.parse("Take a picture")?.steps.count == 4)
+        #expect(TaskPlan.parse("grab the remote")?.name == "pick up the remote")
+        #expect(TaskPlan.parse("start button") == nil)
+        #expect(TaskPlan.parse("microwave") == nil)
+    }
+
+    @Test func wordingUsesTwoAxesLargerFirst() {
+        #expect(TaskWording.direction(dx: 0.3, dy: 0.2) == "right and down")
+        #expect(TaskWording.direction(dx: -0.1, dy: 0.3) == "down and left")
+        #expect(TaskWording.direction(dx: 0.08, dy: 0.01) == "a little right")
+        #expect(TaskWording.direction(dx: 0.01, dy: 0.01) == "a little closer")
+        #expect(TaskWording.relative(dx: 0.3, dy: 0.2) == "to your right and below your hand")
+        #expect(TaskGeometry.overlap(of: ImageRect(x: 0, y: 0, width: 1, height: 1), over: ImageRect(x: 0.5, y: 0, width: 1, height: 1)) == 0.5)
+    }
+
+    @Test func reachGraspOrientAimFinish() {
+        var g = TaskGuide(plan: .photo)
+        let phone = det("cell phone", x: 0.7, y: 0.6, size: 0.15, conf: 0.9)
+        // Nothing seen: ask for the object, not the hand.
+        #expect(g.step(frame([hand(x: 0.3, y: 0.3)], t: 0), now: 0) == [.speak("I cannot see the phone. Move the camera slowly.")])
+        // Object but no hand.
+        #expect(g.step(frame([phone], t: 0.1), now: 0.1) == [.speak("Show me your hand.")])
+        // Both: first line says where it is relative to the hand, with haptics.
+        let first = g.step(frame([phone, hand(x: 0.3, y: 0.3)], t: 0.2), now: 0.2)
+        #expect(first.count == 2)
+        #expect(first.contains(.speak("Phone to your right and below your hand.")))
+        // Then movement words, not repeated every frame.
+        let second = g.step(frame([phone, hand(x: 0.4, y: 0.4)], t: 0.3), now: 0.3)
+        #expect(second.contains(.speak("Move right and down.")))
+        let third = g.step(frame([phone, hand(x: 0.45, y: 0.45)], t: 0.4), now: 0.4)
+        #expect(third == [.guide(dx: 0.25, dy: 0.15)] || third.count == 1)
+        // Hand over the phone: hold, then grasp confirmed.
+        #expect(g.step(frame([phone, hand(x: 0.7, y: 0.6)], t: 1), now: 1) == [.guide(dx: 0, dy: 0)])
+        let grasped = g.step(frame([phone, hand(x: 0.7, y: 0.6)], t: 1.5), now: 1.5)
+        #expect(grasped == [.confirm, .speak("Got it.")])
+        #expect(g.progress.step == 2)
+        // Orient: instruction, then after the wait a check for the model.
+        #expect(g.step(frame([], t: 1.6), now: 1.6) == [.speak("Flip it so the lens faces away from you.")])
+        #expect(g.step(frame([], t: 2), now: 2) == [])
+        guard case .check? = g.step(frame([], t: 5), now: 5).first else { Issue.record("expected a check"); return }
+        // Model says no once: re-prompt; then yes: advance.
+        #expect(g.checkResult(false, now: 6) == [.speak("Not yet. Flip it so the lens faces away from you.")])
+        guard case .check? = g.step(frame([], t: 10), now: 10).first else { Issue.record("expected a second check"); return }
+        #expect(g.checkResult(true, now: 11) == [.speak("Good.")])
+        #expect(g.progress.step == 3)
+        // Aim at the person.
+        let person = det("person", x: 0.6, y: 0.3, size: 0.4, conf: 0.9)
+        let aim = g.step(frame([person, hand(x: 0.4, y: 0.6)], t: 12), now: 12)
+        #expect(aim.contains(.speak("Person ahead. Point up and right.")))
+        #expect(g.step(frame([person, hand(x: 0.6, y: 0.3)], t: 13), now: 13) == [.guide(dx: 0, dy: 0)])
+        #expect(g.step(frame([person, hand(x: 0.6, y: 0.3)], t: 13.6), now: 13.6) == [.confirm, .speak("Lined up.")])
+        // Finish.
+        #expect(g.step(frame([], t: 14), now: 14) == [.done("Lined up. Hold still and press the shutter.")])
+        #expect(g.isFinished)
+    }
+
+    @Test func noModelMeansOrientIsTrusted() {
+        var g = TaskGuide(plan: TaskPlan(name: "t", steps: [.orient(instruction: "Turn it over.", check: nil), .finish(say: "Done.")]))
+        #expect(g.step(frame([], t: 0), now: 0) == [.speak("Turn it over.")])
+        #expect(g.step(frame([], t: 3.5), now: 3.5) == [.speak("Okay.")])
+        #expect(g.step(frame([], t: 4), now: 4) == [.done("Done.")])
+    }
+
+    @Test func engineRunsAPlanFromTheGoal() async {
+        let h = RecordingHaptics(), a = RecordingAudio()
+        let e = AutomationEngine(haptics: h, audio: a)
+        await e.start()
+        await e.setGoal("grab the remote")
+        #expect(await e.goal == "pick up the remote")
+        #expect(await e.taskProgress?.of == 2)
+        let remote = det("remote", x: 0.7, y: 0.5, size: 0.12, conf: 0.9)
+        await e.ingest(frame([remote, det("hand", x: 0.3, y: 0.5, size: 0.12, conf: 0.8)], t: 0))
+        #expect(await a.spoken.last == "Remote to your right.")
+        #expect(await h.guides == 1)
+        guard case .guiding(let step) = await e.state else { Issue.record("expected guiding"); return }
+        #expect(step.instruction == "Remote to your right.")
+        await e.ingest(frame([remote, det("hand", x: 0.7, y: 0.5, size: 0.12, conf: 0.8)], t: 1))
+        await e.ingest(frame([remote, det("hand", x: 0.7, y: 0.5, size: 0.12, conf: 0.8)], t: 1.5))
+        #expect(await a.spoken.last == "Got it.")
+        #expect(await h.confirms == 1)
+        await e.ingest(frame([remote], t: 1.6))
+        #expect(await e.state == .completed("You have the remote."))
+        #expect(await e.taskProgress == nil)
+        // A plain goal afterwards returns to single-target Find.
+        await e.setGoal("start")
+        #expect(await e.goal == "start")
+    }
+}
