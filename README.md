@@ -68,7 +68,7 @@ Read these honestly:
 ## Build
 
 ```bash
-swift build && swift test        # macOS host: pure logic, 53 tests
+swift build && swift test        # macOS host: pure logic, 65 tests
 ```
 
 The iOS-only paths (ARKit, the camera, the haptic actuator) are behind `#if canImport(...) && os(iOS)`. The `ios-build` CI job compiles them with `xcodebuild` for the iOS Simulator. Real latency numbers need a device.
