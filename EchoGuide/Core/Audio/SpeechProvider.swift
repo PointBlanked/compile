@@ -34,7 +34,7 @@ public struct KokoroSpeechProvider: SpeechSynthesizing {
     public var timeout: TimeInterval
     private let transport: Transport
 
-    public init(baseURL: URL, voice: String = "af_heart", speed: Double = 1.0, timeout: TimeInterval = 1.5,
+    public init(baseURL: URL, voice: String = "af_heart", speed: Double = 1.0, timeout: TimeInterval = 2.5,
                 transport: Transport? = nil) {
         self.baseURL = baseURL
         self.voice = voice
@@ -65,7 +65,9 @@ public struct KokoroSpeechProvider: SpeechSynthesizing {
             throw SpeechProviderError.badStatus(http.statusCode)
         }
         guard data.count > 44 else { throw SpeechProviderError.emptyAudio } // a WAV header alone is 44 bytes
-        return data
+        // Kokoro-FastAPI streams its WAV, so the header says "unknown length"
+        // (0xFFFFFFFF). AVAudioPlayer wants the real sizes.
+        return WAVEncoder.withCorrectSizes(data)
     }
 }
 
@@ -137,6 +139,38 @@ public enum WAVEncoder {
             withUnsafeBytes(of: v.littleEndian) { pcm.append(contentsOf: $0) }
         }
         return pcm16Mono(pcm: pcm, sampleRate: sampleRate)
+    }
+
+    /// Rewrites the RIFF and `data` chunk sizes of a complete WAV file whose
+    /// header was written before its length was known (streaming servers put
+    /// 0xFFFFFFFF or 0 there). Anything that is not a RIFF/WAVE file is
+    /// returned untouched.
+    public static func withCorrectSizes(_ wav: Data) -> Data {
+        guard wav.count >= 12,
+              wav[wav.startIndex..<wav.startIndex + 4].elementsEqual("RIFF".utf8),
+              wav[wav.startIndex + 8..<wav.startIndex + 12].elementsEqual("WAVE".utf8) else { return wav }
+        var d = Data(wav) // rebase indices at 0
+        func u32(at i: Int) -> UInt32 {
+            UInt32(d[i]) | UInt32(d[i + 1]) << 8 | UInt32(d[i + 2]) << 16 | UInt32(d[i + 3]) << 24
+        }
+        func put(_ v: UInt32, at i: Int) {
+            d[i] = UInt8(v & 0xFF); d[i + 1] = UInt8(v >> 8 & 0xFF); d[i + 2] = UInt8(v >> 16 & 0xFF); d[i + 3] = UInt8(v >> 24)
+        }
+        // Walk the chunks to find "data"; its payload runs to the end of the file.
+        var i = 12
+        while i + 8 <= d.count {
+            let id = String(decoding: d[i..<i + 4], as: UTF8.self)
+            let size = Int(u32(at: i + 4))
+            if id == "data" {
+                let actual = d.count - (i + 8)
+                if size != actual { put(UInt32(actual), at: i + 4) }
+                break
+            }
+            i += 8 + size + (size & 1)
+        }
+        let riff = d.count - 8
+        if Int(u32(at: 4)) != riff { put(UInt32(riff), at: 4) }
+        return d
     }
 
     /// Wraps little-endian mono PCM16 bytes in a WAV header.

@@ -627,6 +627,21 @@ struct StubListener: GoalListening {
         #expect(det("text", x: 0, y: 0, kind: .text, text: "STOP").stepKey != det("text", x: 0, y: 0, kind: .text, text: "START").stepKey)
     }
 
+    @Test func streamingWAVHeaderIsCorrected() {
+        // Kokoro-FastAPI writes 0xFFFFFFFF sizes because it streams; the
+        // provider must hand AVAudioPlayer the real lengths.
+        var wav = WAVEncoder.pcm16Mono([0, 0.5, -0.5, 1], sampleRate: 24_000)
+        let good = wav
+        for i in [4, 5, 6, 7, 40, 41, 42, 43] { wav[i] = 0xFF }
+        #expect(wav != good)
+        #expect(WAVEncoder.withCorrectSizes(wav) == good)
+        #expect(WAVEncoder.withCorrectSizes(good) == good)
+        #expect(WAVEncoder.withCorrectSizes(Data([1, 2, 3])) == Data([1, 2, 3]))
+        // Sliced input (non-zero startIndex) works too.
+        let sliced = (Data([9, 9]) + wav)[2...]
+        #expect(WAVEncoder.withCorrectSizes(sliced) == good)
+    }
+
     @Test func wavFromRawPCMMatchesFloatPath() {
         let floats: [Float] = [0, 0.5, -0.5, 1]
         var pcm = Data()
