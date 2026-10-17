@@ -57,13 +57,19 @@ public final class VoiceGoalListener: @unchecked Sendable {
         if recognizer.supportsOnDeviceRecognition { request.requiresOnDeviceRecognition = true }
 
         let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .measurement, options: [.duckOthers, .defaultToSpeaker, .allowBluetooth])
-        try session.setActive(true)
+        // Whatever was configured before (playback-only guidance, or the app's
+        // voice loop already recording) is put back afterwards, so this never
+        // silences a microphone someone else is using.
+        let previous = (session.category, session.mode, session.categoryOptions)
+        let alreadyRecording = session.category == .playAndRecord || session.category == .record
+        if !alreadyRecording {
+            try session.setCategory(.playAndRecord, mode: .measurement, options: [.duckOthers, .defaultToSpeaker, .allowBluetooth])
+            try session.setActive(true)
+        }
         defer {
             audioEngine.stop()
             audioEngine.inputNode.removeTap(onBus: 0)
-            // Give the speaker back to the guidance voice.
-            try? session.setCategory(.playback, mode: .spokenAudio, options: [.mixWithOthers, .duckOthers])
+            if !alreadyRecording { try? session.setCategory(previous.0, mode: previous.1, options: previous.2) }
         }
 
         let input = audioEngine.inputNode

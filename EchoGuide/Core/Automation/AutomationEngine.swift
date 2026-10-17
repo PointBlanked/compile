@@ -34,6 +34,9 @@ public struct AutomationConfig: Sendable {
     /// Directional ping cadence while the target is off to one side.
     public var pingInterval: TimeInterval = 0.9
     public var fenceWarningInterval: TimeInterval = 3
+    /// While scanning with nothing to offer, say so this often. Silence is
+    /// ambiguous for a blind user: is it working, or has it crashed?
+    public var scanningReminderInterval: TimeInterval = 8
     /// A finished target is off the menu for this long, so "done" moves on to
     /// the next step instead of guiding the finger back to the same button.
     public var completedCooldown: TimeInterval = 8
@@ -54,6 +57,7 @@ public actor AutomationEngine {
 
     private var lastSpokenLabel: String?
     private var lastSpokenAt: TimeInterval = -.infinity
+    private var lastReminderAt: TimeInterval = -.infinity
     private var lastPingAt: TimeInterval = -.infinity
     private var lastSeenAt: TimeInterval = -.infinity
     private var onTargetSince: TimeInterval?
@@ -128,6 +132,7 @@ public actor AutomationEngine {
 
     public func start() {
         forgetTarget()
+        lastReminderAt = -.infinity
         transition(.scanning)
     }
 
@@ -164,6 +169,7 @@ public actor AutomationEngine {
 
         // Nothing settled, or the settled target has not been seen for a while.
         guard let step, isolation.isCurrentVisible || now - lastSeenAt <= config.lostTargetTimeout else {
+            if step == nil, state == .scanning { await remindScanning(at: now) }
             if now - lastSeenAt > config.lostTargetTimeout, state != .scanning {
                 // Drop only a remembered target; a challenger still settling
                 // keeps its frame count (frames are sparse in a still scene).
@@ -178,6 +184,10 @@ public actor AutomationEngine {
         // The target dropped out of this frame: keep the last cue going, but
         // do not announce, confirm or complete against a remembered box.
         guard isolation.isCurrentVisible else { return }
+
+        // A read-only tool (product lookup on a barcode) needs no finger and
+        // no dwell: seeing the thing is the request.
+        if await fireReadOnlyTool(for: step, at: now) { return }
 
         await announceIfNeeded(step, at: now)
 
@@ -217,16 +227,47 @@ public actor AutomationEngine {
 
     // MARK: - Steps
 
+    /// Identity of a step for exclusion and announcement: label, or
+    /// label|content for text and barcodes (see `Detection.stepKey`).
+    private func key(_ step: ActionStep) -> String { step.target?.stepKey ?? step.targetLabel }
+
+    private func remindScanning(at now: TimeInterval) async {
+        let since = max(lastReminderAt, lastSpokenAt)
+        guard now - since >= config.scanningReminderInterval else { return }
+        lastReminderAt = now
+        await audio.speak(isolation.goal.map { "Looking for \($0)." } ?? "Looking.", azimuth: 0)
+    }
+
+    /// True when a `.none` side-effect tool claimed the target and was run.
+    private func fireReadOnlyTool(for step: ActionStep, at now: TimeInterval) async -> Bool {
+        guard let target = step.target, let tools, let match = await tools.match(target), match.sideEffect == .none else { return false }
+        completedUntil[key(step)] = now + config.completedCooldown
+        onTargetSince = nil
+        await haptics.stop()
+        do {
+            let said = try await tools.invoke(match)
+            lastSpokenLabel = key(step)
+            lastSpokenAt = now
+            await audio.speak(said, azimuth: 0)
+            transition(.completed(said))
+        } catch {
+            completedUntil[key(step)] = nil
+            await audio.speak("I could not read that.", azimuth: 0)
+            transition(.completed(step.targetLabel))
+        }
+        return true
+    }
+
     private func announceIfNeeded(_ step: ActionStep, at now: TimeInterval) async {
-        let isNew = step.targetLabel != lastSpokenLabel
+        let isNew = key(step) != lastSpokenLabel
         guard isNew || now - lastSpokenAt >= config.repeatInstructionAfter else { return }
-        lastSpokenLabel = step.targetLabel
+        lastSpokenLabel = key(step)
         lastSpokenAt = now
 
         var sentence = step.instruction
         if isNew, let target = step.target, let router,
-           target.confidence < config.cloudConfidenceThreshold, !routedLabels.contains(step.targetLabel) {
-            routedLabels.insert(step.targetLabel)
+           target.confidence < config.cloudConfidenceThreshold, !routedLabels.contains(key(step)) {
+            routedLabels.insert(key(step))
             let outcome = await router.resolve(ReasoningQuery(
                 question: "In under eight words, what is this and what should the user do with it?",
                 detections: [target],
@@ -242,7 +283,7 @@ public actor AutomationEngine {
 
     private func complete(_ step: ActionStep, at now: TimeInterval) async {
         onTargetSince = nil
-        completedUntil[step.targetLabel] = now + config.completedCooldown
+        completedUntil[key(step)] = now + config.completedCooldown
 
         await haptics.stop()
 
@@ -257,7 +298,7 @@ public actor AutomationEngine {
             transition(.completed(said))
         } catch {
             // Not excluded: the user should be able to settle on it and try again.
-            completedUntil[step.targetLabel] = nil
+            completedUntil[key(step)] = nil
             await audio.speak("That did not work.", azimuth: 0)
             transition(.completed(step.targetLabel))
         }

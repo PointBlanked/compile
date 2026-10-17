@@ -139,6 +139,11 @@ public final class GuidanceModel {
         return false
     }
 
+    var isCompleted: Bool {
+        if case .completed = state { return true }
+        return false
+    }
+
     /// SF Symbol for the one direction the audio speaks, or nil when there is
     /// nothing to point at. Mirrors `CognitiveTaskIsolation.direction`: the
     /// larger axis wins, so the arrow and the words never disagree.
@@ -168,6 +173,7 @@ public struct GuidanceView: View {
     private var background: Color {
         if model.isWarning { return .red }
         if model.isOnTarget { return Color(red: 0, green: 0.35, blue: 0) }
+        if model.isCompleted { return Color(red: 0, green: 0.55, blue: 0.1) }
         return .black
     }
 
@@ -177,6 +183,7 @@ public struct GuidanceView: View {
         ZStack {
             background.ignoresSafeArea()
                 .animation(.easeInOut(duration: 0.2), value: model.isWarning)
+                .animation(.easeInOut(duration: 0.2), value: model.isCompleted)
 
             VStack(spacing: 16) {
                 Spacer(minLength: 0)

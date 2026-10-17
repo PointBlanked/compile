@@ -537,3 +537,100 @@ struct StubListener: GoalListening {
         #expect(silent.listenResult == "Did not catch that")
     }
 }
+
+// MARK: - Text identity, read-only tools, scanning heartbeat
+
+@Suite struct PipelineBehaviourTests {
+    func engine(tools: ToolInvoking? = nil, goal: String? = nil, config: AutomationConfig = AutomationConfig()) -> (AutomationEngine, RecordingHaptics, RecordingAudio) {
+        var c = CognitiveConfig()
+        c.settleFrames = 1
+        let h = RecordingHaptics(), a = RecordingAudio()
+        return (AutomationEngine(haptics: h, audio: a, tools: tools, cognitive: CognitiveTaskIsolation(config: c, goal: goal), config: config), h, a)
+    }
+
+    @Test func finishingOneTextButtonKeepsTheOthers() async {
+        // Vision labels every OCR hit "text": START and STOP share a label.
+        let (e, _, a) = engine()
+        await e.start()
+        let start = det("text", x: 0.5, y: 0.5, kind: .text, text: "START")
+        let stop = det("text", x: 0.2, y: 0.2, size: 0.08, kind: .text, text: "STOP")
+        await e.ingest(frame([start, stop, tip(x: 0.5, y: 0.5)], t: 0))
+        #expect(await a.spoken.first == "START. You are on it.")
+        await e.ingest(frame([start, stop, tip(x: 0.5, y: 0.5)], t: 1))
+        #expect(await e.state == .completed("text"))
+        // STOP is a different thing: still offered, and announced as new.
+        await e.ingest(frame([start, stop, tip(x: 0.5, y: 0.5)], t: 1.1))
+        guard case .guiding(let step) = await e.state else { Issue.record("expected guiding to STOP"); return }
+        #expect(step.target?.text == "STOP")
+        #expect(await a.spoken.last?.hasPrefix("STOP.") == true)
+    }
+
+    @Test func readOnlyToolFiresOnSightWithoutDwell() async {
+        let registry = PluginRegistry()
+        let looked = Counter()
+        await registry.register(ToolDescriptor(name: "product_lookup", description: "", sideEffect: .none,
+                                               claim: ToolClaim(anyBarcode: true), parameters: ["text"]) { args in
+            await looked.inc()
+            return "Oat milk. Contains oats."
+        })
+        let (e, h, a) = engine(tools: registry)
+        await e.start()
+        // No fingertip at all: the camera simply sees the barcode.
+        let code = det("barcode", x: 0.6, y: 0.4, kind: .barcode, text: "5000112637922")
+        await e.ingest(frame([code], t: 0))
+        #expect(await looked.value == 1)
+        #expect(await e.state == .completed("Oat milk. Contains oats."))
+        #expect(await a.spoken == ["Oat milk. Contains oats."])
+        #expect(await h.guides == 0)
+        // Same barcode next frame: not looked up again during the cooldown.
+        await e.ingest(frame([code], t: 0.5))
+        #expect(await looked.value == 1)
+        // A different barcode is a new product.
+        await e.ingest(frame([det("barcode", x: 0.6, y: 0.4, kind: .barcode, text: "9999")], t: 1))
+        #expect(await looked.value == 2)
+    }
+
+    @Test func physicalToolStillNeedsTheDwell() async {
+        let registry = PluginRegistry()
+        let fired = Counter()
+        await registry.register(ToolDescriptor(name: "go", description: "", sideEffect: .physical, claim: ToolClaim(labels: ["button"])) { _ in
+            await fired.inc(); return "ok"
+        })
+        let (e, _, _) = engine(tools: registry)
+        await e.start()
+        await e.ingest(frame([det("button", x: 0.6, y: 0.4)], t: 0)) // seen, no finger
+        #expect(await fired.value == 0)
+        guard case .guiding = await e.state else { Issue.record("expected guiding"); return }
+    }
+
+    @Test func scanningHeartbeat() async {
+        var config = AutomationConfig()
+        config.scanningReminderInterval = 5
+        let (e, _, a) = engine(goal: "start", config: config)
+        await e.start()
+        await e.ingest(frame([tip(x: 0.5, y: 0.5)], t: 0))
+        #expect(await a.spoken == ["Looking for start."])
+        await e.ingest(frame([tip(x: 0.5, y: 0.5)], t: 3))
+        #expect(await a.spoken.count == 1)
+        await e.ingest(frame([tip(x: 0.5, y: 0.5)], t: 5.5))
+        #expect(await a.spoken.count == 2)
+        // A target silences the heartbeat.
+        await e.ingest(frame([det("start", x: 0.7, y: 0.5), tip(x: 0.4, y: 0.5)], t: 6))
+        #expect(await a.spoken.last == "Start. Move right.")
+        await e.ingest(frame([det("start", x: 0.7, y: 0.5), tip(x: 0.4, y: 0.5)], t: 9))
+        #expect(await a.spoken.count == 3)
+    }
+
+    @Test func stepKeyDistinguishesContentOnly() {
+        #expect(det("button", x: 0, y: 0).stepKey == "button")
+        #expect(det("text", x: 0, y: 0, kind: .text, text: "START").stepKey == "text|START")
+        #expect(det("text", x: 0, y: 0, kind: .text, text: "STOP").stepKey != det("text", x: 0, y: 0, kind: .text, text: "START").stepKey)
+    }
+
+    @Test func wavFromRawPCMMatchesFloatPath() {
+        let floats: [Float] = [0, 0.5, -0.5, 1]
+        var pcm = Data()
+        for s in floats { withUnsafeBytes(of: Int16(s * 32767).littleEndian) { pcm.append(contentsOf: $0) } }
+        #expect(WAVEncoder.pcm16Mono(pcm: pcm, sampleRate: 16_000) == WAVEncoder.pcm16Mono(floats, sampleRate: 16_000))
+    }
+}

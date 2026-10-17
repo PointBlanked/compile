@@ -25,18 +25,36 @@ public struct CognitiveConfig: Sendable {
     public init() {}
 }
 
+public extension Detection {
+    /// What makes a target "the same thing" across frames and for exclusion.
+    /// Vision labels every OCR hit "text" and every barcode "barcode", so the
+    /// recognised content is part of the identity: finishing START must not
+    /// take STOP off the menu with it.
+    var stepKey: String {
+        switch kind {
+        case .text, .barcode: return "\(label)|\(text ?? "")"
+        case .object, .fingertip: return label
+        }
+    }
+}
+
 public struct CognitiveTaskIsolation: Sendable {
     public var config: CognitiveConfig
     /// When set, only matching labels or text are eligible ("start", "microwave").
     public var goal: String?
-    /// Labels temporarily off the menu, e.g. a target the user just finished.
-    /// AutomationEngine sets this so "done" moves on to the next step instead
-    /// of guiding the finger straight back to the same button.
+    /// Targets temporarily off the menu, e.g. one the user just finished, by
+    /// `Detection.stepKey` (a plain label, or label|content for text and
+    /// barcodes). AutomationEngine sets this so "done" moves on to the next
+    /// step instead of guiding the finger straight back to the same button.
     public var excludedLabels: Set<String> = [] {
         didSet {
-            if let cur = current, excludedLabels.contains(cur.label) { current = nil }
-            if let c = candidate, excludedLabels.contains(c.label) { candidate = nil; candidateFrames = 0 }
+            if let cur = current, isExcluded(cur) { current = nil }
+            if let c = candidate, isExcluded(c) { candidate = nil; candidateFrames = 0 }
         }
+    }
+
+    private func isExcluded(_ d: Detection) -> Bool {
+        excludedLabels.contains(d.stepKey) || excludedLabels.contains(d.label)
     }
 
     private var current: Detection?
@@ -114,7 +132,7 @@ public struct CognitiveTaskIsolation: Sendable {
     }
 
     private func isEligible(_ d: Detection) -> Bool {
-        if config.ignoredLabels.contains(d.label) || excludedLabels.contains(d.label) { return false }
+        if config.ignoredLabels.contains(d.label) || isExcluded(d) { return false }
         if let goal { return matches(d, goal) }
         return true
     }
