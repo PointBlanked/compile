@@ -2,12 +2,16 @@
 // wired together. Engines never see each other; they meet here through the
 // protocols in EchoGuideContracts.
 //
-//   LiDAR (ARKit) or CameraFeed -> PerceptionPipeline -> SpatialFence -> AutomationEngine
-//                                                                          |-> haptics, audio
-//                                                                          |-> plugins, router
-//   VoiceLoop (optional) -> goal / question
+//   LiDAR (ARKit) or CameraFeed -> PerceptionPipeline -> SpatialFence
+//        -> AgentCore (Explore / Read / Describe)
+//        -> AutomationEngine (Find: finger guidance, tool press)
+//   Speech, haptics and cloud calls pass through observers that drive the
+//   on-screen captions and the benchmark recorder.
 
+import AVFoundation
+import CoreImage
 import Foundation
+import ImageIO
 import Observation
 import os
 import EchoGuideAutomation
@@ -18,44 +22,77 @@ import EchoGuideVision
 
 private let log = Logger(subsystem: "app.echoguide", category: "runtime")
 
+extension VoiceGoalListener: GoalListening {}
+
 @MainActor
 @Observable
 final class AppRuntime {
-    let guidance = GuidanceModel()
-    private(set) var status = "Starting"
-    private(set) var benchmarkSummary: String?
+    let guidance = GuidanceModel(listener: VoiceGoalListener())
+    let trials = TrialRecorder(storeURL: FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+        .appendingPathComponent("trials.json"))
 
+    private(set) var mode: AgentMode = .explore
+    private(set) var caption = ""
+    private(set) var started = false
+    private(set) var hasLiDAR = false
+    private(set) var hasModel = false
+    let cloudConfigured = AppSettings.proxyBase != nil
+    private(set) var online = false
+    private(set) var cameraError: String?
+    private(set) var benchmarkSummary: String?
+    private(set) var describing = false
+
+    private(set) var lidar: LiDARDepthEngine?
+    private(set) var camera: CameraFeed?
+    private var agent: AgentCore?
     private var automation: AutomationEngine?
     private var pipeline: PerceptionPipeline?
     private var vision: LocalVisionEngine?
-    private var lidar: LiDARDepthEngine?
-    private var camera: CameraFeed?
-    private var voiceIO: VoiceAudioIO?
-    private var stt: DeepgramSTTClient?
+    private let latest = LatestFrame()
     private var background: [Task<Void, Never>] = []
-    private let lastDetections = DetectionBox()
+
+    var statusLine: String {
+        var parts: [String] = []
+        parts.append(hasLiDAR ? "LiDAR" : "Camera")
+        parts.append(hasModel ? "objects on" : "no object model")
+        if cloudConfigured && online {
+            parts.append(AppSettings.imageConsent ? "cloud photos on" : "cloud text only")
+        } else {
+            parts.append("on-device only")
+        }
+        return parts.joined(separator: " · ")
+    }
 
     func start() async {
-        guard automation == nil else { return }
+        guard !started else { return }
+        started = true
         let config = AppConfig.load()
 
         // Perception (local, always).
         let modelURL = ModelStore.locate()
+        hasModel = modelURL != nil
         if modelURL == nil { log.warning("No YOLO model bundled; running hands, text and barcodes only") }
         let vision: LocalVisionEngine
         do {
             vision = try LocalVisionEngine(modelURL: modelURL)
         } catch {
             log.error("Model failed to load: \(error.localizedDescription, privacy: .public)")
+            hasModel = false
             vision = try! LocalVisionEngine(modelURL: nil)
         }
         self.vision = vision
         let lidar = LiDARDepthEngine.isSupported ? LiDARDepthEngine() : nil
         self.lidar = lidar
+        hasLiDAR = lidar != nil
 
-        // Output.
-        let haptics = SpatialHapticEngine()
-        let audio = SpatialAudioEngine()
+        // Output, observed for captions and benchmarks.
+        let speech: SpeechSynthesizing? = config.kokoroURL.map { KokoroSpeechProvider(baseURL: $0) }
+        let trials = self.trials
+        let audio = ObservedAudio(SpatialAudioEngine(speech: speech)) { [weak self] text in
+            Task { @MainActor in self?.caption = text }
+            Task { await trials.noteSpoken() }
+        }
+        let haptics = ObservedHaptics(SpatialHapticEngine()) { Task { await trials.noteHaptic() } }
 
         // Cloud (optional) and tools.
         let connectivity = PathConnectivity()
@@ -63,112 +100,109 @@ final class AppRuntime {
         var routerConfig = CloudRouterConfig()
         routerConfig.imageConsent = AppSettings.imageConsent
         let provider: ReasoningProvider? = AppSettings.proxyBase.map { GeminiProvider(proxyBase: $0, deviceToken: deviceToken) }
-        let router = CloudReasoningRouter(config: routerConfig, provider: provider, connectivity: connectivity)
+        let router = ObservedRouter(CloudReasoningRouter(config: routerConfig, provider: provider, connectivity: connectivity)) {
+            Task { await trials.noteCloudCall() }
+        }
 
         let registry = PluginRegistry()
-        if let manifest = config.plugins {
-            let installed = await registry.install(manifest, secrets: { Keychain.read($0) })
-            for url in installed.failedRemotes { log.warning("Plugin server unreachable: \(url.absoluteString, privacy: .public)") }
-        }
+        let manifest = config.plugins ?? (try? PluginManifest.load(Data(#"{"productLookup":true}"#.utf8)))
+        if let manifest { await registry.install(manifest, secrets: { Keychain.read($0) }) }
 
         // Decisions.
         let automation = AutomationEngine(haptics: haptics, audio: audio, depth: lidar, router: router, tools: registry)
         self.automation = automation
         guidance.bind(to: automation)
         await automation.setGoal(config.goal)
-        await automation.start()
+        let agent = AgentCore(audio: audio, haptics: haptics, depth: lidar, router: router)
+        self.agent = agent
 
-        // Pipeline: frame -> detections -> fence -> automation.
-        let fence = SpatialFence.kitchenDefaults
-        let detections = lastDetections
+        // Pipeline: frame -> detections -> fence -> agent (and automation in Find).
+        let fence = (config.fence ?? FenceConfig()).spatialFence
         let pipeline = PerceptionPipeline(vision: vision) { result, _ in
-            await detections.set(result.targets)
             // Depth is sampled per zone, so two hazards at different distances are judged separately.
             let event = await fence.evaluate(result, depth: lidar)
-            await automation.ingest(result, fence: event)
+            if await agent.ingest(result, fence: event) {
+                await automation.ingest(result, fence: event)
+            }
         }
         self.pipeline = pipeline
 
         // Camera: ARKit owns it when LiDAR is present, otherwise AVCapture.
+        let latest = self.latest
         if let lidar {
-            lidar.onFrame = { pipeline.submit($0) }
+            lidar.onFrame = { frame in
+                latest.set(frame)
+                pipeline.submit(frame)
+            }
             lidar.start()
-            status = "Running with LiDAR"
         } else {
             let camera = CameraFeed()
             do {
-                try camera.start { pipeline.submit($0) }
+                try camera.start { frame in
+                    latest.set(frame)
+                    pipeline.submit(frame)
+                }
                 self.camera = camera
-                status = "Running"
             } catch {
-                status = "Camera unavailable"
+                cameraError = "The camera is not available."
             }
         }
 
-        if AppSettings.voiceEnabled, let proxy = AppSettings.proxyBase {
-            await startVoice(proxy: proxy, audio: audio, automation: automation, router: router, deviceToken: deviceToken)
-        }
+        background.append(Task { [weak self] in
+            while !Task.isCancelled {
+                let isOnline = await connectivity.isOnline()
+                self?.online = isOnline
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+            }
+        })
 
-        if AppSettings.isBenchmark { runBenchmark() }
+        await setMode(.explore, countsAsPrompt: false)
+        if AppSettings.isBenchmark { runLatencyBenchmark() }
     }
 
     func stop() async {
         background.forEach { $0.cancel() }
         lidar?.stop()
         camera?.stop()
-        voiceIO?.stopCapture()
-        await stt?.stop()
         await automation?.stop()
     }
 
-    // MARK: - Voice
+    // MARK: - User actions
 
-    private func startVoice(proxy: URL, audio: SpatialAudioEngine, automation: AutomationEngine,
-                            router: CloudReasoningRouter, deviceToken: @escaping @Sendable () async -> String?) async {
-        // SpatialAudioEngine sets a playback-only session on its first sound;
-        // make it do that now, then widen the session so the microphone can record.
-        await audio.ping(azimuth: 0, elevation: 0)
-        do {
-            try AudioSessionSetup.enableRecording()
-            let stt = DeepgramSTTClient(proxyBase: proxy, deviceToken: deviceToken)
-            let transcripts = try await stt.start()
-            let io = VoiceAudioIO()
-            try io.startCapture { pcm in Task { try? await stt.send(pcm) } }
-            self.stt = stt
-            voiceIO = io
-            let detections = lastDetections
-            background.append(Task {
-                do {
-                    for try await t in transcripts where t.endOfUtterance {
-                        switch VoiceIntent.parse(t.text) {
-                        case .find(let target):
-                            await automation.setGoal(target)
-                            await audio.speak("Looking for \(target).", azimuth: 0)
-                        case .stop:
-                            await automation.setGoal(nil)
-                            await audio.speak("Okay.", azimuth: 0)
-                        case .question(let q):
-                            let seen = await detections.value
-                            let answer = await router.resolve(ReasoningQuery(question: q, detections: seen, localConfidence: 0))
-                            await audio.speak(answer.answer, azimuth: 0)
-                        case nil:
-                            break
-                        }
-                    }
-                } catch {
-                    log.warning("Voice loop ended: \(error.localizedDescription, privacy: .public)")
-                }
-            })
-        } catch {
-            log.warning("Voice unavailable: \(error.localizedDescription, privacy: .public)")
-        }
+    func setMode(_ m: AgentMode, countsAsPrompt: Bool = true) async {
+        mode = m
+        if countsAsPrompt { await trials.notePrompt() }
+        if m == .find { await automation?.start() } else { await automation?.stop() }
+        await agent?.setMode(m)
+        pipeline?.forceNextFrame()
     }
 
-    // MARK: - Benchmark
+    func describe() async {
+        guard let agent, !describing else { return }
+        describing = true
+        defer { describing = false }
+        await trials.notePrompt()
+        let jpeg = AppSettings.imageConsent ? latest.jpeg() : nil
+        await agent.describe(jpeg: jpeg)
+    }
 
-    /// `-benchmark` launch argument: run for 20 s on the live camera, then
-    /// write the real on-device numbers to Documents/benchmark-<time>.json.
-    private func runBenchmark() {
+    func readNow() async {
+        await trials.notePrompt()
+        await agent?.readNow()
+    }
+
+    // MARK: - Benchmarks
+
+    func startTrial(task: String, mode taskMode: String) async {
+        let m: AgentMode = taskMode == "read" ? .read : taskMode == "find" ? .find : .explore
+        await trials.start(task: task, mode: taskMode, offline: !(cloudConfigured && online))
+        await setMode(m, countsAsPrompt: false)
+        if taskMode == "describe" { await describe() }
+    }
+
+    /// 20 s on the live camera; real on-device latency numbers.
+    func runLatencyBenchmark() {
+        benchmarkSummary = "Measuring for 20 seconds. Point the camera at a scene with some movement."
         background.append(Task { [weak self] in
             try? await Task.sleep(nanoseconds: 20_000_000_000)
             guard let self, let pipeline = self.pipeline, let vision = self.vision else { return }
@@ -180,8 +214,76 @@ final class AppRuntime {
     }
 }
 
-/// Last frame's detections, for spoken questions ("what is this?").
-actor DetectionBox {
-    private(set) var value: [Detection] = []
-    func set(_ d: [Detection]) { value = d }
+// MARK: - Observers
+
+/// Forwards speech and reports every sentence (captions, trial counts).
+struct ObservedAudio: SpatialAudioCueing {
+    let inner: SpatialAudioCueing
+    let onSpeak: @Sendable (String) -> Void
+    init(_ inner: SpatialAudioCueing, onSpeak: @escaping @Sendable (String) -> Void) {
+        self.inner = inner
+        self.onSpeak = onSpeak
+    }
+    func speak(_ text: String, azimuth: Float) async {
+        onSpeak(text)
+        await inner.speak(text, azimuth: azimuth)
+    }
+    func ping(azimuth: Float, elevation: Float) async { await inner.ping(azimuth: azimuth, elevation: elevation) }
+}
+
+struct ObservedHaptics: HapticCueing {
+    let inner: HapticCueing
+    let onCue: @Sendable () -> Void
+    init(_ inner: HapticCueing, onCue: @escaping @Sendable () -> Void) {
+        self.inner = inner
+        self.onCue = onCue
+    }
+    func guide(offset dx: Float, _ dy: Float, distanceMetres: Float?) async {
+        onCue()
+        await inner.guide(offset: dx, dy, distanceMetres: distanceMetres)
+    }
+    func confirm() async {
+        onCue()
+        await inner.confirm()
+    }
+    func warn() async {
+        onCue()
+        await inner.warn()
+    }
+    func stop() async { await inner.stop() }
+}
+
+struct ObservedRouter: ReasoningRouting {
+    let inner: ReasoningRouting
+    let onCloud: @Sendable () -> Void
+    init(_ inner: ReasoningRouting, onCloud: @escaping @Sendable () -> Void) {
+        self.inner = inner
+        self.onCloud = onCloud
+    }
+    func resolve(_ query: ReasoningQuery) async -> ReasoningOutcome {
+        let out = await inner.resolve(query)
+        if out.source == .cloud { onCloud() }
+        return out
+    }
+}
+
+/// The newest camera frame, for Describe's photo. One buffer is held at a
+/// time, so ARKit is never starved of frames.
+final class LatestFrame: @unchecked Sendable {
+    private let lock = NSLock()
+    private var frame: CameraFrame?
+    private static let context = CIContext()
+
+    func set(_ f: CameraFrame) { lock.withLock { frame = f } }
+
+    /// Upright, at most 768 px on the long side, ~60% quality: enough for a
+    /// multimodal model, small enough to send quickly.
+    func jpeg(maxSide: CGFloat = 768) -> Data? {
+        guard let pb = lock.withLock({ frame?.pixelBuffer }) else { return nil }
+        var image = CIImage(cvPixelBuffer: pb).oriented(.right)
+        let scale = maxSide / max(image.extent.width, image.extent.height)
+        if scale < 1 { image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale)) }
+        let quality = CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String)
+        return Self.context.jpegRepresentation(of: image, colorSpace: CGColorSpaceCreateDeviceRGB(), options: [quality: 0.6])
+    }
 }

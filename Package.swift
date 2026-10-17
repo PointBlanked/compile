@@ -35,7 +35,7 @@ let package = Package(
             name: "EchoGuideVision",
             dependencies: ["EchoGuideContracts"],
             path: "EchoGuide/Core",
-            exclude: ["Contracts", "Haptics", "Depth", "Audio", "Automation", "Cognitive", "Plugins", "Router"],
+            exclude: ["Contracts", "Haptics", "Depth", "Audio", "Automation", "Cognitive", "Plugins", "Router", "Agent"],
             sources: ["Camera", "Vision", "Fence"]
         ),
         // Haptics, spatial audio (Bryan); LiDAR depth (Maxwell).
@@ -43,7 +43,7 @@ let package = Package(
             name: "EchoGuideSpatial",
             dependencies: ["EchoGuideContracts"],
             path: "EchoGuide/Core",
-            exclude: ["Contracts", "Camera", "Vision", "Fence", "Automation", "Cognitive", "Plugins", "Router"],
+            exclude: ["Contracts", "Camera", "Vision", "Fence", "Automation", "Cognitive", "Plugins", "Router", "Agent"],
             sources: ["Haptics", "Depth", "Audio"]
         ),
         // Bryan: automation state machine, cognitive isolation, SwiftUI.
@@ -51,16 +51,16 @@ let package = Package(
             name: "EchoGuideAutomation",
             dependencies: ["EchoGuideContracts"],
             path: "EchoGuide",
-            exclude: ["Core/Contracts", "Core/Camera", "Core/Vision", "Core/Fence", "Core/Haptics", "Core/Depth", "Core/Audio", "Core/Plugins", "Core/Router"],
+            exclude: ["Core/Contracts", "Core/Camera", "Core/Vision", "Core/Fence", "Core/Haptics", "Core/Depth", "Core/Audio", "Core/Plugins", "Core/Router", "Core/Agent"],
             sources: ["Core/Automation", "Core/Cognitive", "UI"]
         ),
-        // Maxwell: plugin registry (MCP), cloud reasoning router.
+        // Maxwell: plugin registry (MCP), cloud reasoning router, the visual agent.
         .target(
             name: "EchoGuideInfra",
             dependencies: ["EchoGuideContracts"],
             path: "EchoGuide/Core",
             exclude: ["Contracts", "Camera", "Vision", "Fence", "Haptics", "Depth", "Audio", "Automation", "Cognitive"],
-            sources: ["Plugins", "Router"]
+            sources: ["Plugins", "Router", "Agent"]
         ),
         .testTarget(
             name: "EchoGuideTests",

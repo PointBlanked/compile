@@ -6,11 +6,16 @@ import Foundation
 import Security
 import EchoGuideInfra
 import EchoGuideVision
+import EchoGuideSpatial
 
 /// Per-home setup. Lives at Application Support/echoguide.json (written by the
 /// care provider's setup flow); the bundled sample is the fallback.
 struct AppConfig: Decodable {
     var plugins: PluginManifest?
+    /// Hazard zones for this home (hob, stairs); kitchen defaults when absent.
+    var fence: FenceConfig?
+    /// Optional better voice: an OpenAI-compatible Kokoro server.
+    var kokoroURL: URL?
     /// Start narrowed to one task ("start"), nil for open scanning.
     var goal: String?
 
@@ -35,9 +40,14 @@ enum AppSettings {
         return URL(string: s)
     }
 
-    static var imageConsent: Bool { UserDefaults.standard.bool(forKey: "cloudImageConsent") }
-    static var voiceEnabled: Bool { UserDefaults.standard.bool(forKey: "voiceEnabled") }
-    static var elevenLabsVoiceID: String? { UserDefaults.standard.string(forKey: "elevenLabsVoiceID") }
+    static var imageConsent: Bool {
+        get { UserDefaults.standard.bool(forKey: "cloudImageConsent") }
+        set { UserDefaults.standard.set(newValue, forKey: "cloudImageConsent") }
+    }
+    static var onboarded: Bool {
+        get { UserDefaults.standard.bool(forKey: "onboarded") }
+        set { UserDefaults.standard.set(newValue, forKey: "onboarded") }
+    }
     static var isBenchmark: Bool { ProcessInfo.processInfo.arguments.contains("-benchmark") }
 }
 

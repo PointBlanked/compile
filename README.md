@@ -15,13 +15,30 @@ camera ─► FrameDeltaEngine ─► LocalVisionEngine ─► DigitalFence ─�
                                                 └─► SpatialAudioEngine (AVAudioEngine 3D)
 ```
 
+## What it does
+
+A real-time, multimodal visual agent for blind and low-vision people. It perceives continuously, reasons about context, and speaks up on its own when something matters.
+
+| Mode | What the user hears or feels | Runs on |
+|---|---|---|
+| **Explore** (default) | Speaks up on its own: "A chair, on your left, about 2 meters." "Obstacle ahead, very close" (with a buzz). "Sign: EXIT." It names each thing once and is paced so it never chatters. | Phone |
+| **Find** | Say or type a goal ("start button"). Haptic pulses get faster as the finger closes in, two taps mean on target, and holding there presses it through a plugin. | Phone |
+| **Read** | Reads text in reading order, each line once, as you move the camera. **Read everything** reads it all again. | Phone |
+| **Describe** | One tap (or a VoiceOver two-finger double tap): a few sentences about everything in view. Uses a multimodal cloud model with the photo when allowed, otherwise an on-device summary. | Cloud or phone |
+
+Hazard warnings ("Careful. Hob is close." / "Stop. Hob.") work in every mode.
+
+**First launch** is a seven-step spoken setup: welcome, camera, the modes, a hands-on haptic demo, optional voice, photo consent, and how to hold the phone. Only the camera is required; everything else is skippable and can be changed later in Settings.
+
+**Benchmarks:** Settings has the speed test (camera to cue, on this phone) and the eight-task head-to-head battery. Results from other apps are logged by hand next to EchoGuide's own and exported as one CSV. The method is in [`benchmarks/PROTOCOL.md`](benchmarks/PROTOCOL.md).
+
 ## Team and ownership
 
 Two owners. Engines meet only through `EchoGuideContracts`, so the two never edit the same file. Ownership is enforced in `.github/CODEOWNERS`.
 
 | Owner | Area | Paths | Files |
 |---|---|---|---|
-| Maxwell | Perception + infrastructure: what the phone senses, and the plumbing | `EchoGuide/Core/Camera/`, `Vision/`, `Depth/`, `Plugins/`, `Router/`, `EchoGuideApp/`, `proxy/`, `.github/`, `EchoGuideTests/`, `Package.swift`, `plugins/` | `FrameDeltaEngine`, `PerceptionPipeline`, `CameraFeed`, `LocalVisionEngine`, `LiDARDepthEngine`, `PluginRegistry`, built-in plugins, `CloudReasoningRouter`, `VoiceLoop`, the iOS app, the key proxy, CI/CD, tests |
+| Maxwell | Perception + infrastructure: what the phone senses, and the plumbing | `EchoGuide/Core/Camera/`, `Vision/`, `Depth/`, `Plugins/`, `Router/`, `Agent/`, `EchoGuideApp/`, `benchmarks/`, `proxy/`, `.github/`, `EchoGuideTests/`, `Package.swift`, `plugins/` | `FrameDeltaEngine`, `PerceptionPipeline`, `CameraFeed`, `LocalVisionEngine`, `LiDARDepthEngine`, `PluginRegistry`, built-in plugins, `CloudReasoningRouter`, `VoiceLoop`, `AgentCore` (Explore/Read/Describe), `SceneNarrator`, `TextReader`, `TrialRecorder`, the iOS app, the key proxy, CI/CD, tests |
 | Bryan | Experience + safety: everything the user feels, hears and sees | `EchoGuide/Core/Fence/`, `Haptics/`, `Audio/`, `Automation/`, `Cognitive/`, `EchoGuide/UI/` | `DigitalFenceEngine`, `SpatialHapticEngine`, `SpatialAudioEngine`, `AutomationEngine`, `CognitiveTaskIsolation`, `GuidanceView` |
 | Both | Shared contracts | `EchoGuide/Core/Contracts/` | `Contracts.swift` (needs both approvals) |
 
@@ -65,7 +82,7 @@ Read these honestly:
 ## Build
 
 ```bash
-swift build && swift test        # macOS host: pure logic, 62 tests (plus `cd proxy && node --test`: 6)
+swift build && swift test        # macOS host: pure logic, 105 tests (plus `cd proxy && node --test`: 6)
 ```
 
 The iOS-only paths (ARKit, the camera, the haptic actuator) are behind `#if canImport(...) && os(iOS)`. The `ios-build` CI job compiles them with `xcodebuild` for the iOS Simulator. Real latency numbers need a device.

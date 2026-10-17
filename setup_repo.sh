@@ -9,7 +9,7 @@ REMOTE_URL="${REMOTE_URL:-https://github.com/PointBlanked/compile.git}"
 mkdir -p "$TARGET"
 cd "$TARGET"
 
-mkdir -p .github .github/workflows EchoGuide/Core/Audio EchoGuide/Core/Automation EchoGuide/Core/Camera EchoGuide/Core/Cognitive EchoGuide/Core/Contracts EchoGuide/Core/Depth EchoGuide/Core/Fence EchoGuide/Core/Haptics EchoGuide/Core/Plugins EchoGuide/Core/Router EchoGuide/Core/Vision EchoGuide/UI EchoGuideApp EchoGuideApp/Assets.xcassets EchoGuideApp/Assets.xcassets/AppIcon.appiconset EchoGuideApp/EchoGuideApp.xcodeproj EchoGuideApp/EchoGuideApp.xcodeproj/xcshareddata/xcschemes EchoGuideApp/Resources EchoGuideApp/Resources/Models EchoGuideApp/Sources EchoGuideTests plugins proxy scripts
+mkdir -p .github .github/workflows EchoGuide/Core/Agent EchoGuide/Core/Audio EchoGuide/Core/Automation EchoGuide/Core/Camera EchoGuide/Core/Cognitive EchoGuide/Core/Contracts EchoGuide/Core/Depth EchoGuide/Core/Fence EchoGuide/Core/Haptics EchoGuide/Core/Plugins EchoGuide/Core/Router EchoGuide/Core/Vision EchoGuide/UI EchoGuideApp EchoGuideApp/Assets.xcassets EchoGuideApp/Assets.xcassets/AppIcon.appiconset EchoGuideApp/EchoGuideApp.xcodeproj EchoGuideApp/EchoGuideApp.xcodeproj/xcshareddata/xcschemes EchoGuideApp/Resources EchoGuideApp/Resources/Models EchoGuideApp/Sources EchoGuideTests benchmarks plugins proxy scripts
 
 cat > '.github/CODEOWNERS' <<'EOF_AVAE'
 # Two owners. PRs touching a path need that owner's review.
@@ -266,6 +266,667 @@ __pycache__/
 .venv/
 EOF_AVAE
 
+cat > 'EchoGuide/Core/Agent/AgentCore.swift' <<'EOF_AVAE'
+// Owner: Maxwell. The visual agent: one actor that owns what the user hears
+// in each mode, on top of the same live perception stream.
+//
+//   Explore  continuous perception, proactive: names what comes into view and
+//            warns about obstacles in the path, unprompted.
+//   Find     goal-directed: frames go to AutomationEngine (Bryan), which guides
+//            the finger onto one target and presses it.
+//   Read     reads text in view in reading order, once per line.
+//   Describe one-shot contextual reasoning about the whole scene (multimodal
+//            cloud model with the photo when allowed, on-device summary otherwise).
+//
+// Hazard-fence warnings speak in every mode.
+
+import Foundation
+import EchoGuideContracts
+
+public enum AgentMode: String, Sendable, CaseIterable, Codable {
+    case explore, find, read
+
+    public var title: String {
+        switch self {
+        case .explore: return "Explore"
+        case .find: return "Find"
+        case .read: return "Read"
+        }
+    }
+
+    /// One sentence the user hears when switching, so the mode explains itself.
+    public var spokenHelp: String {
+        switch self {
+        case .explore: return "Explore. I will tell you what is around you."
+        case .find: return "Find. Say or type what you want, then follow the pulses."
+        case .read: return "Read. Point the camera at text and hold still."
+        }
+    }
+}
+
+public struct AgentLine: Sendable, Equatable {
+    public enum Source: String, Sendable, Codable { case narrator, reader, describe, fence, system }
+    public var text: String
+    public var source: Source
+    public var at: Date
+}
+
+public struct AgentTelemetry: Sendable, Equatable {
+    public var framesSeen = 0
+    public var announcements = 0
+    public var describeCloud = 0
+    public var describeLocal = 0
+    public var describeP50Ms: Double = 0
+    public var describeP95Ms: Double = 0
+}
+
+public actor AgentCore {
+    public private(set) var mode: AgentMode = .explore
+    private let audio: SpatialAudioCueing
+    private let haptics: HapticCueing
+    private let depth: DepthProviding?
+    private let router: ReasoningRouting?
+    private var narrator: SceneNarrator
+    private var reader = TextReader()
+    private var lastFrame: VisionFrameResult?
+    private var lastFenceWarning: [String: TimeInterval] = [:]
+    private var busyUntil: TimeInterval = 0
+    private var telemetry = AgentTelemetry()
+    private var describeLatency = LatencyWindow(capacity: 64)
+    private var continuations: [UUID: AsyncStream<AgentLine>.Continuation] = [:]
+    private let clock: @Sendable () -> TimeInterval
+
+    public init(audio: SpatialAudioCueing, haptics: HapticCueing, depth: DepthProviding? = nil, router: ReasoningRouting? = nil,
+                narrator: NarratorConfig = NarratorConfig(),
+                clock: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSince1970 }) {
+        self.audio = audio
+        self.haptics = haptics
+        self.depth = depth
+        self.router = router
+        self.narrator = SceneNarrator(config: narrator)
+        self.clock = clock
+    }
+
+    /// Captions for the screen: every sentence the agent says, as it says it.
+    public func lines() -> AsyncStream<AgentLine> {
+        AsyncStream { c in
+            let id = UUID()
+            continuations[id] = c
+            c.onTermination = { [weak self] _ in Task { await self?.drop(id) } }
+        }
+    }
+
+    private func drop(_ id: UUID) { continuations[id] = nil }
+
+    public var stats: AgentTelemetry {
+        var t = telemetry
+        t.describeP50Ms = describeLatency.percentile(0.5)
+        t.describeP95Ms = describeLatency.percentile(0.95)
+        return t
+    }
+
+    public func setMode(_ m: AgentMode, announce: Bool = true) async {
+        mode = m
+        narrator.reset()
+        reader.reset()
+        busyUntil = 0
+        await haptics.stop()
+        if announce { await say(m.spokenHelp, source: .system, urgent: true) }
+    }
+
+    /// Feed every inferred frame. Returns true when the frame belongs to
+    /// AutomationEngine (Find mode), which then also handles the fence.
+    @discardableResult
+    public func ingest(_ frame: VisionFrameResult, fence: FenceEvent?) async -> Bool {
+        lastFrame = frame
+        telemetry.framesSeen += 1
+        if mode == .find { return true }
+
+        if let fence, await handle(fence, at: frame.timestamp) { return false }
+
+        switch mode {
+        case .explore:
+            var depths: [Int: Float] = [:]
+            var ahead: Float?
+            if let depth {
+                // Sample only what could be announced: the few most salient objects and the path ahead.
+                let ranked = frame.detections.enumerated()
+                    .filter { $0.element.kind == .object && !SceneVocabulary.silent.contains($0.element.label) }
+                    .sorted { SceneVocabulary.salience(of: $0.element.label) > SceneVocabulary.salience(of: $1.element.label) }
+                    .prefix(4)
+                for (i, d) in ranked { depths[i] = await depth.depth(at: d.box.mid) }
+                ahead = await depth.depth(at: .center)
+            }
+            guard let a = narrator.observe(frame, depths: depths, aheadMetres: ahead) else { return false }
+            if !a.urgent, clock() < busyUntil { return false }
+            telemetry.announcements += 1
+            if a.urgent { await haptics.warn() }
+            await say(a.text, source: .narrator, azimuth: a.azimuth, urgent: a.urgent)
+        case .read:
+            guard clock() >= busyUntil else { return false }
+            let fresh = reader.newLines(in: frame)
+            guard !fresh.isEmpty else { return false }
+            await say(fresh.prefix(3).joined(separator: ". "), source: .reader)
+        case .find:
+            break
+        }
+        return false
+    }
+
+    /// The Describe button: what is in front of me, all of it, in a few sentences.
+    @discardableResult
+    public func describe(jpeg: Data?) async -> String {
+        let timer = FrameTimer()
+        guard let frame = lastFrame else {
+            let text = "The camera is still starting. Try again in a moment."
+            await say(text, source: .describe, urgent: true)
+            return text
+        }
+        await say("Looking.", source: .system, urgent: true)
+
+        var depths: [Int: Float] = [:]
+        if let depth {
+            for (i, d) in frame.detections.enumerated().prefix(6) where d.kind == .object { depths[i] = await depth.depth(at: d.box.mid) }
+        }
+        let local = SceneSummary.local(frame, depths: depths)
+
+        var text = local
+        if let router {
+            let outcome = await router.resolve(ReasoningQuery(
+                question: "Describe what is in front of the camera for someone who cannot see it.",
+                detections: frame.detections.filter { $0.kind != .fingertip },
+                localConfidence: 0,
+                jpeg: jpeg,
+                maxWords: 40,
+                timeout: 6
+            ))
+            if outcome.source == .cloud, !outcome.answer.isEmpty {
+                text = outcome.answer
+                telemetry.describeCloud += 1
+            } else {
+                telemetry.describeLocal += 1
+            }
+        } else {
+            telemetry.describeLocal += 1
+        }
+        describeLatency.record(timer.elapsedMs)
+        await say(text, source: .describe, urgent: true)
+        return text
+    }
+
+    /// The Read button: everything readable right now, ignoring what was read before.
+    @discardableResult
+    public func readNow() async -> String {
+        guard let frame = lastFrame else { return "" }
+        let lines = TextReader.lines(in: frame)
+        let text = lines.isEmpty ? "I cannot see any text. Hold the phone about a foot away and keep still." : lines.joined(separator: ". ")
+        await say(text, source: .reader, urgent: true)
+        return text
+    }
+
+    // MARK: - Speech
+
+    private func say(_ text: String, source: AgentLine.Source, azimuth: Float = 0, urgent: Bool = false) async {
+        // Roughly 2.5 words a second; the next routine line waits for this one.
+        let words = Double(text.split(separator: " ").count)
+        busyUntil = clock() + max(1.2, words / 2.5)
+        let line = AgentLine(text: text, source: source, at: Date())
+        for c in continuations.values { c.yield(line) }
+        await audio.speak(text, azimuth: azimuth)
+    }
+
+    // MARK: - Fence (Explore and Read; Find delegates to AutomationEngine)
+
+    private func handle(_ event: FenceEvent, at now: TimeInterval) async -> Bool {
+        switch event {
+        case .breached(let zone):
+            await haptics.warn()
+            if throttle(zone, now) { await say("Stop. \(zone.capitalizedFirstLetter).", source: .fence, urgent: true) }
+            return true
+        case .approaching(let zone, _):
+            if throttle(zone, now) {
+                await haptics.warn()
+                await say("Careful. \(zone.capitalizedFirstLetter) is close.", source: .fence, urgent: true)
+            }
+            return false
+        }
+    }
+
+    private func throttle(_ key: String, _ now: TimeInterval) -> Bool {
+        if let last = lastFenceWarning[key], now - last < 3 { return false }
+        lastFenceWarning[key] = now
+        return true
+    }
+}
+
+/// On-device scene description: works offline, and is the fallback whenever
+/// the cloud is off, slow or refused.
+public enum SceneSummary {
+    public static func local(_ frame: VisionFrameResult, depths: [Int: Float] = [:]) -> String {
+        var groups: [String: [String]] = [:]
+        let order = ["ahead", "on your left", "on your right"]
+        var seenLabels = Set<String>()
+        let objects = frame.detections.enumerated()
+            .filter { $0.element.kind == .object && !SceneVocabulary.silent.contains($0.element.label) && $0.element.confidence >= 0.4 }
+            .sorted { SceneVocabulary.salience(of: $0.element.label) > SceneVocabulary.salience(of: $1.element.label) }
+        for (i, d) in objects where seenLabels.insert(d.label).inserted && seenLabels.count <= 5 {
+            var phrase = SceneVocabulary.article(d.label)
+            if let dist = SceneVocabulary.distance(depths[i]) { phrase += ", \(dist)" }
+            groups[SceneVocabulary.place(d.box.midX), default: []].append(phrase)
+        }
+        var sentences = order.compactMap { place -> String? in
+            guard let items = groups[place], !items.isEmpty else { return nil }
+            return "\(place.capitalizedFirstLetter): \(items.joined(separator: "; "))."
+        }
+        let text = TextReader.lines(in: frame).prefix(2)
+        if !text.isEmpty {
+            let joined = text.joined(separator: ". ")
+            sentences.append("Text: " + joined + ".")
+        }
+        if frame.detections.contains(where: { $0.kind == .barcode }) { sentences.append("There is a barcode. Hold still on it to hear the product.") }
+        return sentences.isEmpty
+            ? "I cannot make out anything clearly. Move the phone slowly from side to side."
+            : sentences.joined(separator: " ")
+    }
+}
+EOF_AVAE
+
+cat > 'EchoGuide/Core/Agent/SceneNarrator.swift' <<'EOF_AVAE'
+// Owner: Maxwell. Proactive narration for Explore mode: the agent speaks up
+// on its own when something new and worth knowing comes into view, and stays
+// quiet otherwise. The rules that keep it useful instead of noisy:
+//
+//   * settled:   a thing must be seen on several frames before it is named
+//   * novel:     each thing is named once, then not again for a cooldown
+//   * ranked:    an obstacle in the path beats a car beats a person beats a cup
+//   * paced:     at most one sentence every couple of seconds
+//   * placed:    every sentence says where ("on your left, 2 meters")
+//
+// Pure logic, no audio; AgentCore speaks what this returns.
+
+import Foundation
+import EchoGuideContracts
+
+public struct NarratorConfig: Sendable {
+    public var settleFrames = 2
+    /// The same label is not announced again for this long.
+    public var labelCooldown: TimeInterval = 20
+    /// The same piece of text is not read again for this long.
+    public var textCooldown: TimeInterval = 45
+    /// Minimum gap between two announcements.
+    public var minGap: TimeInterval = 2.5
+    /// Something closer than this, straight ahead, is an obstacle warning.
+    public var obstacleMetres: Float = 1.2
+    public var obstacleCooldown: TimeInterval = 4
+    /// Ignore detections less confident than this (avoids naming noise).
+    public var minimumConfidence: Float = 0.5
+    /// Tracks unseen for this long are forgotten.
+    public var trackExpiry: TimeInterval = 1.5
+
+    public init() {}
+}
+
+public struct Announcement: Sendable, Equatable {
+    public enum Kind: Sendable, Equatable { case obstacle, object, text }
+
+    public var text: String
+    public var kind: Kind
+    /// -π/2 left ... +π/2 right, for the spatial ping before the words.
+    public var azimuth: Float
+    /// Obstacles also buzz.
+    public var urgent: Bool
+}
+
+public enum SceneVocabulary {
+    /// Higher = more worth interrupting for. Unlisted labels score 2.
+    public static let salience: [String: Int] = [
+        "car": 9, "bus": 9, "truck": 9, "motorcycle": 9, "bicycle": 8, "train": 9,
+        "traffic light": 8, "stop sign": 8, "person": 7, "dog": 6, "cat": 5,
+        "bench": 5, "chair": 5, "couch": 4, "bed": 4, "dining table": 5, "toilet": 6, "sink": 5,
+        "refrigerator": 5, "oven": 6, "microwave": 5, "tv": 3, "laptop": 3, "cell phone": 3,
+        "backpack": 3, "handbag": 3, "suitcase": 4, "bottle": 2, "cup": 2, "potted plant": 3,
+    ]
+
+    /// Never volunteered: the user's own hand, and background clutter.
+    public static let silent: Set<String> = ["fingertip", "text"]
+
+    public static func salience(of label: String) -> Int { salience[label] ?? 2 }
+
+    public static func place(_ x: Float) -> String {
+        if x < 0.33 { return "on your left" }
+        if x > 0.67 { return "on your right" }
+        return "ahead"
+    }
+
+    public static func distance(_ metres: Float?) -> String? {
+        guard let m = metres, m.isFinite, m > 0 else { return nil }
+        if m < 0.75 { return "very close" }
+        if m < 1.5 { return "about 1 meter" }
+        return "about \(Int(m.rounded())) meters"
+    }
+
+    public static func azimuth(_ x: Float) -> Float { max(-1, min(1, (x - 0.5) * 2)) * .pi / 2 }
+
+    /// "a chair" / "a person" / "an oven"; plural not needed for one-at-a-time speech.
+    public static func article(_ label: String) -> String {
+        guard let first = label.lowercased().first else { return label }
+        return ("aeiou".contains(first) ? "an " : "a ") + label
+    }
+}
+
+public struct SceneNarrator: Sendable {
+    public var config: NarratorConfig
+
+    struct Track {
+        var label: String
+        var box: ImageRect
+        var frames: Int
+        var lastSeen: TimeInterval
+    }
+
+    private var tracks: [Track] = []
+    private var lastAnnounced: [String: TimeInterval] = [:]
+    private var lastAny: TimeInterval = -.infinity
+
+    public init(config: NarratorConfig = NarratorConfig()) { self.config = config }
+
+    public mutating func reset() {
+        tracks = []
+        lastAnnounced = [:]
+        lastAny = -.infinity
+    }
+
+    /// `depths` holds metres per detection index when LiDAR is available.
+    /// `aheadMetres` is the depth at the frame centre (the walking path).
+    public mutating func observe(_ frame: VisionFrameResult, depths: [Int: Float] = [:], aheadMetres: Float? = nil) -> Announcement? {
+        let now = frame.timestamp
+        updateTracks(frame, now: now)
+
+        // 1. Obstacle in the path: only rule allowed to break the pacing gap.
+        if let ahead = aheadMetres, ahead > 0, ahead < config.obstacleMetres, cooled("__obstacle", now, config.obstacleCooldown) {
+            let what = frame.targets
+                .filter { $0.box.contains(.center) && !SceneVocabulary.silent.contains($0.label) }
+                .max { $0.confidence < $1.confidence }?.label
+            let distance = SceneVocabulary.distance(ahead) ?? "close"
+            let text = what.map { "\($0.capitalizedFirstLetter) ahead, \(distance)." } ?? "Obstacle ahead, \(distance)."
+            return mark(Announcement(text: text, kind: .obstacle, azimuth: 0, urgent: true), keys: ["__obstacle"] + (what.map { [$0] } ?? []), at: now)
+        }
+
+        guard now - lastAny >= config.minGap else { return nil }
+
+        // 2. The most salient settled thing not announced recently.
+        var best: (score: Float, d: Detection, metres: Float?)?
+        for (i, d) in frame.detections.enumerated() {
+            guard d.kind == .object, d.confidence >= config.minimumConfidence,
+                  !SceneVocabulary.silent.contains(d.label), isSettled(d),
+                  cooled(d.label, now, config.labelCooldown) else { continue }
+            let metres = depths[i]
+            // Salience first; nearer and more central break ties.
+            var score = Float(SceneVocabulary.salience(of: d.label))
+            if let m = metres { score += max(0, 3 - m) * 0.5 }
+            score += (1 - abs(d.box.midX - 0.5) * 2) * 0.5
+            if best == nil || score > best!.score { best = (score, d, metres) }
+        }
+        if let b = best {
+            var parts = [SceneVocabulary.article(b.d.label).capitalizedFirstLetter, SceneVocabulary.place(b.d.box.midX)]
+            if let dist = SceneVocabulary.distance(b.metres) { parts.append(dist) }
+            let text = parts.joined(separator: ", ") + "."
+            return mark(Announcement(text: text, kind: .object, azimuth: SceneVocabulary.azimuth(b.d.box.midX), urgent: false), keys: [b.d.label], at: now)
+        }
+
+        // 3. Readable text nobody has read out yet (signs, labels).
+        if let sign = frame.detections
+            .filter({ $0.kind == .text && $0.confidence >= config.minimumConfidence })
+            .compactMap({ d -> (Detection, String)? in
+                guard let t = d.text.map(TextReader.clean), t.count >= 3 else { return nil }
+                return (d, t)
+            })
+            .max(by: { $0.0.box.area < $1.0.box.area }),
+           cooled("text:" + sign.1.lowercased(), now, config.textCooldown) {
+            return mark(Announcement(text: "Sign: \(sign.1).", kind: .text, azimuth: SceneVocabulary.azimuth(sign.0.box.midX), urgent: false),
+                        keys: ["text:" + sign.1.lowercased()], at: now)
+        }
+        return nil
+    }
+
+    // MARK: - Tracking
+
+    private mutating func updateTracks(_ frame: VisionFrameResult, now: TimeInterval) {
+        tracks.removeAll { now - $0.lastSeen > config.trackExpiry }
+        for d in frame.detections where d.kind == .object {
+            if let i = tracks.firstIndex(where: { $0.label == d.label && ($0.box.iou(d.box) > 0.15 || $0.box.mid.distance(to: d.box.mid) < 0.15) }) {
+                tracks[i].box = d.box
+                tracks[i].frames += 1
+                tracks[i].lastSeen = now
+            } else {
+                tracks.append(Track(label: d.label, box: d.box, frames: 1, lastSeen: now))
+            }
+        }
+    }
+
+    private func isSettled(_ d: Detection) -> Bool {
+        tracks.contains { $0.label == d.label && $0.frames >= config.settleFrames && ($0.box.iou(d.box) > 0.15 || $0.box.mid.distance(to: d.box.mid) < 0.15) }
+    }
+
+    private func cooled(_ key: String, _ now: TimeInterval, _ cooldown: TimeInterval) -> Bool {
+        guard let last = lastAnnounced[key] else { return true }
+        return now - last >= cooldown
+    }
+
+    private mutating func mark(_ a: Announcement, keys: [String], at now: TimeInterval) -> Announcement {
+        for k in keys { lastAnnounced[k] = now }
+        lastAny = now
+        return a
+    }
+}
+
+extension String {
+    var capitalizedFirstLetter: String { prefix(1).uppercased() + dropFirst() }
+}
+EOF_AVAE
+
+cat > 'EchoGuide/Core/Agent/TextReader.swift' <<'EOF_AVAE'
+// Owner: Maxwell. Read mode: turns OCR fragments into the order a sighted
+// person would read them (top to bottom, left to right), drops repeats and
+// junk, and remembers what was already read so a held-still page is not
+// read twice.
+
+import Foundation
+import EchoGuideContracts
+
+public struct TextReader: Sendable {
+    /// A line already read is not read again for this long.
+    public var repeatAfter: TimeInterval = 60
+    private var readAt: [String: TimeInterval] = [:]
+
+    public init() {}
+
+    public mutating func reset() { readAt = [:] }
+
+    /// Everything readable in this frame, in reading order, ignoring history.
+    public static func lines(in frame: VisionFrameResult, minimumConfidence: Float = 0.4) -> [String] {
+        let items = frame.detections
+            .filter { $0.kind == .text && $0.confidence >= minimumConfidence }
+            .compactMap { d -> (ImageRect, String)? in
+                guard let t = d.text.map(clean), t.count >= 2 else { return nil }
+                return (d.box, t)
+            }
+        // Group into rows by vertical overlap, then left to right inside a row.
+        let sorted = items.sorted { $0.0.midY < $1.0.midY }
+        var rows: [[(ImageRect, String)]] = []
+        for item in sorted {
+            if let last = rows.last?.last, abs(last.0.midY - item.0.midY) < max(last.0.height, item.0.height) * 0.6 {
+                rows[rows.count - 1].append(item)
+            } else {
+                rows.append([item])
+            }
+        }
+        var seen = Set<String>()
+        return rows.map { $0.sorted { $0.0.midX < $1.0.midX }.map(\.1).joined(separator: " ") }
+            .filter { seen.insert($0.lowercased()).inserted }
+    }
+
+    /// Lines not read recently, marked as read now.
+    public mutating func newLines(in frame: VisionFrameResult) -> [String] {
+        let now = frame.timestamp
+        let fresh = Self.lines(in: frame).filter { line in
+            guard let at = readAt[line.lowercased()] else { return true }
+            return now - at >= repeatAfter
+        }
+        for l in fresh { readAt[l.lowercased()] = now }
+        return fresh
+    }
+
+    /// Strips OCR noise: stray symbols, repeated spaces, lone characters.
+    public static func clean(_ raw: String) -> String {
+        let kept = raw.unicodeScalars.filter { CharacterSet.alphanumerics.union(.whitespaces).union(CharacterSet(charactersIn: ".,:;!?'%$£€&-/()")).contains($0) }
+        let s = String(String.UnicodeScalarView(kept))
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            .trimmingCharacters(in: CharacterSet(charactersIn: " .,-"))
+        // A line with no letters or digits at all is noise.
+        return s.rangeOfCharacter(from: .alphanumerics) == nil ? "" : s
+    }
+}
+EOF_AVAE
+
+cat > 'EchoGuide/Core/Agent/TrialRecorder.swift' <<'EOF_AVAE'
+// Owner: Maxwell. Head-to-head benchmark instrumentation. Every trial is one
+// real task ("find the microwave start button") timed from start to the
+// tester's success/fail tap, with the counts that make products comparable:
+// time to first useful cue, prompts the user had to give, cloud calls, and
+// whether it ran offline. The same task sheet is run on competitor apps by
+// hand (benchmarks/PROTOCOL.md) and both land in one CSV.
+
+import Foundation
+
+public struct TrialResult: Sendable, Codable, Equatable {
+    public var product: String
+    public var task: String
+    public var mode: String
+    public var startedAt: Date
+    public var durationS: Double
+    public var success: Bool
+    /// Start of trial to the first thing the user heard or felt.
+    public var firstCueMs: Double?
+    /// Sentences the product spoke during the trial.
+    public var spokenLines: Int
+    /// Times the user had to tap, speak or otherwise prompt it.
+    public var userPrompts: Int
+    public var cloudCalls: Int
+    public var offline: Bool
+    public var notes: String
+
+    public static let csvHeader = "product,task,mode,started_at,duration_s,success,first_cue_ms,spoken_lines,user_prompts,cloud_calls,offline,notes"
+
+    public var csvRow: String {
+        let iso = ISO8601DateFormatter().string(from: startedAt)
+        let cue = firstCueMs.map { String(format: "%.0f", $0) } ?? ""
+        return [Self.q(product), Self.q(task), mode, iso, String(format: "%.2f", durationS), success ? "1" : "0", cue,
+                "\(spokenLines)", "\(userPrompts)", "\(cloudCalls)", offline ? "1" : "0", Self.q(notes)].joined(separator: ",")
+    }
+
+    static func q(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\"" }
+}
+
+/// The standard task battery. Same tasks, same order, every product.
+public enum BenchmarkTasks {
+    public static let all: [(task: String, mode: String)] = [
+        ("Find and press the Start button on a microwave or labelled panel", "find"),
+        ("Find a specific product on a table of five (by its label)", "find"),
+        ("Read the first line of a printed letter", "read"),
+        ("Identify a packaged food by its barcode", "find"),
+        ("Walk 5 m down a corridor and get warned before a chair in the path", "explore"),
+        ("Say what is on the table without asking a question", "explore"),
+        ("Describe the room in one request", "describe"),
+        ("Same as task 1 in Airplane Mode", "find"),
+    ]
+}
+
+public actor TrialRecorder {
+    public struct Active: Sendable {
+        var product: String
+        var task: String
+        var mode: String
+        var started: Date
+        var startedUptime: Double
+        var firstCue: Double?
+        var spoken = 0
+        var prompts = 0
+        var cloud = 0
+        var offline: Bool
+    }
+
+    private var active: Active?
+    public private(set) var results: [TrialResult] = []
+    private let storeURL: URL?
+
+    public init(storeURL: URL? = nil) {
+        self.storeURL = storeURL
+        if let storeURL, let data = try? Data(contentsOf: storeURL) {
+            let d = JSONDecoder()
+            d.dateDecodingStrategy = .iso8601
+            results = (try? d.decode([TrialResult].self, from: data)) ?? []
+        }
+    }
+
+    public var isRunning: Bool { active != nil }
+    public var currentTask: String? { active?.task }
+
+    public func start(task: String, mode: String, product: String = "EchoGuide", offline: Bool) {
+        active = Active(product: product, task: task, mode: mode, started: Date(), startedUptime: Self.uptime(), offline: offline)
+    }
+
+    public func noteSpoken() {
+        guard active != nil else { return }
+        active!.spoken += 1
+        if active!.firstCue == nil { active!.firstCue = (Self.uptime() - active!.startedUptime) * 1000 }
+    }
+
+    /// A haptic cue also counts as the first useful cue.
+    public func noteHaptic() {
+        guard active != nil, active!.firstCue == nil else { return }
+        active!.firstCue = (Self.uptime() - active!.startedUptime) * 1000
+    }
+
+    public func notePrompt() { if active != nil { active!.prompts += 1 } }
+    public func noteCloudCall() { if active != nil { active!.cloud += 1 } }
+
+    @discardableResult
+    public func finish(success: Bool, notes: String = "") -> TrialResult? {
+        guard let a = active else { return nil }
+        active = nil
+        let r = TrialResult(product: a.product, task: a.task, mode: a.mode, startedAt: a.started,
+                            durationS: Self.uptime() - a.startedUptime, success: success, firstCueMs: a.firstCue,
+                            spokenLines: a.spoken, userPrompts: a.prompts, cloudCalls: a.cloud, offline: a.offline, notes: notes)
+        results.append(r)
+        save()
+        return r
+    }
+
+    /// Add a trial timed by hand on another product (same columns).
+    public func addManual(_ r: TrialResult) {
+        results.append(r)
+        save()
+    }
+
+    public func clear() {
+        results = []
+        save()
+    }
+
+    public var csv: String { ([TrialResult.csvHeader] + results.map(\.csvRow)).joined(separator: "\n") + "\n" }
+
+    private func save() {
+        guard let storeURL else { return }
+        let e = JSONEncoder()
+        e.dateEncodingStrategy = .iso8601
+        try? e.encode(results).write(to: storeURL, options: .atomic)
+    }
+
+    static func uptime() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e9 }
+}
+EOF_AVAE
+
 cat > 'EchoGuide/Core/Audio/SpatialAudioEngine.swift' <<'EOF_AVAE'
 // Owner: Bryan. Directional earcons through AVAudioEngine's environment node
 // (HRTF on headphones, equal-power pan on the speaker) plus on-device speech.
@@ -303,7 +964,21 @@ public actor SpatialAudioEngine: SpatialAudioCueing {
     private var started = false
     private var observers: [NSObjectProtocol] = []
 
-    public init() {}
+    private let speech: SpeechSynthesizing?
+    private let cache: SpeechCache
+    private var speechPlayer: AVAudioPlayer?
+    private var speechDelegate: SpeechPlayerDelegate?
+    private var urgentUntil: TimeInterval = -.infinity
+    /// Where the last phrase came from, for telemetry and tests.
+    public private(set) var lastSpeechSource: SpeechSource = .onDevice
+    public private(set) var lastSpoken: String?
+
+    /// `speech` is an optional better voice (Kokoro). Without one, or whenever
+    /// it fails or is slow, the on-device synthesizer speaks instead.
+    public init(speech: SpeechSynthesizing? = nil, cacheCapacity: Int = 64) {
+        self.speech = speech
+        self.cache = SpeechCache(capacity: cacheCapacity)
+    }
 
     /// Builds the graph once; (re)starts the engine whenever it is down.
     /// A phone call, a route change (headphones out) or backgrounding stops
@@ -367,14 +1042,77 @@ public actor SpatialAudioEngine: SpatialAudioCueing {
     }
 
     public func speak(_ text: String, azimuth: Float) async {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        let urgent = SpeechPolicy.isUrgent(text)
+        // A routine instruction never talks over a hazard or wandering alert.
+        if !urgent, isSpeaking, Date().timeIntervalSince1970 < urgentUntil { return }
+
         // Spoken words carry the instruction; a ping first gives the direction.
         await ping(azimuth: azimuth, elevation: 0)
-        if synth.isSpeaking { synth.stopSpeaking(at: .word) }
+        stopSpeaking()
+        lastSpoken = text
+
+        if let wav = await synthesized(text) {
+            do {
+                let p = try AVAudioPlayer(data: wav)
+                let d = SpeechPlayerDelegate()
+                p.delegate = d
+                speechDelegate = d
+                speechPlayer = p
+                p.prepareToPlay()
+                if p.play() {
+                    lastSpeechSource = .kokoro
+                    if urgent { urgentUntil = Date().timeIntervalSince1970 + p.duration }
+                    return
+                }
+            } catch {}
+            speechPlayer = nil
+        }
+
+        lastSpeechSource = .onDevice
         let u = AVSpeechUtterance(string: text)
         u.rate = AVSpeechUtteranceDefaultSpeechRate * 0.95
         u.prefersAssistiveTechnologySettings = true
+        // ~3 words/s at this rate, generous so the alert is not talked over.
+        if urgent { urgentUntil = Date().timeIntervalSince1970 + Double(text.split(separator: " ").count) / 2.5 }
         synth.speak(u)
     }
+
+    public var isSpeaking: Bool { synth.isSpeaking || (speechPlayer?.isPlaying ?? false) }
+
+    private func stopSpeaking() {
+        if synth.isSpeaking { synth.stopSpeaking(at: .word) }
+        speechPlayer?.stop()
+        speechPlayer = nil
+    }
+
+    /// Cached or freshly synthesized WAV, nil when there is no provider or it
+    /// failed (the caller then uses the on-device voice).
+    private func synthesized(_ text: String) async -> Data? {
+        guard let speech else { return nil }
+        if let hit = await cache.get(text) { return hit }
+        guard let wav = try? await speech.synthesize(text) else { return nil }
+        await cache.put(text, wav)
+        return wav
+    }
+
+    /// Synthesize phrases the demo will need ("Hold still", "Stop. Hob.") so
+    /// the first time they are spoken is as fast as the second.
+    public func prewarm(_ phrases: [String]) async {
+        guard speech != nil else { return }
+        for p in phrases where await cache.get(p) == nil {
+            _ = await synthesized(p)
+        }
+    }
+
+    public var cachedPhrases: Int {
+        get async { await cache.count }
+    }
+
+    /// Keeps the player alive until it finishes; AVAudioPlayer needs a delegate
+    /// object with a stable lifetime to report completion.
+    private final class SpeechPlayerDelegate: NSObject, AVAudioPlayerDelegate {}
 
     /// 60 ms 1.2 kHz sine with a short fade, cheap to schedule repeatedly.
     private static func makePing(format: AVAudioFormat) -> AVAudioPCMBuffer? {
@@ -389,6 +1127,253 @@ public actor SpatialAudioEngine: SpatialAudioCueing {
             ch[i] = sin(2 * .pi * 1200 * t) * 0.5 * env
         }
         return buf
+    }
+}
+#endif
+EOF_AVAE
+
+cat > 'EchoGuide/Core/Audio/SpeechProvider.swift' <<'EOF_AVAE'
+// Owner: Bryan. Pluggable text-to-speech. The default voice is the on-device
+// AVSpeechSynthesizer, which always works. An open-weight Kokoro voice can be
+// layered on top through any server that speaks the OpenAI audio API, such as
+// Kokoro-FastAPI on a laptop or Raspberry Pi in the home:
+//
+//     docker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:latest
+//
+// The provider returns a WAV; SpatialAudioEngine plays it and falls back to
+// the on-device voice on any error or timeout, so Airplane Mode still works.
+
+import Foundation
+
+/// Produces a playable audio file (WAV) for a short phrase.
+public protocol SpeechSynthesizing: Sendable {
+    func synthesize(_ text: String) async throws -> Data
+}
+
+public enum SpeechProviderError: Error, Equatable {
+    case badStatus(Int)
+    case emptyAudio
+    case timeout
+}
+
+/// Kokoro-82M through an OpenAI-compatible `/v1/audio/speech` endpoint.
+public struct KokoroSpeechProvider: SpeechSynthesizing {
+    public typealias Transport = @Sendable (URLRequest) async throws -> (Data, URLResponse)
+
+    public var baseURL: URL
+    /// Kokoro voice id, e.g. "af_heart", "bf_emma", or a blend "af_bella(2)+af_sky(1)".
+    public var voice: String
+    public var speed: Double
+    /// Per-request budget. A spoken cue that arrives late is worse than the
+    /// on-device voice arriving now.
+    public var timeout: TimeInterval
+    private let transport: Transport
+
+    public init(baseURL: URL, voice: String = "af_heart", speed: Double = 1.0, timeout: TimeInterval = 1.5,
+                transport: Transport? = nil) {
+        self.baseURL = baseURL
+        self.voice = voice
+        self.speed = speed
+        self.timeout = timeout
+        self.transport = transport ?? { request in try await URLSession.shared.data(for: request) }
+    }
+
+    public func request(for text: String) -> URLRequest {
+        var r = URLRequest(url: baseURL.appendingPathComponent("v1/audio/speech"))
+        r.httpMethod = "POST"
+        r.timeoutInterval = timeout
+        r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = [
+            "model": "kokoro",
+            "input": text,
+            "voice": voice,
+            "response_format": "wav",
+            "speed": speed,
+        ]
+        r.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        return r
+    }
+
+    public func synthesize(_ text: String) async throws -> Data {
+        let (data, response) = try await withTimeout(timeout) { try await transport(request(for: text)) }
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw SpeechProviderError.badStatus(http.statusCode)
+        }
+        guard data.count > 44 else { throw SpeechProviderError.emptyAudio } // a WAV header alone is 44 bytes
+        return data
+    }
+}
+
+/// Runs `body` or throws `SpeechProviderError.timeout`, whichever comes first.
+func withTimeout<T: Sendable>(_ seconds: TimeInterval, _ body: @escaping @Sendable () async throws -> T) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await body() }
+        group.addTask {
+            try await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+            throw SpeechProviderError.timeout
+        }
+        guard let first = try await group.next() else { throw SpeechProviderError.timeout }
+        group.cancelAll()
+        return first
+    }
+}
+
+/// Phrases repeat ("Start. Move right.", "Hold still"), so synthesized audio
+/// is kept by text. Bounded, least recently used out first.
+public actor SpeechCache {
+    private var store: [String: Data] = [:]
+    private var order: [String] = []
+    public let capacity: Int
+
+    public init(capacity: Int = 64) { self.capacity = max(1, capacity) }
+
+    public var count: Int { store.count }
+
+    public func get(_ text: String) -> Data? {
+        guard let d = store[text] else { return nil }
+        order.removeAll { $0 == text }
+        order.append(text)
+        return d
+    }
+
+    public func put(_ text: String, _ data: Data) {
+        if store[text] == nil, store.count >= capacity, let oldest = order.first {
+            order.removeFirst()
+            store[oldest] = nil
+        }
+        store[text] = data
+        order.removeAll { $0 == text }
+        order.append(text)
+    }
+}
+
+/// Which phrases may interrupt which. A hazard or wandering alert cuts off
+/// anything; a routine instruction never cuts off an alert still playing.
+public enum SpeechPolicy {
+    public static func isUrgent(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespaces)
+        return t.hasPrefix("Stop") || t.hasPrefix("Careful") || t.hasPrefix("You have left")
+    }
+}
+
+public enum SpeechSource: String, Sendable {
+    case onDevice
+    case kokoro
+}
+
+/// Minimal 16-bit mono WAV writer, for tests and for caching on-device audio.
+public enum WAVEncoder {
+    public static func pcm16Mono(_ samples: [Float], sampleRate: Int) -> Data {
+        var d = Data()
+        func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        let dataBytes = UInt32(samples.count * 2)
+        d.append(contentsOf: Array("RIFF".utf8)); u32(36 + dataBytes); d.append(contentsOf: Array("WAVE".utf8))
+        d.append(contentsOf: Array("fmt ".utf8)); u32(16); u16(1); u16(1)
+        u32(UInt32(sampleRate)); u32(UInt32(sampleRate * 2)); u16(2); u16(16)
+        d.append(contentsOf: Array("data".utf8)); u32(dataBytes)
+        for s in samples { u16(UInt16(bitPattern: Int16(max(-1, min(1, s)) * 32767))) }
+        return d
+    }
+}
+EOF_AVAE
+
+cat > 'EchoGuide/Core/Audio/VoiceGoalListener.swift' <<'EOF_AVAE'
+// Owner: Bryan. Hands-free goal entry for people who cannot see the goal
+// field: the user says "find the start button" and the engine narrows to
+// "start button". Recognition is on-device (Speech framework) so it works in
+// Airplane Mode; nothing leaves the phone.
+
+import Foundation
+
+/// Turns a transcript into the goal words CognitiveTaskIsolation matches on.
+public enum GoalPhraseParser {
+    static let filler: Set<String> = [
+        "find", "where", "is", "wheres", "where's", "show", "me", "press", "push", "touch", "tap", "hit",
+        "go", "to", "the", "a", "an", "my", "please", "can", "you", "i", "want", "need", "help", "with",
+        "hey", "echo", "guide", "echoguide", "on", "for", "look", "locate", "get", "um", "uh",
+    ]
+
+    /// nil when nothing is left after stripping filler ("um, please").
+    public static func goal(from transcript: String) -> String? {
+        let words = transcript.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted.subtracting(CharacterSet(charactersIn: "'")))
+            .map { $0.replacingOccurrences(of: "'", with: "") }
+            .filter { !$0.isEmpty && !filler.contains($0) }
+        guard !words.isEmpty else { return nil }
+        return words.joined(separator: " ")
+    }
+}
+
+#if canImport(Speech) && os(iOS)
+import Speech
+import AVFoundation
+
+/// One short listening window: tap the mic, say the goal, done.
+public final class VoiceGoalListener: @unchecked Sendable {
+    public enum ListenError: Error { case notAuthorized, unavailable }
+
+    private let recognizer: SFSpeechRecognizer?
+    private let audioEngine = AVAudioEngine()
+    /// Stop listening after this long even if the user is still talking.
+    public var window: TimeInterval = 5
+
+    public init(locale: Locale = .current) {
+        recognizer = SFSpeechRecognizer(locale: locale)
+    }
+
+    public static func requestAuthorization() async -> Bool {
+        await withCheckedContinuation { c in
+            SFSpeechRecognizer.requestAuthorization { c.resume(returning: $0 == .authorized) }
+        }
+    }
+
+    /// Returns the parsed goal, or nil when nothing usable was said.
+    public func listen() async throws -> String? {
+        guard let recognizer, recognizer.isAvailable else { throw ListenError.unavailable }
+        guard SFSpeechRecognizer.authorizationStatus() == .authorized else { throw ListenError.notAuthorized }
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        if recognizer.supportsOnDeviceRecognition { request.requiresOnDeviceRecognition = true }
+
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playAndRecord, mode: .measurement, options: [.duckOthers, .defaultToSpeaker, .allowBluetooth])
+        try session.setActive(true)
+        defer {
+            audioEngine.stop()
+            audioEngine.inputNode.removeTap(onBus: 0)
+            // Give the speaker back to the guidance voice.
+            try? session.setCategory(.playback, mode: .spokenAudio, options: [.mixWithOthers, .duckOthers])
+        }
+
+        let input = audioEngine.inputNode
+        input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) { buffer, _ in
+            request.append(buffer)
+        }
+        audioEngine.prepare()
+        try audioEngine.start()
+
+        let transcript: String = await withCheckedContinuation { c in
+            var done = false
+            var best = ""
+            var task: SFSpeechRecognitionTask?
+            let finish = {
+                guard !done else { return }
+                done = true
+                task?.cancel()
+                c.resume(returning: best)
+            }
+            task = recognizer.recognitionTask(with: request) { result, error in
+                if let result { best = result.bestTranscription.formattedString }
+                if result?.isFinal == true || error != nil { finish() }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + window) {
+                request.endAudio()
+                finish()
+            }
+        }
+        return GoalPhraseParser.goal(from: transcript)
     }
 }
 #endif
@@ -458,6 +1443,10 @@ public actor AutomationEngine {
     private var lastFenceWarning: [String: TimeInterval] = [:]
     private var routedLabels: Set<String> = []
     private var continuations: [UUID: AsyncStream<AutomationState>.Continuation] = [:]
+    private var cautionContinuations: [UUID: AsyncStream<String?>.Continuation] = [:]
+    /// Hazard zone the hand is approaching right now, nil when clear. Spoken
+    /// as "Careful", shown on screen as a banner; it never changes `state`.
+    public private(set) var caution: String?
 
     public init(
         haptics: HapticCueing,
@@ -489,11 +1478,30 @@ public actor AutomationEngine {
 
     private func removeContinuation(_ id: UUID) { continuations[id] = nil }
 
+    /// For the UI: the zone being approached, nil when the hand is clear.
+    public func cautions() -> AsyncStream<String?> {
+        AsyncStream { c in
+            let id = UUID()
+            c.yield(caution)
+            cautionContinuations[id] = c
+            c.onTermination = { [weak self] _ in Task { await self?.removeCautionContinuation(id) } }
+        }
+    }
+
+    private func removeCautionContinuation(_ id: UUID) { cautionContinuations[id] = nil }
+
+    private func setCaution(_ zone: String?) {
+        guard zone != caution else { return }
+        caution = zone
+        for c in cautionContinuations.values { c.yield(zone) }
+    }
+
     /// Narrow the engine to one task ("start", "microwave"); nil for open scanning.
     public func setGoal(_ goal: String?) {
         isolation.goal = goal
         isolation.reset()
         completedUntil = [:]
+        routedLabels = []
         lastSpokenLabel = nil
         onTargetSince = nil
     }
@@ -507,6 +1515,7 @@ public actor AutomationEngine {
 
     public func stop() async {
         forgetTarget()
+        setCaution(nil)
         transition(.idle)
         await haptics.stop()
     }
@@ -524,6 +1533,7 @@ public actor AutomationEngine {
         guard state != .idle else { return }
         let now = frame.timestamp
 
+        if case .approaching(let zone, _)? = fence { setCaution(zone) } else { setCaution(nil) }
         if let fence, await handle(fence, at: now) { return }
 
         // Recently finished targets are off the menu; prune expired ones.
@@ -628,6 +1638,8 @@ public actor AutomationEngine {
             await audio.speak(said, azimuth: 0)
             transition(.completed(said))
         } catch {
+            // Not excluded: the user should be able to settle on it and try again.
+            completedUntil[step.targetLabel] = nil
             await audio.speak("That did not work.", azimuth: 0)
             transition(.completed(step.targetLabel))
         }
@@ -1136,9 +2148,14 @@ public struct CognitiveTaskIsolation: Sendable {
         return true
     }
 
+    /// A goal can be several words ("start microwave", from the voice
+    /// listener): any word of it on the label or the recognised text matches,
+    /// so "start" on a button and "microwave" on the appliance both count.
     private func matches(_ d: Detection, _ goal: String) -> Bool {
-        let g = goal.lowercased()
-        return d.label.lowercased().contains(g) || (d.text?.lowercased().contains(g) ?? false)
+        let label = d.label.lowercased(), text = d.text?.lowercased() ?? ""
+        let words = goal.lowercased().split(separator: " ").filter { $0.count >= 2 }
+        guard !words.isEmpty else { return false }
+        return words.contains { label.contains($0) || text.contains($0) }
     }
 
     private func isSame(_ a: Detection, _ b: Detection) -> Bool {
@@ -1366,12 +2383,19 @@ public struct ReasoningQuery: Sendable {
     public var localConfidence: Float
     /// JPEG of the triggering frame. Only sent to the cloud with consent.
     public var jpeg: Data?
+    /// Answer length: 8 for a spoken step, ~35 for a scene description.
+    public var maxWords: Int
+    /// Overrides the router's default deadline (an image description needs longer).
+    public var timeout: TimeInterval?
 
-    public init(question: String, detections: [Detection], localConfidence: Float, jpeg: Data? = nil) {
+    public init(question: String, detections: [Detection], localConfidence: Float, jpeg: Data? = nil,
+                maxWords: Int = 8, timeout: TimeInterval? = nil) {
         self.question = question
         self.detections = detections
         self.localConfidence = localConfidence
         self.jpeg = jpeg
+        self.maxWords = maxWords
+        self.timeout = timeout
     }
 }
 
@@ -1628,12 +2652,31 @@ import EchoGuideContracts
 
 // MARK: - Spatial fence
 
-public struct SpatialFenceZone: Sendable, Equatable {
-    public enum Anchor: Sendable, Equatable {
+public struct SpatialFenceZone: Sendable, Equatable, Codable {
+    public enum Anchor: Sendable, Equatable, Codable {
         /// Follows any detection with this label, e.g. "oven".
         case label(String)
         /// Fixed region of the frame, for a fixed camera mount.
         case region(ImageRect)
+
+        // JSON a carer can write by hand: {"label": "oven"} or
+        // {"region": {"x": 0, "y": 0.8, "width": 1, "height": 0.2}}.
+        private enum CodingKeys: String, CodingKey { case label, region }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            if let l = try c.decodeIfPresent(String.self, forKey: .label) { self = .label(l); return }
+            if let r = try c.decodeIfPresent(ImageRect.self, forKey: .region) { self = .region(r); return }
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "anchor needs \"label\" or \"region\""))
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            switch self {
+            case .label(let l): try c.encode(l, forKey: .label)
+            case .region(let r): try c.encode(r, forKey: .region)
+            }
+        }
     }
 
     public var name: String
@@ -1649,9 +2692,19 @@ public struct SpatialFenceZone: Sendable, Equatable {
         self.warningMargin = warningMargin
         self.warningDepthMetres = warningDepthMetres
     }
+
+    private enum CodingKeys: String, CodingKey { case name, anchor, warningMargin, warningDepthMetres }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        anchor = try c.decode(Anchor.self, forKey: .anchor)
+        warningMargin = try c.decodeIfPresent(Float.self, forKey: .warningMargin) ?? 0.08
+        warningDepthMetres = try c.decodeIfPresent(Float.self, forKey: .warningDepthMetres) ?? 0.35
+    }
 }
 
-public struct SpatialFence: Sendable {
+public struct SpatialFence: Sendable, Equatable, Codable {
     public var zones: [SpatialFenceZone]
 
     public init(zones: [SpatialFenceZone]) { self.zones = zones }
@@ -1730,6 +2783,38 @@ public struct SpatialFence: Sendable {
             return frame.targets.filter { $0.label == label }.map(\.box)
         }
     }
+}
+
+// MARK: - Per-home configuration
+
+/// Hazard zones for one home, loaded from JSON next to the plugin manifest,
+/// so a helper can add "the hob is the thing labelled oven" with no code change:
+///
+///     { "zones": [ { "name": "hob", "anchor": { "label": "oven" }, "warningMargin": 0.08 },
+///                  { "name": "stairs", "anchor": { "region": { "x": 0, "y": 0.8, "width": 1, "height": 0.2 } } } ] }
+///
+/// A missing or empty file falls back to `SpatialFence.kitchenDefaults`.
+public struct FenceConfig: Sendable, Equatable, Codable {
+    public var zones: [SpatialFenceZone]
+
+    public init(zones: [SpatialFenceZone] = SpatialFence.kitchenDefaults.zones) {
+        self.zones = zones
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        zones = try c.decodeIfPresent([SpatialFenceZone].self, forKey: .zones) ?? SpatialFence.kitchenDefaults.zones
+    }
+
+    public static func load(from data: Data) throws -> FenceConfig {
+        try JSONDecoder().decode(FenceConfig.self, from: data)
+    }
+
+    public static func load(from url: URL) throws -> FenceConfig {
+        try load(from: Data(contentsOf: url))
+    }
+
+    public var spatialFence: SpatialFence { SpatialFence(zones: zones) }
 }
 EOF_AVAE
 
@@ -2542,7 +3627,7 @@ public actor CloudReasoningRouter: ReasoningRouting {
 
         calls += 1
         let includeImage = config.imageConsent && query.jpeg != nil
-        let timeout = config.timeout
+        let timeout = query.timeout ?? config.timeout
         do {
             let text = try await withThrowingTaskGroup(of: String.self) { group in
                 group.addTask { try await provider.answer(query, includeImage: includeImage) }
@@ -2611,7 +3696,7 @@ public struct GeminiProvider: ReasoningProvider {
         }
         let body: [String: Any] = [
             "contents": [["role": "user", "parts": parts]],
-            "generationConfig": ["maxOutputTokens": 40, "temperature": 0.2],
+            "generationConfig": ["maxOutputTokens": max(40, q.maxWords * 3), "temperature": 0.2],
         ]
         let url = proxyBase.appendingPathComponent("v1beta/models/\(model):generateContent")
         let json = try await transport.postJSON(url, body: body, bearer: await deviceToken())
@@ -2643,7 +3728,7 @@ public struct OpenAIProvider: ReasoningProvider {
         if includeImage, let jpeg = q.jpeg {
             content.append(["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(jpeg.base64EncodedString())", "detail": "low"]])
         }
-        let body: [String: Any] = ["model": model, "max_tokens": 40, "temperature": 0.2, "messages": [["role": "user", "content": content]]]
+        let body: [String: Any] = ["model": model, "max_tokens": max(40, q.maxWords * 3), "temperature": 0.2, "messages": [["role": "user", "content": content]]]
         let json = try await transport.postJSON(proxyBase.appendingPathComponent("v1/chat/completions"), body: body, bearer: await deviceToken())
         let choices = json["choices"] as? [[String: Any]]
         let message = choices?.first?["message"] as? [String: Any]
@@ -2656,10 +3741,13 @@ enum Prompt {
         let seen = q.detections.map { d in
             "\(d.kind == .text ? "text \"\(d.text ?? "")\"" : d.label) (\(Int(d.confidence * 100))%)"
         }.joined(separator: ", ")
+        let length = q.maxWords <= 12
+            ? "Answer in one short plain sentence, no lists, under \(q.maxWords) words."
+            : "Answer in at most three short plain sentences, under \(q.maxWords) words, most important first. Say where things are (left, ahead, right) and mention anything hazardous."
         return """
-        You guide a blind or cognitively impaired person, one step at a time. \
-        On-device vision saw: \(seen). \(q.question) \
-        Answer in one short plain sentence, no lists, under eight words.
+        You are the eyes of a blind or low-vision person holding a phone camera. \
+        On-device vision saw: \(seen.isEmpty ? "nothing it recognises" : seen). \(q.question) \
+        \(length) Never guess at text you cannot read.
         """
     }
 }
@@ -3104,15 +4192,37 @@ import SwiftUI
 import Observation
 import EchoGuideContracts
 
+/// Anything that can listen for a spoken goal and return the goal words.
+/// `VoiceGoalListener` (Audio) satisfies this with a one-line extension in
+/// the app target: `extension VoiceGoalListener: GoalListening {}`.
+public protocol GoalListening: Sendable {
+    func listen() async throws -> String?
+}
+
 @MainActor
 @Observable
 public final class GuidanceModel {
     public private(set) var state: AutomationState = .idle
     public private(set) var goal: String?
+    /// Hazard zone the hand is approaching, for the amber banner.
+    public private(set) var caution: String?
+    public private(set) var isListening = false
+    /// Short feedback after a listening attempt ("Heard: start", "Did not catch that").
+    public private(set) var listenResult: String?
     private var engine: AutomationEngine?
+    private var listener: GoalListening?
     private var task: Task<Void, Never>?
+    private var cautionTask: Task<Void, Never>?
 
-    public init() {}
+    public init(listener: GoalListening? = nil) {
+        self.listener = listener
+    }
+
+    /// A model pinned to one state, for SwiftUI previews and tests.
+    public init(previewState: AutomationState, goal: String? = nil) {
+        state = previewState
+        self.goal = goal
+    }
 
     public func bind(to engine: AutomationEngine) {
         self.engine = engine
@@ -3120,6 +4230,12 @@ public final class GuidanceModel {
         task = Task { [weak self] in
             for await s in await engine.states() {
                 self?.state = s
+            }
+        }
+        cautionTask?.cancel()
+        cautionTask = Task { [weak self] in
+            for await c in await engine.cautions() {
+                self?.caution = c
             }
         }
         Task { [weak self] in
@@ -3145,6 +4261,32 @@ public final class GuidanceModel {
         self.goal = value
         guard let engine else { return }
         Task { await engine.setGoal(value) }
+    }
+
+    public var canListen: Bool { listener != nil }
+
+    /// Mic button: one short listening window, then the goal is set from what
+    /// was said. Pauses nothing; guidance carries on underneath.
+    public func listenForGoal() {
+        guard let listener, !isListening else { return }
+        isListening = true
+        listenResult = nil
+        Task { [weak self] in
+            let heard = try? await listener.listen()
+            guard let self else { return }
+            self.isListening = false
+            if let heard, !heard.isEmpty {
+                self.setGoal(heard)
+                self.listenResult = "Heard: \(heard)"
+            } else {
+                self.listenResult = "Did not catch that"
+            }
+        }
+    }
+
+    /// Banner text for an approaching hazard, in the words the audio speaks.
+    var cautionLine: String? {
+        caution.map { "Careful. \($0.capitalizedFirst) is close." }
     }
 
     /// The one line that matters, in the words the audio speaks.
@@ -3179,6 +4321,20 @@ public final class GuidanceModel {
         if case .onTarget = state { return true }
         return false
     }
+
+    /// SF Symbol for the one direction the audio speaks, or nil when there is
+    /// nothing to point at. Mirrors `CognitiveTaskIsolation.direction`: the
+    /// larger axis wins, so the arrow and the words never disagree.
+    var arrowSymbol: String? {
+        guard case .guiding(let step) = state, case .align(let dx, let dy) = step.guidance else { return nil }
+        return Self.arrowSymbol(dx: dx, dy: dy)
+    }
+
+    static func arrowSymbol(dx: Float, dy: Float) -> String? {
+        guard (dx * dx + dy * dy).squareRoot() > Alignment.tolerance else { return nil }
+        if abs(dx) >= abs(dy) { return dx > 0 ? "arrow.right" : "arrow.left" }
+        return dy > 0 ? "arrow.down" : "arrow.up"
+    }
 }
 
 public struct GuidanceView: View {
@@ -3208,6 +4364,13 @@ public struct GuidanceView: View {
             VStack(spacing: 16) {
                 Spacer(minLength: 0)
 
+                if let arrow = model.arrowSymbol {
+                    Image(systemName: arrow)
+                        .font(.system(size: 96, weight: .black))
+                        .foregroundStyle(foreground)
+                        .accessibilityHidden(true) // the headline already says the direction
+                }
+
                 Text(model.headline)
                     .font(.system(.largeTitle, design: .rounded, weight: .heavy))
                     .foregroundStyle(foreground)
@@ -3222,6 +4385,17 @@ public struct GuidanceView: View {
                         .foregroundStyle(foreground.opacity(0.8))
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 24)
+                }
+
+                if let caution = model.cautionLine, !model.isWarning {
+                    Label(caution, systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(.title2, design: .rounded, weight: .bold))
+                        .foregroundStyle(.black)
+                        .padding(.vertical, 12)
+                        .padding(.horizontal, 20)
+                        .background(Color.orange, in: RoundedRectangle(cornerRadius: 16))
+                        .padding(.horizontal, 24)
+                        .accessibilityAddTraits(.updatesFrequently)
                 }
 
                 Spacer(minLength: 0)
@@ -3250,7 +4424,19 @@ public struct GuidanceView: View {
 
     private var goalField: some View {
         HStack(spacing: 12) {
-            TextField("Goal, e.g. start", text: $goalDraft)
+            if model.canListen {
+                Button(action: model.listenForGoal) {
+                    Image(systemName: model.isListening ? "waveform" : "mic.fill")
+                        .font(.system(.title, weight: .bold))
+                        .frame(width: 60, height: 60)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(model.isListening ? .red : .blue)
+                .disabled(model.isListening)
+                .accessibilityLabel(model.isListening ? "Listening" : "Say the goal")
+                .accessibilityHint("Say what to find, for example start button")
+            }
+            TextField(model.listenResult ?? "Goal, e.g. start", text: $goalDraft)
                 .font(.system(.title3, design: .rounded))
                 .textFieldStyle(.roundedBorder)
                 .submitLabel(.done)
@@ -3298,10 +4484,14 @@ cat > 'EchoGuideApp/EchoGuideApp.xcodeproj/project.pbxproj' <<'EOF_AVAE'
 	objects = {
 
 /* Begin PBXBuildFile section */
-		0459EACAAA5564535521EB1A /* EchoGuideApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47616655E11BEC9506AFC0AF /* EchoGuideApp.swift */; };
-		353C0228E90A352BE56AD794 /* AppRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF490F8AE51962283E50B561 /* AppRuntime.swift */; };
 		3583E46383EC623FB6C309F3 /* AppConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = E7317046C94C5A60F7F5DD7D /* AppConfig.swift */; };
+		353C0228E90A352BE56AD794 /* AppRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF490F8AE51962283E50B561 /* AppRuntime.swift */; };
 		919657EDF72BAF9CFFFCE51A /* BenchmarkReport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31876A8878587ADCBBF59F43 /* BenchmarkReport.swift */; };
+		CC09AA3C10C407305E64D271 /* CameraPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 87CD410DC9D1DAF6EDCED907 /* CameraPreview.swift */; };
+		0459EACAAA5564535521EB1A /* EchoGuideApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47616655E11BEC9506AFC0AF /* EchoGuideApp.swift */; };
+		E5CE96FC9D16D36A99088B5A /* MainView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D14A3E69BEB6CABD230E139F /* MainView.swift */; };
+		7CF4D7277DFBDA985417C955 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 160F2521AC368CCA20755FCE /* OnboardingView.swift */; };
+		54EBA6E841AFBE105A38D4BE /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 837087366C43569ADAE25B54 /* SettingsView.swift */; };
 		262673F27DBD85E2AEF9A09A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = BBE03F3784F40D95E23D8465 /* Assets.xcassets */; };
 		0EB3440FE35D7D55FB80BBA6 /* echoguide.sample.json in Resources */ = {isa = PBXBuildFile; fileRef = 51C0FCA7140C933DC84EB2E5 /* echoguide.sample.json */; };
 		64329A7C11B75311EA1E5D86 /* Models in Resources */ = {isa = PBXBuildFile; fileRef = 4BBB164D9E56DFB73145D0D2 /* Models */; };
@@ -3310,10 +4500,14 @@ cat > 'EchoGuideApp/EchoGuideApp.xcodeproj/project.pbxproj' <<'EOF_AVAE'
 
 /* Begin PBXFileReference section */
 		7F6D01D6546BCD07518D8398 /* EchoGuideApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = EchoGuideApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		47616655E11BEC9506AFC0AF /* EchoGuideApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EchoGuideApp.swift; sourceTree = "<group>"; };
-		EF490F8AE51962283E50B561 /* AppRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRuntime.swift; sourceTree = "<group>"; };
 		E7317046C94C5A60F7F5DD7D /* AppConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfig.swift; sourceTree = "<group>"; };
+		EF490F8AE51962283E50B561 /* AppRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRuntime.swift; sourceTree = "<group>"; };
 		31876A8878587ADCBBF59F43 /* BenchmarkReport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchmarkReport.swift; sourceTree = "<group>"; };
+		87CD410DC9D1DAF6EDCED907 /* CameraPreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraPreview.swift; sourceTree = "<group>"; };
+		47616655E11BEC9506AFC0AF /* EchoGuideApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EchoGuideApp.swift; sourceTree = "<group>"; };
+		D14A3E69BEB6CABD230E139F /* MainView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainView.swift; sourceTree = "<group>"; };
+		160F2521AC368CCA20755FCE /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
+		837087366C43569ADAE25B54 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		BBE03F3784F40D95E23D8465 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Assets.xcassets; path = Assets.xcassets; sourceTree = "<group>"; };
 		51C0FCA7140C933DC84EB2E5 /* echoguide.sample.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; name = echoguide.sample.json; path = Resources/echoguide.sample.json; sourceTree = "<group>"; };
 		4BBB164D9E56DFB73145D0D2 /* Models */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Models; path = Resources/Models; sourceTree = "<group>"; };
@@ -3345,10 +4539,14 @@ cat > 'EchoGuideApp/EchoGuideApp.xcodeproj/project.pbxproj' <<'EOF_AVAE'
 		D8DBA3F9900DD17689CA0C4D /* Sources */ = {
 			isa = PBXGroup;
 			children = (
-				47616655E11BEC9506AFC0AF /* EchoGuideApp.swift */,
-				EF490F8AE51962283E50B561 /* AppRuntime.swift */,
 				E7317046C94C5A60F7F5DD7D /* AppConfig.swift */,
+				EF490F8AE51962283E50B561 /* AppRuntime.swift */,
 				31876A8878587ADCBBF59F43 /* BenchmarkReport.swift */,
+				87CD410DC9D1DAF6EDCED907 /* CameraPreview.swift */,
+				47616655E11BEC9506AFC0AF /* EchoGuideApp.swift */,
+				D14A3E69BEB6CABD230E139F /* MainView.swift */,
+				160F2521AC368CCA20755FCE /* OnboardingView.swift */,
+				837087366C43569ADAE25B54 /* SettingsView.swift */,
 			);
 			path = Sources;
 			sourceTree = "<group>";
@@ -3443,10 +4641,14 @@ cat > 'EchoGuideApp/EchoGuideApp.xcodeproj/project.pbxproj' <<'EOF_AVAE'
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				0459EACAAA5564535521EB1A /* EchoGuideApp.swift in Sources */,
-				353C0228E90A352BE56AD794 /* AppRuntime.swift in Sources */,
 				3583E46383EC623FB6C309F3 /* AppConfig.swift in Sources */,
+				353C0228E90A352BE56AD794 /* AppRuntime.swift in Sources */,
 				919657EDF72BAF9CFFFCE51A /* BenchmarkReport.swift in Sources */,
+				CC09AA3C10C407305E64D271 /* CameraPreview.swift in Sources */,
+				0459EACAAA5564535521EB1A /* EchoGuideApp.swift in Sources */,
+				E5CE96FC9D16D36A99088B5A /* MainView.swift in Sources */,
+				7CF4D7277DFBDA985417C955 /* OnboardingView.swift in Sources */,
+				54EBA6E841AFBE105A38D4BE /* SettingsView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -3610,6 +4812,8 @@ cat > 'EchoGuideApp/Info.plist' <<'EOF_AVAE'
 	<string>EchoGuide watches through the camera to find the one thing you need and guide your hand to it.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>If you turn on voice, EchoGuide listens for requests like "find the start button".</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>EchoGuide turns what you say, like "find the start button", into what to look for. Speech is understood on your phone.</string>
 	<key>UIRequiredDeviceCapabilities</key>
 	<array>
 		<string>arm64</string>
@@ -3657,11 +4861,16 @@ import Foundation
 import Security
 import EchoGuideInfra
 import EchoGuideVision
+import EchoGuideSpatial
 
 /// Per-home setup. Lives at Application Support/echoguide.json (written by the
 /// care provider's setup flow); the bundled sample is the fallback.
 struct AppConfig: Decodable {
     var plugins: PluginManifest?
+    /// Hazard zones for this home (hob, stairs); kitchen defaults when absent.
+    var fence: FenceConfig?
+    /// Optional better voice: an OpenAI-compatible Kokoro server.
+    var kokoroURL: URL?
     /// Start narrowed to one task ("start"), nil for open scanning.
     var goal: String?
 
@@ -3686,9 +4895,14 @@ enum AppSettings {
         return URL(string: s)
     }
 
-    static var imageConsent: Bool { UserDefaults.standard.bool(forKey: "cloudImageConsent") }
-    static var voiceEnabled: Bool { UserDefaults.standard.bool(forKey: "voiceEnabled") }
-    static var elevenLabsVoiceID: String? { UserDefaults.standard.string(forKey: "elevenLabsVoiceID") }
+    static var imageConsent: Bool {
+        get { UserDefaults.standard.bool(forKey: "cloudImageConsent") }
+        set { UserDefaults.standard.set(newValue, forKey: "cloudImageConsent") }
+    }
+    static var onboarded: Bool {
+        get { UserDefaults.standard.bool(forKey: "onboarded") }
+        set { UserDefaults.standard.set(newValue, forKey: "onboarded") }
+    }
     static var isBenchmark: Bool { ProcessInfo.processInfo.arguments.contains("-benchmark") }
 }
 
@@ -3755,12 +4969,16 @@ cat > 'EchoGuideApp/Sources/AppRuntime.swift' <<'EOF_AVAE'
 // wired together. Engines never see each other; they meet here through the
 // protocols in EchoGuideContracts.
 //
-//   LiDAR (ARKit) or CameraFeed -> PerceptionPipeline -> SpatialFence -> AutomationEngine
-//                                                                          |-> haptics, audio
-//                                                                          |-> plugins, router
-//   VoiceLoop (optional) -> goal / question
+//   LiDAR (ARKit) or CameraFeed -> PerceptionPipeline -> SpatialFence
+//        -> AgentCore (Explore / Read / Describe)
+//        -> AutomationEngine (Find: finger guidance, tool press)
+//   Speech, haptics and cloud calls pass through observers that drive the
+//   on-screen captions and the benchmark recorder.
 
+import AVFoundation
+import CoreImage
 import Foundation
+import ImageIO
 import Observation
 import os
 import EchoGuideAutomation
@@ -3771,44 +4989,77 @@ import EchoGuideVision
 
 private let log = Logger(subsystem: "app.echoguide", category: "runtime")
 
+extension VoiceGoalListener: GoalListening {}
+
 @MainActor
 @Observable
 final class AppRuntime {
-    let guidance = GuidanceModel()
-    private(set) var status = "Starting"
-    private(set) var benchmarkSummary: String?
+    let guidance = GuidanceModel(listener: VoiceGoalListener())
+    let trials = TrialRecorder(storeURL: FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+        .appendingPathComponent("trials.json"))
 
+    private(set) var mode: AgentMode = .explore
+    private(set) var caption = ""
+    private(set) var started = false
+    private(set) var hasLiDAR = false
+    private(set) var hasModel = false
+    let cloudConfigured = AppSettings.proxyBase != nil
+    private(set) var online = false
+    private(set) var cameraError: String?
+    private(set) var benchmarkSummary: String?
+    private(set) var describing = false
+
+    private(set) var lidar: LiDARDepthEngine?
+    private(set) var camera: CameraFeed?
+    private var agent: AgentCore?
     private var automation: AutomationEngine?
     private var pipeline: PerceptionPipeline?
     private var vision: LocalVisionEngine?
-    private var lidar: LiDARDepthEngine?
-    private var camera: CameraFeed?
-    private var voiceIO: VoiceAudioIO?
-    private var stt: DeepgramSTTClient?
+    private let latest = LatestFrame()
     private var background: [Task<Void, Never>] = []
-    private let lastDetections = DetectionBox()
+
+    var statusLine: String {
+        var parts: [String] = []
+        parts.append(hasLiDAR ? "LiDAR" : "Camera")
+        parts.append(hasModel ? "objects on" : "no object model")
+        if cloudConfigured && online {
+            parts.append(AppSettings.imageConsent ? "cloud photos on" : "cloud text only")
+        } else {
+            parts.append("on-device only")
+        }
+        return parts.joined(separator: " · ")
+    }
 
     func start() async {
-        guard automation == nil else { return }
+        guard !started else { return }
+        started = true
         let config = AppConfig.load()
 
         // Perception (local, always).
         let modelURL = ModelStore.locate()
+        hasModel = modelURL != nil
         if modelURL == nil { log.warning("No YOLO model bundled; running hands, text and barcodes only") }
         let vision: LocalVisionEngine
         do {
             vision = try LocalVisionEngine(modelURL: modelURL)
         } catch {
             log.error("Model failed to load: \(error.localizedDescription, privacy: .public)")
+            hasModel = false
             vision = try! LocalVisionEngine(modelURL: nil)
         }
         self.vision = vision
         let lidar = LiDARDepthEngine.isSupported ? LiDARDepthEngine() : nil
         self.lidar = lidar
+        hasLiDAR = lidar != nil
 
-        // Output.
-        let haptics = SpatialHapticEngine()
-        let audio = SpatialAudioEngine()
+        // Output, observed for captions and benchmarks.
+        let speech: SpeechSynthesizing? = config.kokoroURL.map { KokoroSpeechProvider(baseURL: $0) }
+        let trials = self.trials
+        let audio = ObservedAudio(SpatialAudioEngine(speech: speech)) { [weak self] text in
+            Task { @MainActor in self?.caption = text }
+            Task { await trials.noteSpoken() }
+        }
+        let haptics = ObservedHaptics(SpatialHapticEngine()) { Task { await trials.noteHaptic() } }
 
         // Cloud (optional) and tools.
         let connectivity = PathConnectivity()
@@ -3816,112 +5067,109 @@ final class AppRuntime {
         var routerConfig = CloudRouterConfig()
         routerConfig.imageConsent = AppSettings.imageConsent
         let provider: ReasoningProvider? = AppSettings.proxyBase.map { GeminiProvider(proxyBase: $0, deviceToken: deviceToken) }
-        let router = CloudReasoningRouter(config: routerConfig, provider: provider, connectivity: connectivity)
+        let router = ObservedRouter(CloudReasoningRouter(config: routerConfig, provider: provider, connectivity: connectivity)) {
+            Task { await trials.noteCloudCall() }
+        }
 
         let registry = PluginRegistry()
-        if let manifest = config.plugins {
-            let installed = await registry.install(manifest, secrets: { Keychain.read($0) })
-            for url in installed.failedRemotes { log.warning("Plugin server unreachable: \(url.absoluteString, privacy: .public)") }
-        }
+        let manifest = config.plugins ?? (try? PluginManifest.load(Data(#"{"productLookup":true}"#.utf8)))
+        if let manifest { await registry.install(manifest, secrets: { Keychain.read($0) }) }
 
         // Decisions.
         let automation = AutomationEngine(haptics: haptics, audio: audio, depth: lidar, router: router, tools: registry)
         self.automation = automation
         guidance.bind(to: automation)
         await automation.setGoal(config.goal)
-        await automation.start()
+        let agent = AgentCore(audio: audio, haptics: haptics, depth: lidar, router: router)
+        self.agent = agent
 
-        // Pipeline: frame -> detections -> fence -> automation.
-        let fence = SpatialFence.kitchenDefaults
-        let detections = lastDetections
+        // Pipeline: frame -> detections -> fence -> agent (and automation in Find).
+        let fence = (config.fence ?? FenceConfig()).spatialFence
         let pipeline = PerceptionPipeline(vision: vision) { result, _ in
-            await detections.set(result.targets)
             // Depth is sampled per zone, so two hazards at different distances are judged separately.
             let event = await fence.evaluate(result, depth: lidar)
-            await automation.ingest(result, fence: event)
+            if await agent.ingest(result, fence: event) {
+                await automation.ingest(result, fence: event)
+            }
         }
         self.pipeline = pipeline
 
         // Camera: ARKit owns it when LiDAR is present, otherwise AVCapture.
+        let latest = self.latest
         if let lidar {
-            lidar.onFrame = { pipeline.submit($0) }
+            lidar.onFrame = { frame in
+                latest.set(frame)
+                pipeline.submit(frame)
+            }
             lidar.start()
-            status = "Running with LiDAR"
         } else {
             let camera = CameraFeed()
             do {
-                try camera.start { pipeline.submit($0) }
+                try camera.start { frame in
+                    latest.set(frame)
+                    pipeline.submit(frame)
+                }
                 self.camera = camera
-                status = "Running"
             } catch {
-                status = "Camera unavailable"
+                cameraError = "The camera is not available."
             }
         }
 
-        if AppSettings.voiceEnabled, let proxy = AppSettings.proxyBase {
-            await startVoice(proxy: proxy, audio: audio, automation: automation, router: router, deviceToken: deviceToken)
-        }
+        background.append(Task { [weak self] in
+            while !Task.isCancelled {
+                let isOnline = await connectivity.isOnline()
+                self?.online = isOnline
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+            }
+        })
 
-        if AppSettings.isBenchmark { runBenchmark() }
+        await setMode(.explore, countsAsPrompt: false)
+        if AppSettings.isBenchmark { runLatencyBenchmark() }
     }
 
     func stop() async {
         background.forEach { $0.cancel() }
         lidar?.stop()
         camera?.stop()
-        voiceIO?.stopCapture()
-        await stt?.stop()
         await automation?.stop()
     }
 
-    // MARK: - Voice
+    // MARK: - User actions
 
-    private func startVoice(proxy: URL, audio: SpatialAudioEngine, automation: AutomationEngine,
-                            router: CloudReasoningRouter, deviceToken: @escaping @Sendable () async -> String?) async {
-        // SpatialAudioEngine sets a playback-only session on its first sound;
-        // make it do that now, then widen the session so the microphone can record.
-        await audio.ping(azimuth: 0, elevation: 0)
-        do {
-            try AudioSessionSetup.enableRecording()
-            let stt = DeepgramSTTClient(proxyBase: proxy, deviceToken: deviceToken)
-            let transcripts = try await stt.start()
-            let io = VoiceAudioIO()
-            try io.startCapture { pcm in Task { try? await stt.send(pcm) } }
-            self.stt = stt
-            voiceIO = io
-            let detections = lastDetections
-            background.append(Task {
-                do {
-                    for try await t in transcripts where t.endOfUtterance {
-                        switch VoiceIntent.parse(t.text) {
-                        case .find(let target):
-                            await automation.setGoal(target)
-                            await audio.speak("Looking for \(target).", azimuth: 0)
-                        case .stop:
-                            await automation.setGoal(nil)
-                            await audio.speak("Okay.", azimuth: 0)
-                        case .question(let q):
-                            let seen = await detections.value
-                            let answer = await router.resolve(ReasoningQuery(question: q, detections: seen, localConfidence: 0))
-                            await audio.speak(answer.answer, azimuth: 0)
-                        case nil:
-                            break
-                        }
-                    }
-                } catch {
-                    log.warning("Voice loop ended: \(error.localizedDescription, privacy: .public)")
-                }
-            })
-        } catch {
-            log.warning("Voice unavailable: \(error.localizedDescription, privacy: .public)")
-        }
+    func setMode(_ m: AgentMode, countsAsPrompt: Bool = true) async {
+        mode = m
+        if countsAsPrompt { await trials.notePrompt() }
+        if m == .find { await automation?.start() } else { await automation?.stop() }
+        await agent?.setMode(m)
+        pipeline?.forceNextFrame()
     }
 
-    // MARK: - Benchmark
+    func describe() async {
+        guard let agent, !describing else { return }
+        describing = true
+        defer { describing = false }
+        await trials.notePrompt()
+        let jpeg = AppSettings.imageConsent ? latest.jpeg() : nil
+        await agent.describe(jpeg: jpeg)
+    }
 
-    /// `-benchmark` launch argument: run for 20 s on the live camera, then
-    /// write the real on-device numbers to Documents/benchmark-<time>.json.
-    private func runBenchmark() {
+    func readNow() async {
+        await trials.notePrompt()
+        await agent?.readNow()
+    }
+
+    // MARK: - Benchmarks
+
+    func startTrial(task: String, mode taskMode: String) async {
+        let m: AgentMode = taskMode == "read" ? .read : taskMode == "find" ? .find : .explore
+        await trials.start(task: task, mode: taskMode, offline: !(cloudConfigured && online))
+        await setMode(m, countsAsPrompt: false)
+        if taskMode == "describe" { await describe() }
+    }
+
+    /// 20 s on the live camera; real on-device latency numbers.
+    func runLatencyBenchmark() {
+        benchmarkSummary = "Measuring for 20 seconds. Point the camera at a scene with some movement."
         background.append(Task { [weak self] in
             try? await Task.sleep(nanoseconds: 20_000_000_000)
             guard let self, let pipeline = self.pipeline, let vision = self.vision else { return }
@@ -3933,10 +5181,78 @@ final class AppRuntime {
     }
 }
 
-/// Last frame's detections, for spoken questions ("what is this?").
-actor DetectionBox {
-    private(set) var value: [Detection] = []
-    func set(_ d: [Detection]) { value = d }
+// MARK: - Observers
+
+/// Forwards speech and reports every sentence (captions, trial counts).
+struct ObservedAudio: SpatialAudioCueing {
+    let inner: SpatialAudioCueing
+    let onSpeak: @Sendable (String) -> Void
+    init(_ inner: SpatialAudioCueing, onSpeak: @escaping @Sendable (String) -> Void) {
+        self.inner = inner
+        self.onSpeak = onSpeak
+    }
+    func speak(_ text: String, azimuth: Float) async {
+        onSpeak(text)
+        await inner.speak(text, azimuth: azimuth)
+    }
+    func ping(azimuth: Float, elevation: Float) async { await inner.ping(azimuth: azimuth, elevation: elevation) }
+}
+
+struct ObservedHaptics: HapticCueing {
+    let inner: HapticCueing
+    let onCue: @Sendable () -> Void
+    init(_ inner: HapticCueing, onCue: @escaping @Sendable () -> Void) {
+        self.inner = inner
+        self.onCue = onCue
+    }
+    func guide(offset dx: Float, _ dy: Float, distanceMetres: Float?) async {
+        onCue()
+        await inner.guide(offset: dx, dy, distanceMetres: distanceMetres)
+    }
+    func confirm() async {
+        onCue()
+        await inner.confirm()
+    }
+    func warn() async {
+        onCue()
+        await inner.warn()
+    }
+    func stop() async { await inner.stop() }
+}
+
+struct ObservedRouter: ReasoningRouting {
+    let inner: ReasoningRouting
+    let onCloud: @Sendable () -> Void
+    init(_ inner: ReasoningRouting, onCloud: @escaping @Sendable () -> Void) {
+        self.inner = inner
+        self.onCloud = onCloud
+    }
+    func resolve(_ query: ReasoningQuery) async -> ReasoningOutcome {
+        let out = await inner.resolve(query)
+        if out.source == .cloud { onCloud() }
+        return out
+    }
+}
+
+/// The newest camera frame, for Describe's photo. One buffer is held at a
+/// time, so ARKit is never starved of frames.
+final class LatestFrame: @unchecked Sendable {
+    private let lock = NSLock()
+    private var frame: CameraFrame?
+    private static let context = CIContext()
+
+    func set(_ f: CameraFrame) { lock.withLock { frame = f } }
+
+    /// Upright, at most 768 px on the long side, ~60% quality: enough for a
+    /// multimodal model, small enough to send quickly.
+    func jpeg(maxSide: CGFloat = 768) -> Data? {
+        guard let pb = lock.withLock({ frame?.pixelBuffer }) else { return nil }
+        var image = CIImage(cvPixelBuffer: pb).oriented(.right)
+        let scale = maxSide / max(image.extent.width, image.extent.height)
+        if scale < 1 { image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale)) }
+        let quality = CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String)
+        return Self.context.jpegRepresentation(of: image, colorSpace: CGColorSpaceCreateDeviceRGB(), options: [quality: 0.6])
+    }
 }
 EOF_AVAE
 
@@ -4003,9 +5319,47 @@ struct BenchmarkReport: Codable {
 }
 EOF_AVAE
 
+cat > 'EchoGuideApp/Sources/CameraPreview.swift' <<'EOF_AVAE'
+// Owner: Maxwell. What the camera sees, for a sighted helper or a demo. The
+// user does not need it; everything it shows is also spoken.
+
+import ARKit
+import AVFoundation
+import SceneKit
+import SwiftUI
+
+struct CameraPreview: UIViewRepresentable {
+    let arSession: ARSession?
+    let captureSession: AVCaptureSession?
+
+    func makeUIView(context: Context) -> UIView {
+        if let arSession {
+            let view = ARSCNView(frame: .zero)
+            view.session = arSession
+            view.automaticallyUpdatesLighting = false
+            view.rendersCameraGrain = false
+            view.isAccessibilityElement = false
+            return view
+        }
+        let view = PreviewView()
+        view.previewLayer.session = captureSession
+        view.previewLayer.videoGravity = .resizeAspectFill
+        view.isAccessibilityElement = false
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {}
+
+    final class PreviewView: UIView {
+        override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
+        var previewLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
+    }
+}
+EOF_AVAE
+
 cat > 'EchoGuideApp/Sources/EchoGuideApp.swift' <<'EOF_AVAE'
-// Owner: Maxwell (app shell). The screen is Bryan's GuidanceView; this file
-// only starts the runtime and keeps the phone awake while guiding.
+// Owner: Maxwell (app shell). First launch shows onboarding; after that the
+// app opens straight into the live camera in Explore mode.
 
 import AVFoundation
 import SwiftUI
@@ -4015,23 +5369,24 @@ import EchoGuideAutomation
 @main
 struct EchoGuideApp: App {
     @State private var runtime = AppRuntime()
+    @State private var onboarded = AppSettings.onboarded
     @Environment(\.scenePhase) private var phase
 
     var body: some Scene {
         WindowGroup {
-            ZStack(alignment: .bottom) {
-                GuidanceView(model: runtime.guidance)
-                if let summary = runtime.benchmarkSummary {
-                    Text(summary)
-                        .font(.system(.footnote, design: .monospaced))
-                        .foregroundStyle(.white)
-                        .padding(12)
-                        .background(.black.opacity(0.8))
-                        .accessibilityLabel("Benchmark result. \(summary)")
+            Group {
+                if onboarded {
+                    MainView(runtime: runtime)
+                        .task { await runtime.start() }
+                } else {
+                    OnboardingView(cloudAvailable: runtime.cloudConfigured) {
+                        AppSettings.onboarded = true
+                        onboarded = true
+                    }
                 }
             }
+            .preferredColorScheme(.dark)
             .statusBarHidden()
-            .task { await runtime.start() }
         }
         .onChange(of: phase) { _, new in
             // Guidance needs the camera; never let the screen lock mid-task.
@@ -4039,15 +5394,794 @@ struct EchoGuideApp: App {
         }
     }
 }
+EOF_AVAE
 
-enum AudioSessionSetup {
-    /// Voice mode needs the mic. Keep mixing and ducking so a phone call or
-    /// music is never silenced, and route to the speaker, not the earpiece.
-    static func enableRecording() throws {
-        let s = AVAudioSession.sharedInstance()
-        try s.setCategory(.playAndRecord, mode: .voiceChat,
-                          options: [.defaultToSpeaker, .mixWithOthers, .duckOthers, .allowBluetoothA2DP])
-        try s.setActive(true)
+cat > 'EchoGuideApp/Sources/MainView.swift' <<'EOF_AVAE'
+// Owner: Maxwell. The live screen. Top: what the camera sees, with the last
+// spoken sentence in huge text. Bottom: the three modes and the one action
+// for the current mode. Find mode hands the screen to Bryan's GuidanceView.
+// Everything here is also spoken; the screen is for low vision and helpers.
+
+import SwiftUI
+import EchoGuideAutomation
+import EchoGuideInfra
+
+struct MainView: View {
+    @Bindable var runtime: AppRuntime
+    @State private var showSettings = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            if runtime.mode == .find {
+                GuidanceView(model: runtime.guidance)
+            } else {
+                live
+            }
+            controls
+        }
+        .background(Color.black.ignoresSafeArea())
+        .sheet(isPresented: $showSettings) { SettingsView(runtime: runtime) }
+        // VoiceOver's two-finger double tap: describe, from anywhere.
+        .accessibilityAction(.magicTap) { Task { await runtime.describe() } }
+    }
+
+    private var header: some View {
+        HStack {
+            Text(runtime.statusLine)
+                .font(.system(.footnote, design: .rounded, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.75))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+                .accessibilityLabel("Status: \(runtime.statusLine)")
+            Spacer()
+            Button { showSettings = true } label: {
+                Image(systemName: "gearshape.fill")
+                    .font(.title2)
+                    .foregroundStyle(.yellow)
+                    .frame(width: 48, height: 48)
+            }
+            .accessibilityLabel("Settings and benchmarks")
+        }
+        .padding(.horizontal, 16)
+    }
+
+    private var live: some View {
+        ZStack(alignment: .bottom) {
+            CameraPreview(arSession: runtime.lidar?.session, captureSession: runtime.camera?.session)
+                .overlay(Color.black.opacity(0.25))
+                .clipShape(RoundedRectangle(cornerRadius: 20))
+                .accessibilityHidden(true)
+
+            VStack(spacing: 8) {
+                if let error = runtime.cameraError {
+                    Text(error).font(.title2.bold()).foregroundStyle(.red)
+                }
+                Text(runtime.caption.isEmpty ? runtime.mode.spokenHelp : runtime.caption)
+                    .font(.system(.title, design: .rounded, weight: .heavy))
+                    .foregroundStyle(.yellow)
+                    .multilineTextAlignment(.center)
+                    .minimumScaleFactor(0.5)
+                    .padding(16)
+                    .frame(maxWidth: .infinity)
+                    .background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 16))
+                    .accessibilityLabel(runtime.caption.isEmpty ? runtime.mode.spokenHelp : runtime.caption)
+                    .accessibilityAddTraits(.updatesFrequently)
+                if let summary = runtime.benchmarkSummary {
+                    Text(summary)
+                        .font(.system(.footnote, design: .monospaced))
+                        .foregroundStyle(.white)
+                        .padding(8)
+                        .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 8))
+                }
+            }
+            .padding(12)
+        }
+        .padding(.horizontal, 12)
+    }
+
+    private var controls: some View {
+        VStack(spacing: 12) {
+            TrialBanner(runtime: runtime)
+
+            HStack(spacing: 10) {
+                ForEach(AgentMode.allCases, id: \.self) { m in
+                    Button { Task { await runtime.setMode(m) } } label: {
+                        VStack(spacing: 4) {
+                            Image(systemName: icon(m)).font(.title2)
+                            Text(m.title).font(.system(.headline, design: .rounded, weight: .bold))
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 72)
+                        .foregroundStyle(runtime.mode == m ? .black : .yellow)
+                        .background(runtime.mode == m ? Color.yellow : Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 16))
+                    }
+                    .accessibilityLabel(m.title)
+                    .accessibilityHint(m.spokenHelp)
+                    .accessibilityAddTraits(runtime.mode == m ? .isSelected : [])
+                }
+            }
+
+            if runtime.mode == .read {
+                BigButton("Read everything", hint: "Reads all the text the camera can see right now") { Task { await runtime.readNow() } }
+            } else if runtime.mode == .explore {
+                BigButton(runtime.describing ? "Looking…" : "Describe", hint: "Tells you everything in front of the camera") {
+                    Task { await runtime.describe() }
+                }
+                .disabled(runtime.describing)
+            }
+        }
+        .padding(16)
+    }
+
+    private func icon(_ m: AgentMode) -> String {
+        switch m {
+        case .explore: return "eye.fill"
+        case .find: return "hand.point.up.left.fill"
+        case .read: return "text.viewfinder"
+        }
+    }
+}
+
+/// Shown while a benchmark trial runs: the tester taps the outcome.
+struct TrialBanner: View {
+    let runtime: AppRuntime
+    @State private var task: String?
+    @State private var started = Date()
+
+    var body: some View {
+        Group {
+            if let task {
+                VStack(spacing: 8) {
+                    TimelineView(.periodic(from: started, by: 1)) { ctx in
+                        Text("Trial: \(task) · \(Int(ctx.date.timeIntervalSince(started))) s")
+                            .font(.system(.subheadline, design: .rounded, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .lineLimit(2)
+                    }
+                    HStack(spacing: 10) {
+                        BigButton("Success") { finish(true) }
+                        BigButton("Failed", filled: false) { finish(false) }
+                    }
+                }
+                .padding(12)
+                .background(Color.blue.opacity(0.35), in: RoundedRectangle(cornerRadius: 16))
+            }
+        }
+        .task {
+            while !Task.isCancelled {
+                let current = await runtime.trials.currentTask
+                if current != task {
+                    task = current
+                    started = Date()
+                }
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
+        }
+    }
+
+    private func finish(_ success: Bool) {
+        Task {
+            await runtime.trials.finish(success: success)
+            task = nil
+        }
+    }
+}
+EOF_AVAE
+
+cat > 'EchoGuideApp/Sources/OnboardingView.swift' <<'EOF_AVAE'
+// Owner: Maxwell. First-launch setup, built for someone who cannot see the
+// screen: every page speaks itself (unless VoiceOver is already reading),
+// every control is one large button, and nothing is required except the
+// camera. Six short steps, under two minutes.
+
+import AVFoundation
+import Speech
+import SwiftUI
+import EchoGuideSpatial
+
+struct OnboardingView: View {
+    let cloudAvailable: Bool
+    let onFinish: () -> Void
+
+    enum Step: Int, CaseIterable { case welcome, camera, modes, feel, voice, privacy, ready }
+
+    @State private var step: Step = .welcome
+    @State private var cameraStatus = AVCaptureDevice.authorizationStatus(for: .video)
+    @State private var voiceGranted = false
+    @State private var cloudPhotos = AppSettings.imageConsent
+    @State private var narrator = Narrator()
+    @State private var haptics = SpatialHapticEngine()
+    @State private var demoRunning = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ProgressView(value: Double(step.rawValue + 1), total: Double(Step.allCases.count))
+                .tint(.yellow)
+                .padding(.horizontal, 24)
+                .padding(.top, 16)
+                .accessibilityLabel("Step \(step.rawValue + 1) of \(Step.allCases.count)")
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    Text(title)
+                        .font(.system(.largeTitle, design: .rounded, weight: .heavy))
+                        .foregroundStyle(.yellow)
+                        .accessibilityAddTraits(.isHeader)
+                    Text(bodyText)
+                        .font(.system(.title2, design: .rounded))
+                        .foregroundStyle(.white)
+                        .fixedSize(horizontal: false, vertical: true)
+                    extra
+                }
+                .padding(24)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            VStack(spacing: 12) {
+                BigButton(primaryLabel, hint: primaryHint, filled: true) { Task { await primaryAction() } }
+                    .disabled(demoRunning)
+                if let secondary = secondaryLabel {
+                    BigButton(secondary, filled: false) { advance() }
+                }
+            }
+            .padding(24)
+        }
+        .background(Color.black.ignoresSafeArea())
+        .onAppear { narrator.say(spoken) }
+        .onChange(of: step) { _, _ in narrator.say(spoken) }
+    }
+
+    // MARK: - Copy
+
+    private var title: String {
+        switch step {
+        case .welcome: return "EchoGuide"
+        case .camera: return "Your camera"
+        case .modes: return "Three ways to use it"
+        case .feel: return "Feel the guidance"
+        case .voice: return "Your voice"
+        case .privacy: return "Richer descriptions"
+        case .ready: return "You're ready"
+        }
+    }
+
+    private var bodyText: String {
+        switch step {
+        case .welcome:
+            return "EchoGuide is your eyes through the phone camera. It tells you what is around you, reads text, and guides your hand to buttons. You do not need to look at the screen."
+        case .camera:
+            return cameraStatus == .denied || cameraStatus == .restricted
+                ? "Camera access is off. EchoGuide cannot work without it. Open Settings, choose EchoGuide, and turn on Camera."
+                : "EchoGuide watches through the back camera. Video stays on your phone."
+        case .modes:
+            return "Explore tells you what comes into view, and warns you about things in your path.\n\nFind guides your finger to one thing you ask for, like the start button.\n\nRead reads signs, letters and labels out loud.\n\nAnd any time, Describe tells you everything in front of you."
+        case .feel:
+            return "In Find, the phone pulses. Faster pulses mean your finger is closer. Two quick taps mean you are on it. Hold still there and EchoGuide confirms."
+        case .voice:
+            return "You can say what to find, like \"find the start button\". Speech is understood on your phone. This is optional."
+        case .privacy:
+            return cloudAvailable
+                ? "Describe works on your phone. If you allow it, EchoGuide can also send a photo to an AI model for a fuller description. Photos are not stored by EchoGuide. You can change this later in Settings."
+                : "Everything in this version runs on your phone, even in Airplane Mode. Nothing is sent anywhere."
+        case .ready:
+            return "Hold the phone upright at chest height with the camera facing away from you. EchoGuide starts in Explore. Use the large buttons at the bottom of the screen to switch modes. With VoiceOver, a two-finger double tap means Describe."
+        }
+    }
+
+    private var spoken: String { "\(title). \(bodyText) \(primaryLabel)." }
+
+    @ViewBuilder private var extra: some View {
+        switch step {
+        case .privacy where cloudAvailable:
+            Toggle(isOn: $cloudPhotos) {
+                Text("Send photos for richer descriptions")
+                    .font(.system(.title3, design: .rounded, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+            .tint(.yellow)
+            .padding(.vertical, 8)
+            .onChange(of: cloudPhotos) { _, on in AppSettings.imageConsent = on }
+        case .voice where voiceGranted:
+            Label("Voice is on", systemImage: "checkmark.circle.fill")
+                .font(.system(.title3, design: .rounded, weight: .semibold))
+                .foregroundStyle(.green)
+        default:
+            EmptyView()
+        }
+    }
+
+    private var primaryLabel: String {
+        switch step {
+        case .welcome: return "Get started"
+        case .camera:
+            switch cameraStatus {
+            case .authorized: return "Continue"
+            case .denied, .restricted: return "Open Settings"
+            default: return "Allow camera"
+            }
+        case .modes: return "Continue"
+        case .feel: return demoRunning ? "Feel the phone…" : "Try it"
+        case .voice: return voiceGranted ? "Continue" : "Turn on voice"
+        case .privacy: return "Continue"
+        case .ready: return "Start"
+        }
+    }
+
+    private var primaryHint: String? {
+        step == .feel ? "Plays the guidance pulses from far to close, then the on-target taps" : nil
+    }
+
+    private var secondaryLabel: String? {
+        switch step {
+        case .feel: return "Skip"
+        case .voice: return voiceGranted ? nil : "Not now"
+        default: return nil
+        }
+    }
+
+    // MARK: - Actions
+
+    private func advance() {
+        if let next = Step(rawValue: step.rawValue + 1) { step = next } else { finish() }
+    }
+
+    private func finish() {
+        narrator.stop()
+        onFinish()
+    }
+
+    private func primaryAction() async {
+        switch step {
+        case .camera:
+            switch cameraStatus {
+            case .authorized:
+                advance()
+            case .denied, .restricted:
+                if let url = URL(string: UIApplication.openSettingsURLString) { await UIApplication.shared.open(url) }
+            default:
+                let granted = await AVCaptureDevice.requestAccess(for: .video)
+                cameraStatus = AVCaptureDevice.authorizationStatus(for: .video)
+                if granted { advance() } else { narrator.say(bodyText) }
+            }
+        case .feel:
+            demoRunning = true
+            narrator.say("Far.")
+            await haptics.guide(offset: 0.45, 0, distanceMetres: nil)
+            try? await Task.sleep(nanoseconds: 1_600_000_000)
+            narrator.say("Closer.")
+            await haptics.guide(offset: 0.18, 0, distanceMetres: nil)
+            try? await Task.sleep(nanoseconds: 1_600_000_000)
+            narrator.say("Almost.")
+            await haptics.guide(offset: 0.06, 0, distanceMetres: nil)
+            try? await Task.sleep(nanoseconds: 1_400_000_000)
+            await haptics.stop()
+            await haptics.confirm()
+            narrator.say("On it.")
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            demoRunning = false
+            advance()
+        case .voice:
+            if voiceGranted { advance(); return }
+            let speech = await VoiceGoalListener.requestAuthorization()
+            let mic = await AVAudioApplication.requestRecordPermission()
+            voiceGranted = speech && mic
+            if voiceGranted { narrator.say("Voice is on.") }
+            advance()
+        case .ready:
+            finish()
+        default:
+            advance()
+        }
+    }
+}
+
+/// Speaks onboarding pages, unless VoiceOver is already reading the screen.
+@MainActor
+final class Narrator {
+    private let synth = AVSpeechSynthesizer()
+
+    func say(_ text: String) {
+        guard !UIAccessibility.isVoiceOverRunning else { return }
+        if synth.isSpeaking { synth.stopSpeaking(at: .immediate) }
+        let u = AVSpeechUtterance(string: text)
+        u.rate = AVSpeechUtteranceDefaultSpeechRate * 0.95
+        u.prefersAssistiveTechnologySettings = true
+        synth.speak(u)
+    }
+
+    func stop() { synth.stopSpeaking(at: .immediate) }
+}
+
+/// The one button style in the app: full width, 72 pt tall, high contrast.
+struct BigButton: View {
+    let label: String
+    let hint: String?
+    let filled: Bool
+    let action: () -> Void
+
+    init(_ label: String, hint: String? = nil, filled: Bool = true, action: @escaping () -> Void) {
+        self.label = label
+        self.hint = hint
+        self.filled = filled
+        self.action = action
+    }
+
+    var body: some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(.title2, design: .rounded, weight: .bold))
+                .frame(maxWidth: .infinity, minHeight: 72)
+                .foregroundStyle(filled ? .black : .yellow)
+                .background(filled ? Color.yellow : Color.clear, in: RoundedRectangle(cornerRadius: 16))
+                .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.yellow, lineWidth: filled ? 0 : 3))
+        }
+        .accessibilityHint(hint ?? "")
+    }
+}
+EOF_AVAE
+
+cat > 'EchoGuideApp/Sources/SettingsView.swift' <<'EOF_AVAE'
+// Owner: Maxwell. Settings, system status, and the benchmark lab: run the
+// standard task battery on EchoGuide, log the same tasks done with other
+// apps, and export one CSV that compares them.
+
+import SwiftUI
+import EchoGuideInfra
+
+struct SettingsView: View {
+    let runtime: AppRuntime
+    @Environment(\.dismiss) private var dismiss
+    @State private var cloudPhotos = AppSettings.imageConsent
+    @State private var results: [TrialResult] = []
+    @State private var csv = ""
+    @State private var showManual = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Status") {
+                    LabeledContent("Depth", value: runtime.hasLiDAR ? "LiDAR" : "Not available")
+                    LabeledContent("Object model", value: runtime.hasModel ? "Loaded" : "Not bundled")
+                    LabeledContent("Cloud", value: runtime.cloudConfigured ? (runtime.online ? "Reachable" : "Offline") : "Not configured")
+                }
+
+                if runtime.cloudConfigured {
+                    Section {
+                        Toggle("Send photos for richer descriptions", isOn: $cloudPhotos)
+                            .onChange(of: cloudPhotos) { _, on in AppSettings.imageConsent = on }
+                    } footer: {
+                        Text("Applies the next time EchoGuide opens. Photos are only sent when you tap Describe, and EchoGuide does not store them.")
+                    }
+                }
+
+                Section {
+                    Button("Measure on-device speed (20 s)") {
+                        runtime.runLatencyBenchmark()
+                        dismiss()
+                    }
+                } header: {
+                    Text("Speed")
+                } footer: {
+                    Text("Times every stage from camera frame to spoken or felt cue, on this phone. Result appears on the main screen and is saved in Files > EchoGuide.")
+                }
+
+                Section {
+                    ForEach(Array(BenchmarkTasks.all.enumerated()), id: \.offset) { i, t in
+                        Button {
+                            Task {
+                                await runtime.startTrial(task: t.task, mode: t.mode)
+                                dismiss()
+                            }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("\(i + 1). \(t.task)")
+                                Text(t.mode.capitalized).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Run a benchmark task")
+                } footer: {
+                    Text("Starts the timer and switches to the right mode. Tap Success or Failed on the main screen when done. The same tasks are in benchmarks/PROTOCOL.md for other apps.")
+                }
+
+                Section("Results (\(results.count))") {
+                    ForEach(Array(results.enumerated()), id: \.offset) { _, r in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(r.product): \(r.task)").font(.subheadline).lineLimit(2)
+                            Text("\(r.success ? "✓" : "✗") \(String(format: "%.1f", r.durationS)) s · first cue \(r.firstCueMs.map { String(format: "%.1f s", $0 / 1000) } ?? "none") · \(r.userPrompts) prompts\(r.offline ? " · offline" : "")")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Button("Add a result from another app") { showManual = true }
+                    if !results.isEmpty {
+                        ShareLink("Export CSV", item: csv)
+                        Button("Clear results", role: .destructive) {
+                            Task {
+                                await runtime.trials.clear()
+                                await reload()
+                            }
+                        }
+                    }
+                }
+
+                Section {
+                    Button("Replay the introduction") {
+                        AppSettings.onboarded = false
+                        dismiss()
+                    }
+                } footer: {
+                    Text("Shows the setup steps the next time EchoGuide opens.")
+                }
+            }
+            .navigationTitle("Settings")
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .task { await reload() }
+            .sheet(isPresented: $showManual, onDismiss: { Task { await reload() } }) {
+                ManualResultView(trials: runtime.trials)
+            }
+        }
+    }
+
+    private func reload() async {
+        results = await runtime.trials.results.reversed()
+        csv = await runtime.trials.csv
+    }
+}
+
+/// Log a trial timed by hand on a competitor app, same columns as ours.
+struct ManualResultView: View {
+    let trials: TrialRecorder
+    @Environment(\.dismiss) private var dismiss
+    static let products = ["Google Gemini Guided Vision", "Apple Live Recognition / Point and Speak", "Be My Eyes (Be My AI)", "Microsoft Seeing AI", "Aira", "Other"]
+    @State private var product = products[0]
+    @State private var taskIndex = 0
+    @State private var seconds = 30.0
+    @State private var success = true
+    @State private var firstCue = 3.0
+    @State private var prompts = 1
+    @State private var offline = false
+    @State private var notes = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Picker("Product", selection: $product) { ForEach(Self.products, id: \.self) { Text($0) } }
+                Picker("Task", selection: $taskIndex) {
+                    ForEach(Array(BenchmarkTasks.all.enumerated()), id: \.offset) { i, t in Text("\(i + 1). \(t.task)").tag(i) }
+                }
+                Toggle("Succeeded", isOn: $success)
+                Stepper("Total time: \(Int(seconds)) s", value: $seconds, in: 1...600, step: 1)
+                Stepper("First useful cue: \(String(format: "%.1f", firstCue)) s", value: $firstCue, in: 0...120, step: 0.5)
+                Stepper("Times the user had to ask: \(prompts)", value: $prompts, in: 0...50)
+                Toggle("Was offline", isOn: $offline)
+                TextField("Notes", text: $notes)
+            }
+            .navigationTitle("Other app result")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        let t = BenchmarkTasks.all[taskIndex]
+                        let r = TrialResult(product: product, task: t.task, mode: t.mode, startedAt: Date(), durationS: seconds,
+                                            success: success, firstCueMs: firstCue * 1000, spokenLines: 0, userPrompts: prompts,
+                                            cloudCalls: 0, offline: offline, notes: notes)
+                        Task {
+                            await trials.addManual(r)
+                            dismiss()
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+EOF_AVAE
+
+cat > 'EchoGuideTests/AgentTests.swift' <<'EOF_AVAE'
+// Owner: Maxwell. The visual agent: proactive narration, reading, describe,
+// mode routing, and the benchmark recorder.
+
+import Foundation
+import Testing
+import EchoGuideContracts
+@testable import EchoGuideInfra
+
+private func obj(_ label: String, x: Float, y: Float = 0.5, size: Float = 0.2, conf: Float = 0.9) -> Detection {
+    Detection(label: label, confidence: conf, box: ImageRect(x: x - size / 2, y: y - size / 2, width: size, height: size))
+}
+
+private func txt(_ s: String, x: Float, y: Float, conf: Float = 0.9) -> Detection {
+    Detection(label: "text", confidence: conf, box: ImageRect(x: x - 0.1, y: y - 0.02, width: 0.2, height: 0.04), kind: .text, text: s)
+}
+
+private func f(_ d: [Detection], _ t: TimeInterval) -> VisionFrameResult {
+    VisionFrameResult(frameIndex: 0, timestamp: t, detections: d, inferenceMs: 5)
+}
+
+struct FixedDepth: DepthProviding {
+    var metres: Float
+    func depth(at point: ImagePoint) async -> Float? { metres }
+}
+
+final class ManualClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var t: TimeInterval = 1000
+    var now: TimeInterval { lock.withLock { t } }
+    func advance(_ s: TimeInterval) { lock.withLock { t += s } }
+}
+
+struct StubRouter: ReasoningRouting {
+    var answer: String
+    var source: ReasoningSource
+    func resolve(_ query: ReasoningQuery) async -> ReasoningOutcome {
+        ReasoningOutcome(answer: answer, source: source, latencyMs: 1)
+    }
+}
+
+@Suite struct NarratorTests {
+    @Test func namesSettledThingsOnceWithPlace() {
+        var n = SceneNarrator()
+        #expect(n.observe(f([obj("chair", x: 0.2)], 0)) == nil) // not settled yet
+        let a = n.observe(f([obj("chair", x: 0.2)], 0.1))
+        #expect(a?.text == "A chair, on your left.")
+        #expect(a?.azimuth ?? 0 < 0)
+        // Same chair later: silent (cooldown).
+        #expect(n.observe(f([obj("chair", x: 0.2)], 5)) == nil)
+    }
+
+    @Test func mostSalientWins() {
+        var n = SceneNarrator()
+        let scene = [obj("cup", x: 0.5), obj("car", x: 0.8), obj("person", x: 0.4)]
+        _ = n.observe(f(scene, 0))
+        #expect(n.observe(f(scene, 0.1))?.text == "A car, on your right.")
+    }
+
+    @Test func pacedBetweenAnnouncements() {
+        var n = SceneNarrator()
+        let scene = [obj("car", x: 0.8), obj("person", x: 0.2)]
+        _ = n.observe(f(scene, 0))
+        #expect(n.observe(f(scene, 0.1)) != nil)
+        #expect(n.observe(f(scene, 1.0)) == nil) // inside min gap
+        #expect(n.observe(f(scene, 2.0)) == nil)
+        #expect(n.observe(f(scene, 3.0))?.text == "A person, on your left.")
+    }
+
+    @Test func obstacleBreaksPacingAndIsUrgent() {
+        var n = SceneNarrator()
+        let scene = [obj("car", x: 0.8)]
+        _ = n.observe(f(scene, 0))
+        _ = n.observe(f(scene, 0.1))
+        let a = n.observe(f([obj("chair", x: 0.5, size: 0.4)], 0.5), aheadMetres: 0.6)
+        #expect(a?.kind == .obstacle)
+        #expect(a?.urgent == true)
+        #expect(a?.text == "Chair ahead, very close.")
+    }
+
+    @Test func distanceFromDepth() {
+        var n = SceneNarrator()
+        _ = n.observe(f([obj("person", x: 0.5)], 0), depths: [0: 2.2])
+        #expect(n.observe(f([obj("person", x: 0.5)], 0.1), depths: [0: 2.2])?.text == "A person, ahead, about 2 meters.")
+    }
+
+    @Test func readsNewSignsWhenNothingElse() {
+        var n = SceneNarrator()
+        #expect(n.observe(f([txt("EXIT", x: 0.5, y: 0.2)], 0))?.text == "Sign: EXIT.")
+        #expect(n.observe(f([txt("EXIT", x: 0.5, y: 0.2)], 10)) == nil)
+    }
+
+    @Test func ignoresLowConfidenceNoise() {
+        var n = SceneNarrator()
+        _ = n.observe(f([obj("dog", x: 0.5, conf: 0.3)], 0))
+        #expect(n.observe(f([obj("dog", x: 0.5, conf: 0.3)], 0.1)) == nil)
+    }
+}
+
+@Suite struct ReaderTests {
+    @Test func readingOrder() {
+        let frame = f([txt("World", x: 0.7, y: 0.3), txt("Hello", x: 0.3, y: 0.3), txt("Second line", x: 0.4, y: 0.6)], 0)
+        #expect(TextReader.lines(in: frame) == ["Hello World", "Second line"])
+    }
+
+    @Test func doesNotRepeat() {
+        var r = TextReader()
+        let frame = f([txt("Best before 12 Nov", x: 0.5, y: 0.5)], 0)
+        #expect(r.newLines(in: frame) == ["Best before 12 Nov"])
+        #expect(r.newLines(in: f(frame.detections, 5)).isEmpty)
+        #expect(r.newLines(in: f(frame.detections, 61)) == ["Best before 12 Nov"])
+    }
+
+    @Test func cleansNoise() {
+        #expect(TextReader.clean("  ~~EXIT~~  ") == "EXIT")
+        #expect(TextReader.clean("|||") == "")
+    }
+}
+
+@Suite struct AgentCoreTests {
+    func core(router: ReasoningRouting? = nil, depth: DepthProviding? = nil) -> (AgentCore, RecordingAudio, RecordingHaptics, ManualClock) {
+        let a = RecordingAudio(), h = RecordingHaptics(), clock = ManualClock()
+        return (AgentCore(audio: a, haptics: h, depth: depth, router: router, clock: { clock.now }), a, h, clock)
+    }
+
+    @Test func exploreSpeaksUnprompted() async {
+        let (c, a, _, _) = core()
+        await c.ingest(f([obj("person", x: 0.5)], 0), fence: nil)
+        await c.ingest(f([obj("person", x: 0.5)], 0.1), fence: nil)
+        #expect(await a.spoken == ["A person, ahead."])
+    }
+
+    @Test func findHandsFramesToAutomation() async {
+        let (c, a, _, _) = core()
+        await c.setMode(.find, announce: false)
+        #expect(await c.ingest(f([obj("person", x: 0.5)], 0), fence: .breached(zone: "hob")) == true)
+        #expect(await a.spoken.isEmpty) // AutomationEngine owns speech and fence in Find
+    }
+
+    @Test func fenceWarnsInExplore() async {
+        let (c, a, h, _) = core()
+        await c.ingest(f([], 0), fence: .breached(zone: "hob"))
+        #expect(await a.spoken == ["Stop. Hob."])
+        #expect(await h.warns == 1)
+    }
+
+    @Test func obstacleWithLiDAR() async {
+        let (c, a, h, _) = core(depth: FixedDepth(metres: 0.7))
+        await c.ingest(f([], 0), fence: nil)
+        #expect(await a.spoken == ["Obstacle ahead, very close."])
+        #expect(await h.warns == 1)
+    }
+
+    @Test func readModeReadsOnce() async {
+        let (c, a, _, clock) = core()
+        await c.setMode(.read, announce: false)
+        let page = [txt("Dear Maxwell", x: 0.4, y: 0.2)]
+        await c.ingest(f(page, 0), fence: nil)
+        clock.advance(10)
+        await c.ingest(f(page, 1), fence: nil)
+        #expect(await a.spoken == ["Dear Maxwell"])
+    }
+
+    @Test func describeUsesCloudWhenAvailable() async {
+        let (c, a, _, _) = core(router: StubRouter(answer: "A kitchen counter with a kettle on the left.", source: .cloud))
+        await c.ingest(f([obj("oven", x: 0.5)], 0), fence: nil)
+        #expect(await c.describe(jpeg: Data([1])) == "A kitchen counter with a kettle on the left.")
+        #expect(await a.spoken.last == "A kitchen counter with a kettle on the left.")
+        #expect(await c.stats.describeCloud == 1)
+    }
+
+    @Test func describeFallsBackToLocalSummaryOffline() async {
+        let (c, _, _, _) = core(router: StubRouter(answer: "This might be oven.", source: .localFallback))
+        await c.ingest(f([obj("oven", x: 0.5), obj("person", x: 0.1), txt("BAKE", x: 0.5, y: 0.8)], 0), fence: nil)
+        let said = await c.describe(jpeg: nil)
+        #expect(said == "Ahead: an oven. On your left: a person. Text: BAKE.")
+        #expect(await c.stats.describeLocal == 1)
+    }
+
+    @Test func describeBeforeCameraIsHonest() async {
+        let (c, _, _, _) = core()
+        #expect(await c.describe(jpeg: nil).hasPrefix("The camera is still starting"))
+    }
+}
+
+@Suite struct TrialRecorderTests {
+    @Test func recordsAndExportsCSV() async {
+        let r = TrialRecorder()
+        await r.start(task: "Find start", mode: "find", offline: true)
+        await r.notePrompt()
+        await r.noteSpoken()
+        await r.noteSpoken()
+        let result = await r.finish(success: true, notes: "fast, \"clean\"")
+        #expect(result?.spokenLines == 2)
+        #expect(result?.userPrompts == 1)
+        #expect(result?.firstCueMs != nil)
+        let csv = await r.csv
+        #expect(csv.hasPrefix(TrialResult.csvHeader))
+        #expect(csv.contains("\"fast, \"\"clean\"\"\""))
+        #expect(csv.contains(",1,")) // success / offline flags
+    }
+
+    @Test func taskBatteryIsStable() {
+        #expect(BenchmarkTasks.all.count == 8)
     }
 }
 EOF_AVAE
@@ -4667,6 +6801,339 @@ struct TableDepth: DepthProviding {
         #expect(await a.spoken.count == 2)
     }
 }
+
+// MARK: - Tool failure, cadence
+
+@Suite struct AutomationCadenceTests {
+    func engine(tools: ToolInvoking? = nil) -> (AutomationEngine, RecordingHaptics, RecordingAudio) {
+        var c = CognitiveConfig()
+        c.settleFrames = 1
+        let h = RecordingHaptics(), a = RecordingAudio()
+        return (AutomationEngine(haptics: h, audio: a, tools: tools, cognitive: CognitiveTaskIsolation(config: c)), h, a)
+    }
+
+
+
+
+    @Test func failedToolCanBeRetriedAtOnce() async {
+        struct Boom: Error {}
+        let registry = PluginRegistry()
+        let calls = Counter()
+        await registry.register(ToolDescriptor(name: "go", description: "", sideEffect: .physical, claim: ToolClaim(labels: ["button"])) { _ in
+            await calls.inc()
+            if await calls.value == 1 { throw Boom() }
+            return "Done."
+        })
+        let (e, _, a) = engine(tools: registry)
+        await e.start()
+        let onIt = [det("button", x: 0.5, y: 0.5), tip(x: 0.5, y: 0.5)]
+        await e.ingest(frame(onIt, t: 0))
+        await e.ingest(frame(onIt, t: 1))
+        #expect(await e.state == .completed("button"))
+        #expect(await a.spoken.last == "That did not work.")
+        // Same button is offered again straight away; a fresh dwell fires it.
+        await e.ingest(frame(onIt, t: 1.1))
+        guard case .onTarget(let step) = await e.state else { Issue.record("expected onTarget for retry"); return }
+        #expect(step.targetLabel == "button")
+        await e.ingest(frame(onIt, t: 2))
+        #expect(await e.state == .completed("Done."))
+        #expect(await calls.value == 2)
+    }
+
+    @Test func approachWarningIsThrottled() async {
+        let (e, h, a) = engine()
+        await e.start()
+        let f = { (t: TimeInterval) in frame([det("button", x: 0.7, y: 0.5), tip(x: 0.4, y: 0.5)], t: t) }
+        await e.ingest(f(0), fence: .approaching(zone: "hob", metres: nil))
+        await e.ingest(f(1), fence: .approaching(zone: "hob", metres: nil))
+        #expect(await h.warns == 1)
+        #expect(await a.spoken.filter { $0.hasPrefix("Careful") }.count == 1)
+        // Guidance carries on underneath the caution.
+        guard case .guiding = await e.state else { Issue.record("expected guiding"); return }
+        await e.ingest(f(3.5), fence: .approaching(zone: "hob", metres: nil))
+        #expect(await h.warns == 2)
+    }
+
+    @Test func instructionRepeatsOnlyAfterInterval() async {
+        let (e, _, a) = engine()
+        await e.start()
+        let f = { (t: TimeInterval) in frame([det("button", x: 0.7, y: 0.5), tip(x: 0.4, y: 0.5)], t: t) }
+        await e.ingest(f(0))
+        await e.ingest(f(3))
+        #expect(await a.spoken.count == 1)
+        await e.ingest(f(6.5))
+        #expect(await a.spoken.count == 2)
+    }
+
+    @Test func directionalPingKeepsItsCadence() async {
+        let (e, _, a) = engine()
+        await e.start()
+        let f = { (t: TimeInterval) in frame([det("button", x: 0.8, y: 0.5), tip(x: 0.3, y: 0.5)], t: t) }
+        await e.ingest(f(0))
+        await e.ingest(f(0.3))
+        await e.ingest(f(0.6))
+        #expect(await a.pings == 1)
+        await e.ingest(f(1.0))
+        #expect(await a.pings == 2)
+        // Target straight ahead: no sideways ping.
+        await e.ingest(frame([det("button", x: 0.3, y: 0.2), tip(x: 0.3, y: 0.5)], t: 5))
+        #expect(await a.pings == 2)
+    }
+}
+
+// MARK: - Per-home fence configuration
+
+@Suite struct FenceConfigTests {
+    @Test func decodesHandWrittenJSON() throws {
+        let json = """
+        { "zones": [
+            { "name": "hob", "anchor": { "label": "oven" }, "warningMargin": 0.1 },
+            { "name": "stairs", "anchor": { "region": { "x": 0, "y": 0.8, "width": 1, "height": 0.2 } } }
+          ] }
+        """
+        let c = try FenceConfig.load(from: Data(json.utf8))
+        #expect(c.zones.count == 2)
+        #expect(c.zones[0].anchor == .label("oven"))
+        #expect(c.zones[0].warningMargin == 0.1)
+        #expect(c.zones[1].anchor == .region(ImageRect(x: 0, y: 0.8, width: 1, height: 0.2)))
+        #expect(c.zones[1].warningDepthMetres == 0.35) // default kept
+        // The decoded zones behave like code-defined ones.
+        let f = frame([tip(x: 0.5, y: 0.9)], t: 0)
+        #expect(c.spatialFence.evaluate(f) == .breached(zone: "stairs"))
+    }
+
+    @Test func emptyConfigFallsBackToKitchenDefaults() throws {
+        let c = try FenceConfig.load(from: Data("{}".utf8))
+        #expect(c.spatialFence == SpatialFence.kitchenDefaults)
+    }
+
+    @Test func roundTrips() throws {
+        let original = FenceConfig(
+            zones: [SpatialFenceZone(name: "knife", anchor: .label("knife"), warningMargin: 0.05, warningDepthMetres: 0.2)])
+        let data = try JSONEncoder().encode(original)
+        #expect(try FenceConfig.load(from: data) == original)
+    }
+
+    @Test func anchorNeedsLabelOrRegion() {
+        #expect(throws: DecodingError.self) {
+            try FenceConfig.load(from: Data(#"{ "zones": [ { "name": "x", "anchor": {} } ] }"#.utf8))
+        }
+    }
+}
+
+// MARK: - Screen
+
+@Suite struct GuidanceModelTests {
+    @Test @MainActor func headlineMirrorsTheAudio() {
+        let step = ActionStep(targetLabel: "start", instruction: "Start. Move right.", guidance: .align(dx: 0.3, dy: 0), target: nil)
+        #expect(GuidanceModel(previewState: .guiding(step)).headline == "Start. Move right.")
+        #expect(GuidanceModel(previewState: .guiding(step)).detail == "Follow the pulses")
+        #expect(GuidanceModel(previewState: .onTarget(step)).detail == "Hold still")
+        #expect(GuidanceModel(previewState: .completed("Microwave started.")).headline == "Done. Microwave started.")
+        #expect(GuidanceModel(previewState: .warning("hob")).headline == "Stop. Hob")
+        #expect(GuidanceModel(previewState: .warning("hob")).isWarning)
+        #expect(GuidanceModel(previewState: .scanning, goal: "start").detail == "Looking for \"start\"")
+        #expect(GuidanceModel(previewState: .idle).isPaused)
+    }
+
+    @Test @MainActor func arrowAgreesWithTheSpokenDirection() {
+        let step = ActionStep(targetLabel: "start", instruction: "", guidance: .align(dx: 0.02, dy: -0.2), target: nil)
+        #expect(GuidanceModel(previewState: .guiding(step)).arrowSymbol == "arrow.up")
+        #expect(CognitiveTaskIsolation.direction(dx: 0.02, dy: -0.2).hasPrefix("Move up"))
+        #expect(GuidanceModel.arrowSymbol(dx: 0.3, dy: 0.1) == "arrow.right")
+        #expect(GuidanceModel.arrowSymbol(dx: -0.3, dy: 0.1) == "arrow.left")
+        #expect(GuidanceModel.arrowSymbol(dx: 0, dy: 0.3) == "arrow.down")
+        #expect(GuidanceModel.arrowSymbol(dx: 0.01, dy: 0.01) == nil)
+        // Not guiding: no arrow.
+        #expect(GuidanceModel(previewState: .onTarget(step)).arrowSymbol == nil)
+    }
+}
+
+// MARK: - Voice: Kokoro provider, cache, priority, goal parsing
+
+struct StubSpeech: SpeechSynthesizing {
+    var fail = false
+    var delay: TimeInterval = 0
+    var calls: Counter? = nil
+    func synthesize(_ text: String) async throws -> Data {
+        await calls?.inc()
+        if delay > 0 { try await Task.sleep(nanoseconds: UInt64(delay * 1e9)) }
+        if fail { throw SpeechProviderError.badStatus(500) }
+        return WAVEncoder.pcm16Mono([Float](repeating: 0, count: 2400), sampleRate: 24_000)
+    }
+}
+
+struct StubListener: GoalListening {
+    var heard: String?
+    func listen() async throws -> String? { heard }
+}
+
+@Suite struct SpeechProviderTests {
+    @Test func kokoroRequestIsOpenAIShaped() throws {
+        let p = KokoroSpeechProvider(baseURL: URL(string: "http://pi.local:8880")!, voice: "bf_emma", speed: 1.1)
+        let r = p.request(for: "Start. Move right.")
+        #expect(r.url?.absoluteString == "http://pi.local:8880/v1/audio/speech")
+        #expect(r.httpMethod == "POST")
+        let body = try JSONSerialization.jsonObject(with: r.httpBody ?? Data()) as? [String: Any]
+        #expect(body?["model"] as? String == "kokoro")
+        #expect(body?["input"] as? String == "Start. Move right.")
+        #expect(body?["voice"] as? String == "bf_emma")
+        #expect(body?["response_format"] as? String == "wav")
+        #expect(body?["speed"] as? Double == 1.1)
+    }
+
+    @Test func kokoroReturnsAudioAndRejectsErrors() async throws {
+        let wav = WAVEncoder.pcm16Mono([0, 0.5, -0.5], sampleRate: 24_000)
+        func provider(status: Int, body: Data) -> KokoroSpeechProvider {
+            KokoroSpeechProvider(baseURL: URL(string: "http://localhost:8880")!) { req in
+                (body, HTTPURLResponse(url: req.url!, statusCode: status, httpVersion: nil, headerFields: nil)!)
+            }
+        }
+        #expect(try await provider(status: 200, body: wav) .synthesize("hi") == wav)
+        await #expect(throws: SpeechProviderError.badStatus(503)) { try await provider(status: 503, body: wav).synthesize("hi") }
+        await #expect(throws: SpeechProviderError.emptyAudio) { try await provider(status: 200, body: Data()).synthesize("hi") }
+    }
+
+    @Test func kokoroGivesUpAfterTimeout() async {
+        let p = KokoroSpeechProvider(baseURL: URL(string: "http://localhost:8880")!, timeout: 0.05) { req in
+            try await Task.sleep(nanoseconds: 2_000_000_000)
+            return (Data(), HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        let t = FrameTimer()
+        await #expect(throws: SpeechProviderError.timeout) { try await p.synthesize("hi") }
+        #expect(t.elapsedMs < 1_000)
+    }
+
+    @Test func wavHeaderIsValid() {
+        let d = WAVEncoder.pcm16Mono([0, 1, -1], sampleRate: 24_000)
+        #expect(d.count == 44 + 6)
+        #expect(String(decoding: d.prefix(4), as: UTF8.self) == "RIFF")
+        #expect(String(decoding: d[8..<12], as: UTF8.self) == "WAVE")
+        let rate = d[24..<28].withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
+        #expect(UInt32(littleEndian: rate) == 24_000)
+    }
+
+    @Test func cacheEvictsLeastRecentlyUsed() async {
+        let c = SpeechCache(capacity: 2)
+        await c.put("a", Data([1])); await c.put("b", Data([2]))
+        _ = await c.get("a") // a is now the most recent
+        await c.put("c", Data([3]))
+        #expect(await c.get("b") == nil)
+        #expect(await c.get("a") == Data([1]))
+        #expect(await c.get("c") == Data([3]))
+        #expect(await c.count == 2)
+    }
+
+    @Test func urgencyPolicy() {
+        #expect(SpeechPolicy.isUrgent("Stop. Hob."))
+        #expect(SpeechPolicy.isUrgent("Careful. Knife is close."))
+        #expect(SpeechPolicy.isUrgent("You have left home. Your carer has been told."))
+        #expect(!SpeechPolicy.isUrgent("Start. Move right."))
+        #expect(!SpeechPolicy.isUrgent("Microwave started."))
+    }
+
+    @Test func engineFallsBackToOnDeviceVoice() async {
+        // Provider down: the phrase is still spoken, by the on-device voice.
+        let down = SpatialAudioEngine(speech: StubSpeech(fail: true))
+        await down.speak("Start. Move right.", azimuth: 0)
+        #expect(await down.lastSpeechSource == .onDevice)
+        #expect(await down.lastSpoken == "Start. Move right.")
+        #expect(await down.cachedPhrases == 0)
+        // No provider at all: same.
+        let plain = SpatialAudioEngine()
+        await plain.speak("Hold still", azimuth: 0)
+        #expect(await plain.lastSpeechSource == .onDevice)
+    }
+
+    @Test func engineCachesSynthesizedPhrases() async {
+        let calls = Counter()
+        let e = SpatialAudioEngine(speech: StubSpeech(calls: calls))
+        await e.prewarm(["Hold still", "Stop. Hob."])
+        #expect(await calls.value == 2)
+        #expect(await e.cachedPhrases == 2)
+        await e.prewarm(["Hold still"]) // already cached
+        #expect(await calls.value == 2)
+        await e.speak("Hold still", azimuth: 0)
+        #expect(await calls.value == 2) // served from cache
+        await e.speak("Start. Move right.", azimuth: 0.3)
+        #expect(await calls.value == 3)
+        #expect(await e.cachedPhrases == 3)
+    }
+
+    @Test func goalParsingStripsFiller() {
+        #expect(GoalPhraseParser.goal(from: "Find the start button") == "start button")
+        #expect(GoalPhraseParser.goal(from: "Where's the microwave?") == "microwave")
+        #expect(GoalPhraseParser.goal(from: "Hey EchoGuide, please press START") == "start")
+        #expect(GoalPhraseParser.goal(from: "um, please") == nil)
+        #expect(GoalPhraseParser.goal(from: "") == nil)
+    }
+
+    @Test func multiWordGoalMatchesAnyWord() {
+        var c = CognitiveConfig()
+        c.settleFrames = 1
+        var iso = CognitiveTaskIsolation(config: c, goal: "start microwave")
+        let dets = [det("cup", x: 0.5, y: 0.5), det("text", x: 0.7, y: 0.7, kind: .text, text: "START"), det("microwave", x: 0.2, y: 0.2, size: 0.4)]
+        let step = iso.isolate(frame(dets, t: 0))
+        #expect(step != nil)
+        #expect(step?.targetLabel != "cup")
+        // The parser's output drops into the goal unchanged.
+        iso.goal = GoalPhraseParser.goal(from: "find the stop button")
+        iso.reset()
+        #expect(iso.isolate(frame([det("start", x: 0.5, y: 0.5), det("stop", x: 0.3, y: 0.3)], t: 1))?.targetLabel == "stop")
+    }
+}
+
+// MARK: - Caution banner and mic button
+
+@Suite struct CautionTests {
+    @Test func engineReportsApproachAsCautionNotState() async {
+        var c = CognitiveConfig()
+        c.settleFrames = 1
+        let e = AutomationEngine(haptics: RecordingHaptics(), audio: RecordingAudio(), cognitive: CognitiveTaskIsolation(config: c))
+        await e.start()
+        let f = { (t: TimeInterval) in frame([det("button", x: 0.7, y: 0.5), tip(x: 0.4, y: 0.5)], t: t) }
+        await e.ingest(f(0), fence: .approaching(zone: "hob", metres: 0.2))
+        #expect(await e.caution == "hob")
+        guard case .guiding = await e.state else { Issue.record("expected guiding under the caution"); return }
+        await e.ingest(f(0.1))
+        #expect(await e.caution == nil)
+        await e.ingest(f(0.2), fence: .approaching(zone: "knife", metres: nil))
+        #expect(await e.caution == "knife")
+        await e.stop()
+        #expect(await e.caution == nil)
+    }
+
+    @Test func cautionStreamDeliversChanges() async {
+        var c = CognitiveConfig()
+        c.settleFrames = 1
+        let e = AutomationEngine(haptics: RecordingHaptics(), audio: RecordingAudio(), cognitive: CognitiveTaskIsolation(config: c))
+        await e.start()
+        let stream = await e.cautions()
+        var it = stream.makeAsyncIterator()
+        #expect(await it.next() == .some(nil)) // current value first
+        await e.ingest(frame([tip(x: 0.4, y: 0.5)], t: 0), fence: .approaching(zone: "hob", metres: nil))
+        #expect(await it.next() == .some("hob"))
+    }
+
+    @Test @MainActor func modelShowsCautionLineAndHearsGoal() async {
+        let m = GuidanceModel(listener: StubListener(heard: "start button"))
+        #expect(m.canListen)
+        #expect(m.cautionLine == nil)
+        #expect(GuidanceModel(previewState: .idle).canListen == false)
+        m.listenForGoal()
+        // The listening task hops through the main actor; yield until it lands.
+        for _ in 0..<50 where m.isListening || m.goal == nil { await Task.yield() }
+        #expect(m.goal == "start button")
+        #expect(m.listenResult == "Heard: start button")
+        #expect(!m.isListening)
+
+        let silent = GuidanceModel(listener: StubListener(heard: nil))
+        silent.listenForGoal()
+        for _ in 0..<50 where silent.isListening { await Task.yield() }
+        #expect(silent.goal == nil)
+        #expect(silent.listenResult == "Did not catch that")
+    }
+}
 EOF_AVAE
 
 cat > 'EchoGuideTests/PerceptionAndPluginTests.swift' <<'EOF_AVAE'
@@ -4954,7 +7421,7 @@ let package = Package(
             name: "EchoGuideVision",
             dependencies: ["EchoGuideContracts"],
             path: "EchoGuide/Core",
-            exclude: ["Contracts", "Haptics", "Depth", "Audio", "Automation", "Cognitive", "Plugins", "Router"],
+            exclude: ["Contracts", "Haptics", "Depth", "Audio", "Automation", "Cognitive", "Plugins", "Router", "Agent"],
             sources: ["Camera", "Vision", "Fence"]
         ),
         // Haptics, spatial audio (Bryan); LiDAR depth (Maxwell).
@@ -4962,7 +7429,7 @@ let package = Package(
             name: "EchoGuideSpatial",
             dependencies: ["EchoGuideContracts"],
             path: "EchoGuide/Core",
-            exclude: ["Contracts", "Camera", "Vision", "Fence", "Automation", "Cognitive", "Plugins", "Router"],
+            exclude: ["Contracts", "Camera", "Vision", "Fence", "Automation", "Cognitive", "Plugins", "Router", "Agent"],
             sources: ["Haptics", "Depth", "Audio"]
         ),
         // Bryan: automation state machine, cognitive isolation, SwiftUI.
@@ -4970,16 +7437,16 @@ let package = Package(
             name: "EchoGuideAutomation",
             dependencies: ["EchoGuideContracts"],
             path: "EchoGuide",
-            exclude: ["Core/Contracts", "Core/Camera", "Core/Vision", "Core/Fence", "Core/Haptics", "Core/Depth", "Core/Audio", "Core/Plugins", "Core/Router"],
+            exclude: ["Core/Contracts", "Core/Camera", "Core/Vision", "Core/Fence", "Core/Haptics", "Core/Depth", "Core/Audio", "Core/Plugins", "Core/Router", "Core/Agent"],
             sources: ["Core/Automation", "Core/Cognitive", "UI"]
         ),
-        // Maxwell: plugin registry (MCP), cloud reasoning router.
+        // Maxwell: plugin registry (MCP), cloud reasoning router, the visual agent.
         .target(
             name: "EchoGuideInfra",
             dependencies: ["EchoGuideContracts"],
             path: "EchoGuide/Core",
             exclude: ["Contracts", "Camera", "Vision", "Fence", "Haptics", "Depth", "Audio", "Automation", "Cognitive"],
-            sources: ["Plugins", "Router"]
+            sources: ["Plugins", "Router", "Agent"]
         ),
         .testTarget(
             name: "EchoGuideTests",
@@ -5014,13 +7481,30 @@ camera ─► FrameDeltaEngine ─► LocalVisionEngine ─► DigitalFence ─�
                                                 └─► SpatialAudioEngine (AVAudioEngine 3D)
 ```
 
+## What it does
+
+A real-time, multimodal visual agent for blind and low-vision people. It perceives continuously, reasons about context, and speaks up on its own when something matters.
+
+| Mode | What the user hears or feels | Runs on |
+|---|---|---|
+| **Explore** (default) | Speaks up on its own: "A chair, on your left, about 2 meters." "Obstacle ahead, very close" (with a buzz). "Sign: EXIT." It names each thing once and is paced so it never chatters. | Phone |
+| **Find** | Say or type a goal ("start button"). Haptic pulses get faster as the finger closes in, two taps mean on target, and holding there presses it through a plugin. | Phone |
+| **Read** | Reads text in reading order, each line once, as you move the camera. **Read everything** reads it all again. | Phone |
+| **Describe** | One tap (or a VoiceOver two-finger double tap): a few sentences about everything in view. Uses a multimodal cloud model with the photo when allowed, otherwise an on-device summary. | Cloud or phone |
+
+Hazard warnings ("Careful. Hob is close." / "Stop. Hob.") work in every mode.
+
+**First launch** is a seven-step spoken setup: welcome, camera, the modes, a hands-on haptic demo, optional voice, photo consent, and how to hold the phone. Only the camera is required; everything else is skippable and can be changed later in Settings.
+
+**Benchmarks:** Settings has the speed test (camera to cue, on this phone) and the eight-task head-to-head battery. Results from other apps are logged by hand next to EchoGuide's own and exported as one CSV. The method is in [`benchmarks/PROTOCOL.md`](benchmarks/PROTOCOL.md).
+
 ## Team and ownership
 
 Two owners. Engines meet only through `EchoGuideContracts`, so the two never edit the same file. Ownership is enforced in `.github/CODEOWNERS`.
 
 | Owner | Area | Paths | Files |
 |---|---|---|---|
-| Maxwell | Perception + infrastructure: what the phone senses, and the plumbing | `EchoGuide/Core/Camera/`, `Vision/`, `Depth/`, `Plugins/`, `Router/`, `EchoGuideApp/`, `proxy/`, `.github/`, `EchoGuideTests/`, `Package.swift`, `plugins/` | `FrameDeltaEngine`, `PerceptionPipeline`, `CameraFeed`, `LocalVisionEngine`, `LiDARDepthEngine`, `PluginRegistry`, built-in plugins, `CloudReasoningRouter`, `VoiceLoop`, the iOS app, the key proxy, CI/CD, tests |
+| Maxwell | Perception + infrastructure: what the phone senses, and the plumbing | `EchoGuide/Core/Camera/`, `Vision/`, `Depth/`, `Plugins/`, `Router/`, `Agent/`, `EchoGuideApp/`, `benchmarks/`, `proxy/`, `.github/`, `EchoGuideTests/`, `Package.swift`, `plugins/` | `FrameDeltaEngine`, `PerceptionPipeline`, `CameraFeed`, `LocalVisionEngine`, `LiDARDepthEngine`, `PluginRegistry`, built-in plugins, `CloudReasoningRouter`, `VoiceLoop`, `AgentCore` (Explore/Read/Describe), `SceneNarrator`, `TextReader`, `TrialRecorder`, the iOS app, the key proxy, CI/CD, tests |
 | Bryan | Experience + safety: everything the user feels, hears and sees | `EchoGuide/Core/Fence/`, `Haptics/`, `Audio/`, `Automation/`, `Cognitive/`, `EchoGuide/UI/` | `DigitalFenceEngine`, `SpatialHapticEngine`, `SpatialAudioEngine`, `AutomationEngine`, `CognitiveTaskIsolation`, `GuidanceView` |
 | Both | Shared contracts | `EchoGuide/Core/Contracts/` | `Contracts.swift` (needs both approvals) |
 
@@ -5064,7 +7548,7 @@ Read these honestly:
 ## Build
 
 ```bash
-swift build && swift test        # macOS host: pure logic, 62 tests (plus `cd proxy && node --test`: 6)
+swift build && swift test        # macOS host: pure logic, 105 tests (plus `cd proxy && node --test`: 6)
 ```
 
 The iOS-only paths (ARKit, the camera, the haptic actuator) are behind `#if canImport(...) && os(iOS)`. The `ios-build` CI job compiles them with `xcodebuild` for the iOS Simulator. Real latency numbers need a device.
@@ -5113,6 +7597,112 @@ Remote tools are registered as `physical` unless told otherwise. A physical tool
 - The OpenAI Realtime API (multi-turn). The router uses one-shot Chat Completions.
 - A setup flow that writes `echoguide.json` and the Keychain secrets (today: by hand).
 - Real measurements: run the on-device benchmark on an A17-class iPhone and put the numbers in the targets table.
+EOF_AVAE
+
+cat > 'benchmarks/PROTOCOL.md' <<'EOF_AVAE'
+# Head-to-head benchmark protocol
+
+Owner: Maxwell. Purpose: measure EchoGuide against the apps blind and low-vision people already use, on the same tasks, with numbers anyone can check. No claim about being better goes in a pitch unless it comes from this sheet.
+
+## Products
+
+| Product | Notes |
+|---|---|
+| EchoGuide | This app. Trials are timed automatically (Settings → Run a benchmark task). |
+| Google Gemini Live, Guided Vision | Android. Launched October 1, 2026. |
+| Apple Live Recognition / Point and Speak | iPhone Magnifier. Point and Speak needs LiDAR. |
+| Be My Eyes (Be My AI) | AI image description. Use the AI mode, not volunteers, so the comparison is fair. |
+| Microsoft Seeing AI | Short Text, Document, Product, Scene channels. |
+
+## Tasks (run all eight, in order, on every product)
+
+| # | Task | EchoGuide mode | What success means |
+|---|---|---|---|
+| 1 | Find and press the Start button on a microwave or labelled panel | Find | Finger is on Start and it is pressed |
+| 2 | Find a specific product on a table of five, by its label | Find | Hand is on the right item |
+| 3 | Read the first line of a printed letter | Read | First line read correctly |
+| 4 | Identify a packaged food by its barcode | Find | Product named correctly |
+| 5 | Walk 5 m down a corridor and get warned before a chair in the path | Explore | Warning comes before contact |
+| 6 | Say what is on the table without being asked | Explore | Things named with no prompt |
+| 7 | Describe the room in one request | Describe | Main objects and their positions correct |
+| 8 | Task 1 again in Airplane Mode | Find | Same as task 1 |
+
+## Setup
+
+- The same room, lighting, objects and tester for every product. Randomise product order per tester, so learning does not favour whichever goes last.
+- The tester is blindfolded (or is a blind or low-vision participant, with consent). A second person keeps time and does not help.
+- Start the clock when the tester says "go"; stop at success, or at 120 s (counts as failed).
+
+## What to record (CSV columns)
+
+| Column | Meaning |
+|---|---|
+| `duration_s` | Go to success, or 120 for a fail |
+| `success` | 1 or 0 |
+| `first_cue_ms` | Go to the first useful thing heard or felt |
+| `user_prompts` | Times the tester had to tap, speak, or ask again |
+| `spoken_lines` | Sentences the product spoke (noise if high and unhelpful) |
+| `cloud_calls` | Network requests (EchoGuide counts them; others: 0 if unknown) |
+| `offline` | 1 if the trial ran without a connection |
+
+EchoGuide fills every column itself. For other apps, use **Settings → Add a result from another app**, so all results land in one CSV (**Export CSV**). `scoresheet.csv` is a blank copy for paper.
+
+## How to report
+
+Per task and product, report the success rate, the median time, and the median prompts, with n (number of trials). With fewer than 5 trials per cell, call the result "early" and do not claim significance.
+
+The comparisons this battery is designed to show, if they hold up:
+
+- **Tasks 1, 2 and 4:** guidance onto a control. Others describe or read; they do not lead the finger to a target. Expect EchoGuide to win on success and time.
+- **Tasks 5 and 6:** proactive, with no prompts. Others answer when asked; `user_prompts` shows the difference.
+- **Task 8:** offline. Cloud-first products are expected to fail.
+- **Tasks 3 and 7:** reading and description, where the incumbents are strong. Report these honestly even if EchoGuide loses; that is where the cloud model and photo consent matter.
+
+Also run the on-device speed test (Settings → Measure on-device speed) on the phone used, and report its p50 and p95 next to the task results.
+EOF_AVAE
+
+cat > 'benchmarks/scoresheet.csv' <<'EOF_AVAE'
+product,task,mode,started_at,duration_s,success,first_cue_ms,spoken_lines,user_prompts,cloud_calls,offline,notes
+"EchoGuide","Find and press the Start button on a microwave or labelled panel",find,,,,,,,,,""
+"EchoGuide","Find a specific product on a table of five (by its label)",find,,,,,,,,,""
+"EchoGuide","Read the first line of a printed letter",read,,,,,,,,,""
+"EchoGuide","Identify a packaged food by its barcode",find,,,,,,,,,""
+"EchoGuide","Walk 5 m down a corridor and get warned before a chair in the path",explore,,,,,,,,,""
+"EchoGuide","Say what is on the table without asking a question",explore,,,,,,,,,""
+"EchoGuide","Describe the room in one request",describe,,,,,,,,,""
+"EchoGuide","Same as task 1 in Airplane Mode",find,,,,,,,,,""
+"Google Gemini Guided Vision","Find and press the Start button on a microwave or labelled panel",find,,,,,,,,,""
+"Google Gemini Guided Vision","Find a specific product on a table of five (by its label)",find,,,,,,,,,""
+"Google Gemini Guided Vision","Read the first line of a printed letter",read,,,,,,,,,""
+"Google Gemini Guided Vision","Identify a packaged food by its barcode",find,,,,,,,,,""
+"Google Gemini Guided Vision","Walk 5 m down a corridor and get warned before a chair in the path",explore,,,,,,,,,""
+"Google Gemini Guided Vision","Say what is on the table without asking a question",explore,,,,,,,,,""
+"Google Gemini Guided Vision","Describe the room in one request",describe,,,,,,,,,""
+"Google Gemini Guided Vision","Same as task 1 in Airplane Mode",find,,,,,,,,,""
+"Apple Live Recognition / Point and Speak","Find and press the Start button on a microwave or labelled panel",find,,,,,,,,,""
+"Apple Live Recognition / Point and Speak","Find a specific product on a table of five (by its label)",find,,,,,,,,,""
+"Apple Live Recognition / Point and Speak","Read the first line of a printed letter",read,,,,,,,,,""
+"Apple Live Recognition / Point and Speak","Identify a packaged food by its barcode",find,,,,,,,,,""
+"Apple Live Recognition / Point and Speak","Walk 5 m down a corridor and get warned before a chair in the path",explore,,,,,,,,,""
+"Apple Live Recognition / Point and Speak","Say what is on the table without asking a question",explore,,,,,,,,,""
+"Apple Live Recognition / Point and Speak","Describe the room in one request",describe,,,,,,,,,""
+"Apple Live Recognition / Point and Speak","Same as task 1 in Airplane Mode",find,,,,,,,,,""
+"Be My Eyes (Be My AI)","Find and press the Start button on a microwave or labelled panel",find,,,,,,,,,""
+"Be My Eyes (Be My AI)","Find a specific product on a table of five (by its label)",find,,,,,,,,,""
+"Be My Eyes (Be My AI)","Read the first line of a printed letter",read,,,,,,,,,""
+"Be My Eyes (Be My AI)","Identify a packaged food by its barcode",find,,,,,,,,,""
+"Be My Eyes (Be My AI)","Walk 5 m down a corridor and get warned before a chair in the path",explore,,,,,,,,,""
+"Be My Eyes (Be My AI)","Say what is on the table without asking a question",explore,,,,,,,,,""
+"Be My Eyes (Be My AI)","Describe the room in one request",describe,,,,,,,,,""
+"Be My Eyes (Be My AI)","Same as task 1 in Airplane Mode",find,,,,,,,,,""
+"Microsoft Seeing AI","Find and press the Start button on a microwave or labelled panel",find,,,,,,,,,""
+"Microsoft Seeing AI","Find a specific product on a table of five (by its label)",find,,,,,,,,,""
+"Microsoft Seeing AI","Read the first line of a printed letter",read,,,,,,,,,""
+"Microsoft Seeing AI","Identify a packaged food by its barcode",find,,,,,,,,,""
+"Microsoft Seeing AI","Walk 5 m down a corridor and get warned before a chair in the path",explore,,,,,,,,,""
+"Microsoft Seeing AI","Say what is on the table without asking a question",explore,,,,,,,,,""
+"Microsoft Seeing AI","Describe the room in one request",describe,,,,,,,,,""
+"Microsoft Seeing AI","Same as task 1 in Airplane Mode",find,,,,,,,,,""
 EOF_AVAE
 
 cat > 'plugins/smart_home_server.py' <<'EOF_AVAE'
@@ -5374,6 +7964,69 @@ test('rate limits per device', async () => {
   for (let i = 0; i < 20; i++) last = await post('/v1/chat/completions', { model: 'gpt-4o', messages: [] });
   assert.equal(last.status, 429);
 });
+EOF_AVAE
+
+cat > 'scripts/gen_xcodeproj.py' <<'EOF_AVAE'
+# Owner: Maxwell. Regenerates EchoGuideApp/EchoGuideApp.xcodeproj from the files
+# in EchoGuideApp/Sources. Run from the repo root after adding or removing an
+# app source file: python3 scripts/gen_xcodeproj.py
+import hashlib, os
+
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'EchoGuideApp')
+def oid(name): return hashlib.md5(name.encode()).hexdigest()[:24].upper()
+
+srcs = sorted(f for f in os.listdir(os.path.join(ROOT, 'Sources')) if f.endswith('.swift'))
+P=oid('project'); T=oid('target'); MAIN=oid('maingroup'); SRCG=oid('srcgroup'); RESG=oid('resgroup'); PRODG=oid('prodgroup')
+APP=oid('app.product'); PKG=oid('localpkg'); DEP=oid('pkgdep'); DEPBF=oid('pkgdep.bf')
+SP=oid('sources.phase'); FP=oid('frameworks.phase'); RP=oid('resources.phase')
+PCL=oid('proj.cfglist'); TCL=oid('tgt.cfglist'); PD=oid('proj.debug'); PR=oid('proj.release'); TD=oid('tgt.debug'); TR=oid('tgt.release')
+INFO=oid('info.plist')
+res=[('Assets.xcassets','folder.assetcatalog','Assets.xcassets'),('echoguide.sample.json','text.json','Resources/echoguide.sample.json'),('Models','folder','Resources/Models')]
+L=[]; a=L.append
+a('// !$*UTF8*$!\n{\n\tarchiveVersion = 1;\n\tclasses = {\n\t};\n\tobjectVersion = 60;\n\tobjects = {\n')
+a('\n/* Begin PBXBuildFile section */\n')
+for s in srcs: a(f'\t\t{oid("bf."+s)} /* {s} in Sources */ = {{isa = PBXBuildFile; fileRef = {oid("fr."+s)} /* {s} */; }};\n')
+for n,_,_ in res: a(f'\t\t{oid("bf."+n)} /* {n} in Resources */ = {{isa = PBXBuildFile; fileRef = {oid("fr."+n)} /* {n} */; }};\n')
+a(f'\t\t{DEPBF} /* EchoGuide in Frameworks */ = {{isa = PBXBuildFile; productRef = {DEP} /* EchoGuide */; }};\n')
+a('/* End PBXBuildFile section */\n\n/* Begin PBXFileReference section */\n')
+a(f'\t\t{APP} /* EchoGuideApp.app */ = {{isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = EchoGuideApp.app; sourceTree = BUILT_PRODUCTS_DIR; }};\n')
+for s in srcs: a(f'\t\t{oid("fr."+s)} /* {s} */ = {{isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = {s}; sourceTree = "<group>"; }};\n')
+for n,t,p in res: a(f'\t\t{oid("fr."+n)} /* {n} */ = {{isa = PBXFileReference; lastKnownFileType = {t}; name = {n}; path = {p}; sourceTree = "<group>"; }};\n')
+a(f'\t\t{INFO} /* Info.plist */ = {{isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; }};\n')
+a('/* End PBXFileReference section */\n\n/* Begin PBXFrameworksBuildPhase section */\n')
+a(f'\t\t{FP} /* Frameworks */ = {{\n\t\t\tisa = PBXFrameworksBuildPhase;\n\t\t\tbuildActionMask = 2147483647;\n\t\t\tfiles = (\n\t\t\t\t{DEPBF} /* EchoGuide in Frameworks */,\n\t\t\t);\n\t\t\trunOnlyForDeploymentPostprocessing = 0;\n\t\t}};\n')
+a('/* End PBXFrameworksBuildPhase section */\n\n/* Begin PBXGroup section */\n')
+a(f'\t\t{MAIN} = {{\n\t\t\tisa = PBXGroup;\n\t\t\tchildren = (\n\t\t\t\t{SRCG} /* Sources */,\n\t\t\t\t{RESG} /* Resources */,\n\t\t\t\t{INFO} /* Info.plist */,\n\t\t\t\t{PRODG} /* Products */,\n\t\t\t);\n\t\t\tsourceTree = "<group>";\n\t\t}};\n')
+a(f'\t\t{SRCG} /* Sources */ = {{\n\t\t\tisa = PBXGroup;\n\t\t\tchildren = (\n'+''.join(f'\t\t\t\t{oid("fr."+s)} /* {s} */,\n' for s in srcs)+'\t\t\t);\n\t\t\tpath = Sources;\n\t\t\tsourceTree = "<group>";\n\t\t};\n')
+a(f'\t\t{RESG} /* Resources */ = {{\n\t\t\tisa = PBXGroup;\n\t\t\tchildren = (\n'+''.join(f'\t\t\t\t{oid("fr."+n)} /* {n} */,\n' for n,_,_ in res)+'\t\t\t);\n\t\t\tname = Resources;\n\t\t\tsourceTree = "<group>";\n\t\t};\n')
+a(f'\t\t{PRODG} /* Products */ = {{\n\t\t\tisa = PBXGroup;\n\t\t\tchildren = (\n\t\t\t\t{APP} /* EchoGuideApp.app */,\n\t\t\t);\n\t\t\tname = Products;\n\t\t\tsourceTree = "<group>";\n\t\t}};\n')
+a('/* End PBXGroup section */\n\n/* Begin PBXNativeTarget section */\n')
+a(f'\t\t{T} /* EchoGuideApp */ = {{\n\t\t\tisa = PBXNativeTarget;\n\t\t\tbuildConfigurationList = {TCL} /* Build configuration list for PBXNativeTarget "EchoGuideApp" */;\n\t\t\tbuildPhases = (\n\t\t\t\t{SP} /* Sources */,\n\t\t\t\t{FP} /* Frameworks */,\n\t\t\t\t{RP} /* Resources */,\n\t\t\t);\n\t\t\tbuildRules = (\n\t\t\t);\n\t\t\tdependencies = (\n\t\t\t);\n\t\t\tname = EchoGuideApp;\n\t\t\tpackageProductDependencies = (\n\t\t\t\t{DEP} /* EchoGuide */,\n\t\t\t);\n\t\t\tproductName = EchoGuideApp;\n\t\t\tproductReference = {APP} /* EchoGuideApp.app */;\n\t\t\tproductType = "com.apple.product-type.application";\n\t\t}};\n')
+a('/* End PBXNativeTarget section */\n\n/* Begin PBXProject section */\n')
+a(f'\t\t{P} /* Project object */ = {{\n\t\t\tisa = PBXProject;\n\t\t\tattributes = {{\n\t\t\t\tBuildIndependentTargetsInParallel = 1;\n\t\t\t\tLastSwiftUpdateCheck = 1600;\n\t\t\t\tLastUpgradeCheck = 1600;\n\t\t\t}};\n\t\t\tbuildConfigurationList = {PCL} /* Build configuration list for PBXProject "EchoGuideApp" */;\n\t\t\tcompatibilityVersion = "Xcode 15.0";\n\t\t\tdevelopmentRegion = en;\n\t\t\thasScannedForEncodings = 0;\n\t\t\tknownRegions = (\n\t\t\t\ten,\n\t\t\t\tBase,\n\t\t\t);\n\t\t\tmainGroup = {MAIN};\n\t\t\tpackageReferences = (\n\t\t\t\t{PKG} /* XCLocalSwiftPackageReference ".." */,\n\t\t\t);\n\t\t\tproductRefGroup = {PRODG} /* Products */;\n\t\t\tprojectDirPath = "";\n\t\t\tprojectRoot = "";\n\t\t\ttargets = (\n\t\t\t\t{T} /* EchoGuideApp */,\n\t\t\t);\n\t\t}};\n')
+a('/* End PBXProject section */\n\n/* Begin PBXResourcesBuildPhase section */\n')
+a(f'\t\t{RP} /* Resources */ = {{\n\t\t\tisa = PBXResourcesBuildPhase;\n\t\t\tbuildActionMask = 2147483647;\n\t\t\tfiles = (\n'+''.join(f'\t\t\t\t{oid("bf."+n)} /* {n} in Resources */,\n' for n,_,_ in res)+'\t\t\t);\n\t\t\trunOnlyForDeploymentPostprocessing = 0;\n\t\t};\n')
+a('/* End PBXResourcesBuildPhase section */\n\n/* Begin PBXSourcesBuildPhase section */\n')
+a(f'\t\t{SP} /* Sources */ = {{\n\t\t\tisa = PBXSourcesBuildPhase;\n\t\t\tbuildActionMask = 2147483647;\n\t\t\tfiles = (\n'+''.join(f'\t\t\t\t{oid("bf."+s)} /* {s} in Sources */,\n' for s in srcs)+'\t\t\t);\n\t\t\trunOnlyForDeploymentPostprocessing = 0;\n\t\t};\n')
+a('/* End PBXSourcesBuildPhase section */\n\n/* Begin XCBuildConfiguration section */\n')
+def cfg(i,name,settings):
+    body=''.join(f'\t\t\t\t{k} = {v};\n' for k,v in settings)
+    a(f'\t\t{i} /* {name} */ = {{\n\t\t\tisa = XCBuildConfiguration;\n\t\t\tbuildSettings = {{\n{body}\t\t\t}};\n\t\t\tname = {name};\n\t\t}};\n')
+common=[('ALWAYS_SEARCH_USER_PATHS','NO'),('CLANG_ENABLE_MODULES','YES'),('CLANG_ENABLE_OBJC_ARC','YES'),('ENABLE_STRICT_OBJC_MSGSEND','YES'),('ENABLE_USER_SCRIPT_SANDBOXING','YES'),('GCC_C_LANGUAGE_STANDARD','gnu17'),('IPHONEOS_DEPLOYMENT_TARGET','17.0'),('SDKROOT','iphoneos')]
+cfg(PD,'Debug',common+[('DEBUG_INFORMATION_FORMAT','dwarf'),('ENABLE_TESTABILITY','YES'),('GCC_OPTIMIZATION_LEVEL','0'),('ONLY_ACTIVE_ARCH','YES'),('SWIFT_ACTIVE_COMPILATION_CONDITIONS','"DEBUG $(inherited)"'),('SWIFT_OPTIMIZATION_LEVEL','"-Onone"')])
+cfg(PR,'Release',common+[('DEBUG_INFORMATION_FORMAT','"dwarf-with-dsym"'),('SWIFT_COMPILATION_MODE','wholemodule'),('VALIDATE_PRODUCT','YES')])
+tgt=[('ASSETCATALOG_COMPILER_APPICON_NAME','AppIcon'),('CODE_SIGN_STYLE','Automatic'),('CURRENT_PROJECT_VERSION','1'),('DEVELOPMENT_TEAM','""'),('EG_PROXY_BASE_URL','""'),('GENERATE_INFOPLIST_FILE','YES'),('INFOPLIST_FILE','Info.plist'),('LD_RUNPATH_SEARCH_PATHS','"$(inherited) @executable_path/Frameworks"'),('MARKETING_VERSION','0.1.0'),('PRODUCT_BUNDLE_IDENTIFIER','app.echoguide.EchoGuide'),('PRODUCT_NAME','"$(TARGET_NAME)"'),('SWIFT_EMIT_LOC_STRINGS','YES'),('SWIFT_VERSION','5.0'),('TARGETED_DEVICE_FAMILY','1')]
+cfg(TD,'Debug',tgt); cfg(TR,'Release',tgt)
+a('/* End XCBuildConfiguration section */\n\n/* Begin XCConfigurationList section */\n')
+for i,n,d,r in [(PCL,'PBXProject "EchoGuideApp"',PD,PR),(TCL,'PBXNativeTarget "EchoGuideApp"',TD,TR)]:
+    a(f'\t\t{i} /* Build configuration list for {n} */ = {{\n\t\t\tisa = XCConfigurationList;\n\t\t\tbuildConfigurations = (\n\t\t\t\t{d} /* Debug */,\n\t\t\t\t{r} /* Release */,\n\t\t\t);\n\t\t\tdefaultConfigurationIsVisible = 0;\n\t\t\tdefaultConfigurationName = Release;\n\t\t}};\n')
+a('/* End XCConfigurationList section */\n\n/* Begin XCLocalSwiftPackageReference section */\n')
+a(f'\t\t{PKG} /* XCLocalSwiftPackageReference ".." */ = {{\n\t\t\tisa = XCLocalSwiftPackageReference;\n\t\t\trelativePath = ..;\n\t\t}};\n')
+a('/* End XCLocalSwiftPackageReference section */\n\n/* Begin XCSwiftPackageProductDependency section */\n')
+a(f'\t\t{DEP} /* EchoGuide */ = {{\n\t\t\tisa = XCSwiftPackageProductDependency;\n\t\t\tproductName = EchoGuide;\n\t\t}};\n')
+a('/* End XCSwiftPackageProductDependency section */\n\t};\n'+f'\trootObject = {P} /* Project object */;\n}}\n')
+open(os.path.join(ROOT,'EchoGuideApp.xcodeproj/project.pbxproj'),'w').write(''.join(L))
+print(f"wrote project with {len(srcs)} sources")
 EOF_AVAE
 
 cat > 'scripts/regen_setup.py' <<'EOF_AVAE'

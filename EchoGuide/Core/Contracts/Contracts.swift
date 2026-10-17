@@ -167,12 +167,19 @@ public struct ReasoningQuery: Sendable {
     public var localConfidence: Float
     /// JPEG of the triggering frame. Only sent to the cloud with consent.
     public var jpeg: Data?
+    /// Answer length: 8 for a spoken step, ~35 for a scene description.
+    public var maxWords: Int
+    /// Overrides the router's default deadline (an image description needs longer).
+    public var timeout: TimeInterval?
 
-    public init(question: String, detections: [Detection], localConfidence: Float, jpeg: Data? = nil) {
+    public init(question: String, detections: [Detection], localConfidence: Float, jpeg: Data? = nil,
+                maxWords: Int = 8, timeout: TimeInterval? = nil) {
         self.question = question
         self.detections = detections
         self.localConfidence = localConfidence
         self.jpeg = jpeg
+        self.maxWords = maxWords
+        self.timeout = timeout
     }
 }
 

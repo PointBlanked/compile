@@ -10,6 +10,8 @@
 	<string>EchoGuide watches through the camera to find the one thing you need and guide your hand to it.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>If you turn on voice, EchoGuide listens for requests like "find the start button".</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>EchoGuide turns what you say, like "find the start button", into what to look for. Speech is understood on your phone.</string>
 	<key>UIRequiredDeviceCapabilities</key>
 	<array>
 		<string>arm64</string>

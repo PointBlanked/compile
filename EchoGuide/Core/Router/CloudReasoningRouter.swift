@@ -61,7 +61,7 @@ public actor CloudReasoningRouter: ReasoningRouting {
 
         calls += 1
         let includeImage = config.imageConsent && query.jpeg != nil
-        let timeout = config.timeout
+        let timeout = query.timeout ?? config.timeout
         do {
             let text = try await withThrowingTaskGroup(of: String.self) { group in
                 group.addTask { try await provider.answer(query, includeImage: includeImage) }
@@ -130,7 +130,7 @@ public struct GeminiProvider: ReasoningProvider {
         }
         let body: [String: Any] = [
             "contents": [["role": "user", "parts": parts]],
-            "generationConfig": ["maxOutputTokens": 40, "temperature": 0.2],
+            "generationConfig": ["maxOutputTokens": max(40, q.maxWords * 3), "temperature": 0.2],
         ]
         let url = proxyBase.appendingPathComponent("v1beta/models/\(model):generateContent")
         let json = try await transport.postJSON(url, body: body, bearer: await deviceToken())
@@ -162,7 +162,7 @@ public struct OpenAIProvider: ReasoningProvider {
         if includeImage, let jpeg = q.jpeg {
             content.append(["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(jpeg.base64EncodedString())", "detail": "low"]])
         }
-        let body: [String: Any] = ["model": model, "max_tokens": 40, "temperature": 0.2, "messages": [["role": "user", "content": content]]]
+        let body: [String: Any] = ["model": model, "max_tokens": max(40, q.maxWords * 3), "temperature": 0.2, "messages": [["role": "user", "content": content]]]
         let json = try await transport.postJSON(proxyBase.appendingPathComponent("v1/chat/completions"), body: body, bearer: await deviceToken())
         let choices = json["choices"] as? [[String: Any]]
         let message = choices?.first?["message"] as? [String: Any]
@@ -175,10 +175,13 @@ enum Prompt {
         let seen = q.detections.map { d in
             "\(d.kind == .text ? "text \"\(d.text ?? "")\"" : d.label) (\(Int(d.confidence * 100))%)"
         }.joined(separator: ", ")
+        let length = q.maxWords <= 12
+            ? "Answer in one short plain sentence, no lists, under \(q.maxWords) words."
+            : "Answer in at most three short plain sentences, under \(q.maxWords) words, most important first. Say where things are (left, ahead, right) and mention anything hazardous."
         return """
-        You guide a blind or cognitively impaired person, one step at a time. \
-        On-device vision saw: \(seen). \(q.question) \
-        Answer in one short plain sentence, no lists, under eight words.
+        You are the eyes of a blind or low-vision person holding a phone camera. \
+        On-device vision saw: \(seen.isEmpty ? "nothing it recognises" : seen). \(q.question) \
+        \(length) Never guess at text you cannot read.
         """
     }
 }
