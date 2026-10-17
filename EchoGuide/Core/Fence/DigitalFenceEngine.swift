@@ -49,34 +49,61 @@ public struct SpatialFence: Sendable {
     ])
 
     /// Evaluate one frame. `handDepth` and `zoneDepth` are metres from LiDAR,
-    /// nil when unknown (then the 2-D test alone decides). Returns the most
-    /// severe event: a breach beats an approach.
+    /// nil when unknown (then the 2-D test alone decides). One `zoneDepth`
+    /// applies to every zone; use `evaluate(_:depth:)` to sample each zone.
+    /// Returns the most severe event: a breach beats an approach.
     public func evaluate(_ frame: VisionFrameResult, handDepth: Float? = nil, zoneDepth: Float? = nil) -> FenceEvent? {
         guard let tip = frame.fingertip?.box.mid else { return nil }
+        let gap: Float? = {
+            guard let h = handDepth, let z = zoneDepth else { return nil }
+            return abs(z - h)
+        }()
+        return resolve(tip: tip, candidates: candidates(in: frame).map { ($0.zone, $0.rect, gap) })
+    }
+
+    /// Evaluate one frame against a live depth source (LiDAR). The hand and
+    /// the centre of every zone rect are sampled, so a hob at 1.2 m and a
+    /// knife at 0.4 m each get their own distance to the hand. A zone whose
+    /// depth is unknown falls back to the 2-D test.
+    public func evaluate(_ frame: VisionFrameResult, depth: DepthProviding?) async -> FenceEvent? {
+        guard let tip = frame.fingertip?.box.mid else { return nil }
+        let pairs = candidates(in: frame)
+        guard let depth, !pairs.isEmpty, let hand = await depth.depth(at: tip) else {
+            return resolve(tip: tip, candidates: pairs.map { ($0.zone, $0.rect, nil) })
+        }
+        var withGap: [(SpatialFenceZone, ImageRect, Float?)] = []
+        withGap.reserveCapacity(pairs.count)
+        for (zone, rect) in pairs {
+            let z = await depth.depth(at: rect.mid)
+            withGap.append((zone, rect, z.map { abs($0 - hand) }))
+        }
+        return resolve(tip: tip, candidates: withGap)
+    }
+
+    private func candidates(in frame: VisionFrameResult) -> [(zone: SpatialFenceZone, rect: ImageRect)] {
+        zones.flatMap { zone in rects(for: zone, in: frame).map { (zone, $0) } }
+    }
+
+    /// `candidates` carries each zone rect with the hand-to-zone depth gap in
+    /// metres (nil when unknown).
+    private func resolve(tip: ImagePoint, candidates: [(SpatialFenceZone, ImageRect, Float?)]) -> FenceEvent? {
         var approaching: FenceEvent?
 
-        for zone in zones {
-            for rect in rects(for: zone, in: frame) {
-                let depthGap: Float? = {
-                    guard let h = handDepth, let z = zoneDepth else { return nil }
-                    return abs(z - h)
-                }()
-
-                if rect.contains(tip) {
-                    // Overlapping in 2-D but clearly far apart in depth is not contact.
-                    if let gap = depthGap, gap > zone.warningDepthMetres {
-                        approaching = approaching ?? .approaching(zone: zone.name, metres: gap)
-                        continue
-                    }
-                    return .breached(zone: zone.name)
+        for (zone, rect, depthGap) in candidates {
+            if rect.contains(tip) {
+                // Overlapping in 2-D but clearly far apart in depth is not contact.
+                if let gap = depthGap, gap > zone.warningDepthMetres {
+                    approaching = approaching ?? .approaching(zone: zone.name, metres: gap)
+                    continue
                 }
+                return .breached(zone: zone.name)
+            }
 
-                let m = zone.warningMargin
-                let warn = ImageRect(x: rect.x - m, y: rect.y - m, width: rect.width + 2 * m, height: rect.height + 2 * m)
-                if warn.contains(tip), approaching == nil {
-                    if let gap = depthGap, gap > zone.warningDepthMetres { continue }
-                    approaching = .approaching(zone: zone.name, metres: depthGap)
-                }
+            let m = zone.warningMargin
+            let warn = ImageRect(x: rect.x - m, y: rect.y - m, width: rect.width + 2 * m, height: rect.height + 2 * m)
+            if warn.contains(tip), approaching == nil {
+                if let gap = depthGap, gap > zone.warningDepthMetres { continue }
+                approaching = .approaching(zone: zone.name, metres: depthGap)
             }
         }
         return approaching
@@ -131,16 +158,24 @@ public struct SafeArea: Sendable, Equatable, Codable {
 public struct LocationFence: Sendable {
     public var areas: [SafeArea]
     /// Must be outside every area for this long before `leftSafeArea` fires.
-    public var exitDwell: TimeInterval = 45
+    public var exitDwell: TimeInterval
     /// Fixes worse than this are ignored (indoor GPS can be 100 m+ off).
-    public var maxAccuracyMetres: Double = 65
+    public var maxAccuracyMetres: Double
 
-    private(set) var insideArea: String?
+    /// Name of the area the last good fix was inside, nil when outside all.
+    public private(set) var insideArea: String?
     private var outsideSince: TimeInterval?
     private var reportedExit = false
     private var lastArea: String?
 
-    public init(areas: [SafeArea]) { self.areas = areas }
+    /// True once an exit has been reported and not yet cancelled by a return.
+    public var isOutside: Bool { reportedExit }
+
+    public init(areas: [SafeArea], exitDwell: TimeInterval = 45, maxAccuracyMetres: Double = 65) {
+        self.areas = areas
+        self.exitDwell = exitDwell
+        self.maxAccuracyMetres = maxAccuracyMetres
+    }
 
     public mutating func update(_ c: GeoCoordinate, accuracyMetres: Double, at t: TimeInterval) -> FenceEvent? {
         guard accuracyMetres <= maxAccuracyMetres else { return nil }

@@ -35,8 +35,17 @@ The split follows the pipeline: Maxwell owns everything up to "a detection with 
 
 There are two layers. Each one only reports a `FenceEvent`, and `AutomationEngine` decides how the user hears or feels it.
 
-- **Spatial fence:** hazard zones the camera can see, such as the hob or a knife. A zone follows a detected label or covers a fixed part of the frame. When the fingertip comes near a zone, the user gets "Careful" and a warning pulse. When it enters the zone, they get "Stop" and the warning preempts all other guidance. If LiDAR is available, its depth reading rules out cases where the hand only overlaps the zone on screen but is not near it.
-- **Location fence:** safe areas for dementia wandering. A position must stay outside the area for 45 s before it counts as leaving, and fixes with poor accuracy are ignored. The event is reported once, and a `notify_caregiver` MCP tool is called if one is registered.
+- **Spatial fence:** hazard zones the camera can see, such as the hob or a knife. A zone follows a detected label or covers a fixed part of the frame. When the fingertip comes near a zone, the user gets "Careful" and a warning pulse. When it enters the zone, they get "Stop", the warning preempts all other guidance, and any dwell in progress is cancelled so a physical tool cannot fire straight after a hazard. If LiDAR is available, `SpatialFence.evaluate(_:depth:)` samples the hand and the centre of every zone through `DepthProviding`, so a hob at 1.2 m and a knife at 0.4 m each get their own distance; a hand that only overlaps a zone on screen is an approach, not a breach.
+- **Location fence:** safe areas for dementia wandering. A position must stay outside the area for 45 s before it counts as leaving, and fixes with poor accuracy are ignored. The event is reported once, and a `notify_caregiver` MCP tool is called if one is registered. The engine enters `outsideSafeArea`, which camera frames do not clear; only `returnedToSafeArea` does, and a paused engine stays paused.
+
+## Automation (Bryan)
+
+`AutomationEngine` runs `scanning -> guiding -> onTarget -> completed -> scanning`. Details that matter for the demo:
+
+- A target that drops out of the frame keeps its last haptic cue for `lostTargetTimeout` (1.2 s), then haptics stop and the engine goes back to scanning. It never announces, confirms or completes against a remembered box.
+- A finished target is excluded for `completedCooldown` (8 s), so "done" moves on to the next step instead of guiding the finger back to the same button.
+- On target, the guidance pulse train stops and a double tap plays once; hovering does not buzz.
+- `GuidanceView` shows the step huge and yellow on black, a second line for carers ("Hold still", "Follow the pulses"), a goal field, and one big Pause/Resume button.
 
 ## Targets
 
@@ -59,7 +68,7 @@ Read these honestly:
 ## Build
 
 ```bash
-swift build && swift test        # macOS host: pure logic, 36 tests
+swift build && swift test        # macOS host: pure logic, 53 tests
 ```
 
 The iOS-only paths (ARKit, the camera, the haptic actuator) are behind `#if canImport(...) && os(iOS)`. The `ios-build` CI job compiles them with `xcodebuild` for the iOS Simulator. Real latency numbers need a device.

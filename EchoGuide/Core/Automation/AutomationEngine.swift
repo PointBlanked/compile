@@ -18,7 +18,10 @@ public enum AutomationState: Sendable, Equatable {
     case guiding(ActionStep)
     case onTarget(ActionStep)
     case completed(String)
+    /// Hand inside a spatial hazard zone.
     case warning(String)
+    /// User has walked out of a safe location region (dementia wandering).
+    case outsideSafeArea(String)
 }
 
 public struct AutomationConfig: Sendable {
@@ -33,6 +36,9 @@ public struct AutomationConfig: Sendable {
     /// Directional ping cadence while the target is off to one side.
     public var pingInterval: TimeInterval = 0.9
     public var fenceWarningInterval: TimeInterval = 3
+    /// A finished target is off the menu for this long, so "done" moves on to
+    /// the next step instead of guiding the finger back to the same button.
+    public var completedCooldown: TimeInterval = 8
 
     public init() {}
 }
@@ -53,7 +59,7 @@ public actor AutomationEngine {
     private var lastPingAt: TimeInterval = -.infinity
     private var lastSeenAt: TimeInterval = -.infinity
     private var onTargetSince: TimeInterval?
-    private var completedLabel: String?
+    private var completedUntil: [String: TimeInterval] = [:]
     private var lastFenceWarning: [String: TimeInterval] = [:]
     private var routedLabels: Set<String> = []
     private var continuations: [UUID: AsyncStream<AutomationState>.Continuation] = [:]
@@ -92,14 +98,29 @@ public actor AutomationEngine {
     public func setGoal(_ goal: String?) {
         isolation.goal = goal
         isolation.reset()
-        completedLabel = nil
+        completedUntil = [:]
+        lastSpokenLabel = nil
+        onTargetSince = nil
     }
 
-    public func start() { transition(.scanning) }
+    public var goal: String? { isolation.goal }
+
+    public func start() {
+        forgetTarget()
+        transition(.scanning)
+    }
 
     public func stop() async {
+        forgetTarget()
         transition(.idle)
         await haptics.stop()
+    }
+
+    private func forgetTarget() {
+        isolation.reset()
+        onTargetSince = nil
+        lastSpokenLabel = nil
+        lastSeenAt = -.infinity
     }
 
     // MARK: - Input
@@ -109,25 +130,33 @@ public actor AutomationEngine {
         let now = frame.timestamp
 
         if let fence, await handle(fence, at: now) { return }
+        // Wandering outside the safe area is cleared only by coming back.
+        if case .outsideSafeArea = state { return }
 
-        guard let step = isolation.isolate(frame) else {
+        // Recently finished targets are off the menu; prune expired ones.
+        completedUntil = completedUntil.filter { $0.value > now }
+        let excluded = Set(completedUntil.keys)
+        if excluded != isolation.excludedLabels { isolation.excludedLabels = excluded }
+
+        let step = isolation.isolate(frame)
+        if step != nil, isolation.isCurrentVisible { lastSeenAt = now }
+
+        // Nothing settled, or the settled target has not been seen for a while.
+        guard let step, isolation.isCurrentVisible || now - lastSeenAt <= config.lostTargetTimeout else {
             if now - lastSeenAt > config.lostTargetTimeout, state != .scanning {
+                // Drop only a remembered target; a challenger still settling
+                // keeps its frame count (frames are sparse in a still scene).
+                if step != nil { isolation.reset() }
                 onTargetSince = nil
+                lastSpokenLabel = nil
                 await haptics.stop()
                 transition(.scanning)
             }
             return
         }
-        lastSeenAt = now
-
-        // Finished target stays finished until the finger moves off it.
-        if step.targetLabel == completedLabel {
-            if case .align(let dx, let dy) = step.guidance, (dx * dx + dy * dy).squareRoot() > Alignment.tolerance * 3 {
-                completedLabel = nil
-            } else {
-                return
-            }
-        }
+        // The target dropped out of this frame: keep the last cue going, but
+        // do not announce, confirm or complete against a remembered box.
+        guard isolation.isCurrentVisible else { return }
 
         await announceIfNeeded(step, at: now)
 
@@ -156,7 +185,7 @@ public actor AutomationEngine {
         transition(.onTarget(step))
 
         if let since = onTargetSince, now - since >= config.dwellToConfirm {
-            await complete(step)
+            await complete(step, at: now)
         }
     }
 
@@ -190,9 +219,11 @@ public actor AutomationEngine {
         await audio.speak(sentence, azimuth: azimuth)
     }
 
-    private func complete(_ step: ActionStep) async {
+    private func complete(_ step: ActionStep, at now: TimeInterval) async {
         onTargetSince = nil
-        completedLabel = step.targetLabel
+        completedUntil[step.targetLabel] = now + config.completedCooldown
+
+        await haptics.stop()
 
         guard let target = step.target, let tools, let match = await tools.match(target) else {
             transition(.completed(step.targetLabel))
@@ -207,7 +238,6 @@ public actor AutomationEngine {
             await audio.speak("That did not work.", azimuth: 0)
             transition(.completed(step.targetLabel))
         }
-        await haptics.stop()
     }
 
     // MARK: - Fence
@@ -216,6 +246,9 @@ public actor AutomationEngine {
     private func handle(_ event: FenceEvent, at now: TimeInterval) async -> Bool {
         switch event {
         case .breached(let zone):
+            // A hazard cancels any dwell in progress: the finger must settle on
+            // the target again, from scratch, before a physical tool can fire.
+            onTargetSince = nil
             await haptics.warn()
             if throttle(zone, at: now) { await audio.speak("Stop. \(zone.capitalizedFirst).", azimuth: 0) }
             transition(.warning(zone))
@@ -233,11 +266,12 @@ public actor AutomationEngine {
                 told = (try? await tools.invoke(alert)) != nil
             }
             await audio.speak(told ? "You have left \(region). Your carer has been told." : "You have left \(region).", azimuth: 0)
-            transition(.warning(region))
+            transition(.outsideSafeArea(region))
             return true
         case .returnedToSafeArea(let region):
             await audio.speak("You are back at \(region).", azimuth: 0)
-            transition(.scanning)
+            // Only the wandering alert is cleared; a paused engine stays paused.
+            if case .outsideSafeArea = state { transition(.scanning) }
             return false
         }
     }

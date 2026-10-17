@@ -28,10 +28,23 @@ public struct CognitiveTaskIsolation: Sendable {
     public var config: CognitiveConfig
     /// When set, only matching labels or text are eligible ("start", "microwave").
     public var goal: String?
+    /// Labels temporarily off the menu, e.g. a target the user just finished.
+    /// AutomationEngine sets this so "done" moves on to the next step instead
+    /// of guiding the finger straight back to the same button.
+    public var excludedLabels: Set<String> = [] {
+        didSet {
+            if let cur = current, excludedLabels.contains(cur.label) { current = nil }
+            if let c = candidate, excludedLabels.contains(c.label) { candidate = nil; candidateFrames = 0 }
+        }
+    }
 
     private var current: Detection?
     private var candidate: Detection?
     private var candidateFrames = 0
+    /// True when the step returned by the last `isolate` came from a detection
+    /// in that frame; false when it is the remembered target of an earlier
+    /// frame. The caller uses this to time out a target that has gone away.
+    public private(set) var isCurrentVisible = false
 
     public init(config: CognitiveConfig = CognitiveConfig(), goal: String? = nil) {
         self.config = config
@@ -42,12 +55,14 @@ public struct CognitiveTaskIsolation: Sendable {
         current = nil
         candidate = nil
         candidateFrames = 0
+        isCurrentVisible = false
     }
 
     /// The one step for this frame, or nil when nothing is settled yet.
     public mutating func isolate(_ frame: VisionFrameResult) -> ActionStep? {
         let anchor = frame.fingertip?.box.mid ?? .center
         let eligible = frame.targets.filter(isEligible)
+        isCurrentVisible = false
         guard let best = eligible.max(by: { score($0, anchor: anchor) < score($1, anchor: anchor) }) else {
             candidate = nil
             candidateFrames = 0
@@ -60,6 +75,7 @@ public struct CognitiveTaskIsolation: Sendable {
         // best rival is clearly better.
         if let cur = current, let refreshed = eligible.first(where: { isSame($0, cur) }) {
             current = refreshed
+            isCurrentVisible = true
             let rivalWins = !isSame(best, refreshed)
                 && score(best, anchor: anchor) > score(refreshed, anchor: anchor) * config.switchMargin
             if !rivalWins {
@@ -73,13 +89,13 @@ public struct CognitiveTaskIsolation: Sendable {
         if let c = candidate, isSame(c, best) {
             candidateFrames += 1
         } else {
-            candidate = best
             candidateFrames = 1
         }
         candidate = best
 
-        if candidateFrames >= config.settleFrames || current == nil && config.settleFrames <= 1 {
+        if candidateFrames >= config.settleFrames {
             current = best
+            isCurrentVisible = true
             candidate = nil
             candidateFrames = 0
         }
@@ -97,7 +113,7 @@ public struct CognitiveTaskIsolation: Sendable {
     }
 
     private func isEligible(_ d: Detection) -> Bool {
-        if config.ignoredLabels.contains(d.label) { return false }
+        if config.ignoredLabels.contains(d.label) || excludedLabels.contains(d.label) { return false }
         if let goal { return matches(d, goal) }
         return true
     }

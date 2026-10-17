@@ -49,11 +49,15 @@ public actor SpatialHapticEngine: HapticCueing {
     private var engine: CHHapticEngine?
     private var loop: Task<Void, Never>?
     private var current: HapticPulse?
-    private var lastConfirm: TimeInterval = 0
+    private var lastConfirm: Double = -.infinity
+    private let clock = FrameTimer()
 
     public init() {}
 
     public var isSupported: Bool { CHHapticEngine.capabilitiesForHardware().supportsHaptics }
+
+    /// True while the guidance pulse train is running (for telemetry and tests).
+    public var isGuiding: Bool { current != nil }
 
     private func ensureEngine() throws -> CHHapticEngine? {
         guard isSupported else { return nil }
@@ -83,9 +87,11 @@ public actor SpatialHapticEngine: HapticCueing {
     }
 
     public func confirm() async {
+        // On target: the guidance train stops, whoever called us.
+        current = nil
         // Debounce: hovering on target should not buzz continuously.
-        let now = Date().timeIntervalSince1970
-        guard now - lastConfirm > 1.0 else { return }
+        let now = clock.elapsedMs
+        guard now - lastConfirm > 1_000 else { return }
         lastConfirm = now
         play([(0, 1.0, 0.9), (0.09, 1.0, 0.9)])
     }
@@ -117,7 +123,12 @@ public actor SpatialHapticEngine: HapticCueing {
         return p
     }
 
-    private func loopEnded() { loop = nil }
+    private func loopEnded() {
+        loop = nil
+        // A guide() that landed between the loop's last tick and this call
+        // would otherwise wait for the next frame; pick it up now.
+        if current != nil { startLoop() }
+    }
 
     /// (relativeTime, intensity, sharpness) transients.
     private func play(_ events: [(TimeInterval, Float, Float)]) {

@@ -30,20 +30,29 @@ public actor SpatialAudioEngine: SpatialAudioCueing {
     private let synth = AVSpeechSynthesizer()
     private let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)!
     private var pingBuffer: AVAudioPCMBuffer?
+    private var wired = false
     private var started = false
+    private var observers: [NSObjectProtocol] = []
 
     public init() {}
 
+    /// Builds the graph once; (re)starts the engine whenever it is down.
+    /// A phone call, a route change (headphones out) or backgrounding stops
+    /// AVAudioEngine; the next cue brings it back instead of going silent.
     private func startIfNeeded() {
-        guard !started else { return }
-        engine.attach(environment)
-        engine.attach(player)
-        // Mono source into the environment node is what makes it positional.
-        engine.connect(player, to: environment, format: format)
-        engine.connect(environment, to: engine.mainMixerNode, format: nil)
-        player.renderingAlgorithm = .auto
-        environment.listenerPosition = AVAudio3DPoint(x: 0, y: 0, z: 0)
-        pingBuffer = Self.makePing(format: format)
+        if !wired {
+            engine.attach(environment)
+            engine.attach(player)
+            // Mono source into the environment node is what makes it positional.
+            engine.connect(player, to: environment, format: format)
+            engine.connect(environment, to: engine.mainMixerNode, format: nil)
+            player.renderingAlgorithm = .auto
+            environment.listenerPosition = AVAudio3DPoint(x: 0, y: 0, z: 0)
+            pingBuffer = Self.makePing(format: format)
+            observeInterruptions()
+            wired = true
+        }
+        guard !started || !engine.isRunning else { return }
         do {
             #if os(iOS)
             let s = AVAudioSession.sharedInstance()
@@ -59,12 +68,33 @@ public actor SpatialAudioEngine: SpatialAudioCueing {
         }
     }
 
+    private func observeInterruptions() {
+        let center = NotificationCenter.default
+        var names: [Notification.Name] = [.AVAudioEngineConfigurationChange]
+        #if os(iOS)
+        names += [AVAudioSession.interruptionNotification, AVAudioSession.routeChangeNotification]
+        #endif
+        for name in names {
+            observers.append(center.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
+                Task { await self?.markStopped() }
+            })
+        }
+    }
+
+    private func markStopped() { started = false }
+
     public func ping(azimuth: Float, elevation: Float) async {
         startIfNeeded()
         guard started, let pingBuffer else { return }
         let p = SpatialAudioMath.position(azimuth: azimuth, elevation: elevation)
         player.position = AVAudio3DPoint(x: p.x, y: p.y, z: p.z)
-        player.scheduleBuffer(pingBuffer, at: nil, options: .interrupts, completionHandler: nil)
+        schedule(pingBuffer)
+    }
+
+    /// Synchronous on purpose: the async `scheduleBuffer` variant would hold
+    /// the actor until the buffer has played.
+    private func schedule(_ buffer: AVAudioPCMBuffer) {
+        player.scheduleBuffer(buffer, at: nil, options: .interrupts, completionHandler: nil)
     }
 
     public func speak(_ text: String, azimuth: Float) async {
