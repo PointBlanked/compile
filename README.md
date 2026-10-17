@@ -1,13 +1,13 @@
 # EchoGuide
 
+> **Development build — for experimental software testing and demos only.** EchoGuide is still in development and must not be used for medical testing, diagnosis, treatment, or any other medical purpose. It is not a medical device and is not FDA approved. Do not rely on it for real-world navigation, personal safety, or other serious or consequential decisions. Its outputs and actions may be incorrect or unreliable, and it is not a substitute for established assistive tools or professional care.
+
 **A real-time, multimodal visual agent for blind and low-vision people.** It watches through the phone camera continuously, reasons about what matters, and acts on its own: it names what comes into view, warns before you walk into something, reads what's in front of you, and guides your finger onto the exact button you need, then presses it. It runs on the phone, works in Airplane Mode, and needs no screen.
 
 [![swift-ci](https://github.com/PointBlanked/compile/actions/workflows/swift-ci.yml/badge.svg)](https://github.com/PointBlanked/compile/actions/workflows/swift-ci.yml)
 ![tests](https://img.shields.io/badge/tests-112%20passing-brightgreen)
 ![platform](https://img.shields.io/badge/iOS-17%2B-black)
 ![on-device](https://img.shields.io/badge/runs-on--device%20%C2%B7%20offline-yellow)
-
-> Not a medical device and not FDA approved. Currently for testing only.
 
 ## The problem
 
