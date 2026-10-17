@@ -89,7 +89,7 @@ cat > '.github/workflows/ios-release.yml' <<'EOF_AVAE'
 #   ASC_ISSUER_ID        issuer id
 #   ASC_KEY_P8_BASE64    base64 of the AuthKey_XXXX.p8 file
 #   EG_PROXY_BASE_URL    deployed proxy URL baked into the build (optional)
-# The bundle id app.echoguide.EchoGuide must exist in App Store Connect.
+# The bundle id you pass must match an app record in App Store Connect.
 
 name: ios-release
 
@@ -99,6 +99,11 @@ on:
       build_number:
         description: "Build number (must increase every upload)"
         required: true
+        default: "1"
+      bundle_id:
+        description: "Bundle ID of the App Store Connect app record"
+        required: true
+        default: "app.echoguide.EchoGuide"
 
 jobs:
   testflight:
@@ -142,6 +147,7 @@ jobs:
             -authenticationKeyIssuerID "${{ secrets.ASC_ISSUER_ID }}" \
             DEVELOPMENT_TEAM="${{ secrets.APPLE_TEAM_ID }}" \
             CURRENT_PROJECT_VERSION="${{ inputs.build_number }}" \
+            PRODUCT_BUNDLE_IDENTIFIER="${{ inputs.bundle_id }}" \
             EG_PROXY_BASE_URL="${{ secrets.EG_PROXY_BASE_URL }}" | tail -n 60
           exit ${PIPESTATUS[0]}
 
