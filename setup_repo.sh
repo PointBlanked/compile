@@ -135,6 +135,7 @@ jobs:
 
       - name: Archive
         run: |
+          status=0
           xcodebuild archive \
             -project EchoGuideApp/EchoGuideApp.xcodeproj \
             -scheme EchoGuideApp \
@@ -148,8 +149,7 @@ jobs:
             DEVELOPMENT_TEAM="${{ secrets.APPLE_TEAM_ID }}" \
             CURRENT_PROJECT_VERSION="${{ inputs.build_number }}" \
             PRODUCT_BUNDLE_IDENTIFIER="${{ inputs.bundle_id }}" \
-            EG_PROXY_BASE_URL="${{ secrets.EG_PROXY_BASE_URL }}" > archive.log 2>&1
-          status=$?
+            EG_PROXY_BASE_URL="${{ secrets.EG_PROXY_BASE_URL }}" > archive.log 2>&1 || status=$?
           grep -E "error:" archive.log | sort -u | head -60 || true
           tail -n 25 archive.log
           exit $status
@@ -235,13 +235,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build app for iOS Simulator
         run: |
+          status=0
           xcodebuild build \
             -project EchoGuideApp/EchoGuideApp.xcodeproj \
             -scheme EchoGuideApp \
             -destination 'generic/platform=iOS Simulator' \
             -skipPackagePluginValidation \
-            CODE_SIGNING_ALLOWED=NO > build.log 2>&1
-          status=$?
+            CODE_SIGNING_ALLOWED=NO > build.log 2>&1 || status=$?
           grep -E "error:|warning: .*will be an error" build.log | sort -u | head -60 || true
           tail -n 15 build.log
           exit $status
@@ -821,6 +821,22 @@ public struct TrialResult: Sendable, Codable, Equatable {
     public var cloudCalls: Int
     public var offline: Bool
     public var notes: String
+
+    public init(product: String, task: String, mode: String, startedAt: Date, durationS: Double, success: Bool,
+                firstCueMs: Double?, spokenLines: Int, userPrompts: Int, cloudCalls: Int, offline: Bool, notes: String) {
+        self.product = product
+        self.task = task
+        self.mode = mode
+        self.startedAt = startedAt
+        self.durationS = durationS
+        self.success = success
+        self.firstCueMs = firstCueMs
+        self.spokenLines = spokenLines
+        self.userPrompts = userPrompts
+        self.cloudCalls = cloudCalls
+        self.offline = offline
+        self.notes = notes
+    }
 
     public static let csvHeader = "product,task,mode,started_at,duration_s,success,first_cue_ms,spoken_lines,user_prompts,cloud_calls,offline,notes"
 

@@ -24,6 +24,22 @@ public struct TrialResult: Sendable, Codable, Equatable {
     public var offline: Bool
     public var notes: String
 
+    public init(product: String, task: String, mode: String, startedAt: Date, durationS: Double, success: Bool,
+                firstCueMs: Double?, spokenLines: Int, userPrompts: Int, cloudCalls: Int, offline: Bool, notes: String) {
+        self.product = product
+        self.task = task
+        self.mode = mode
+        self.startedAt = startedAt
+        self.durationS = durationS
+        self.success = success
+        self.firstCueMs = firstCueMs
+        self.spokenLines = spokenLines
+        self.userPrompts = userPrompts
+        self.cloudCalls = cloudCalls
+        self.offline = offline
+        self.notes = notes
+    }
+
     public static let csvHeader = "product,task,mode,started_at,duration_s,success,first_cue_ms,spoken_lines,user_prompts,cloud_calls,offline,notes"
 
     public var csvRow: String {
