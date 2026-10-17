@@ -10,3 +10,4 @@ __pycache__/
 # local YOLO export scratch
 yolo/
 *.pt
+yolo-export/
