@@ -177,10 +177,14 @@ public struct ReasoningQuery: Sendable {
     public var maxWords: Int
     /// Overrides the router's default deadline (an image description needs longer).
     public var timeout: TimeInterval?
+    /// Send `question` verbatim, without the "you are the eyes of..." framing
+    /// (structured tasks such as OCR correction supply their own prompt).
+    public var raw: Bool
 
     public init(question: String, detections: [Detection], localConfidence: Float, jpeg: Data? = nil,
-                maxWords: Int = 8, timeout: TimeInterval? = nil) {
+                maxWords: Int = 8, timeout: TimeInterval? = nil, raw: Bool = false) {
         self.question = question
+        self.raw = raw
         self.detections = detections
         self.localConfidence = localConfidence
         self.jpeg = jpeg

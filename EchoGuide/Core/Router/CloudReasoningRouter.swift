@@ -172,6 +172,7 @@ public struct OpenAIProvider: ReasoningProvider {
 
 enum Prompt {
     static func text(_ q: ReasoningQuery) -> String {
+        if q.raw { return q.question }
         let seen = q.detections.map { d in
             "\(d.kind == .text ? "text \"\(d.text ?? "")\"" : d.label) (\(Int(d.confidence * 100))%)"
         }.joined(separator: ", ")

@@ -67,12 +67,30 @@ public actor TextVerifier {
 
     // MARK: - Model handoff
 
+    /// Worked examples make a small text model reliable at this; sent raw,
+    /// without the router's conversational framing.
     public static func question(_ lines: [String]) -> String {
         """
-        These lines came from OCR of a sign, label or page, in reading order. Correct obvious OCR mistakes \
-        (split or merged letters, 0/O and 1/I swaps) without adding words, drop any line that is not real text, \
-        and return the corrected lines only, one per line, in the same order. If nothing is real text, return NONE.
+        You fix OCR output from signs and appliance panels. Rules: fix split or merged letters and digit/letter swaps \
+        (0/O, 1/I, 5/S), never add words, drop lines that are not real words, keep the order, one line per output line, \
+        and answer NONE only if nothing is real.
+        Example input:
+        STAR T
+        5TOP
+        l|l1
+        Example output:
+        START
+        STOP
+
+        Example input:
+        PU5H TO 0PEN
+        qzx vwk
+        Example output:
+        PUSH TO OPEN
+
+        Input:
         \(lines.joined(separator: "\n"))
+        Output:
         """
     }
 
@@ -87,7 +105,7 @@ public actor TextVerifier {
         if let hit = cache[key] { return hit }
         guard let router else { return gated }
         let outcome = await router.resolve(ReasoningQuery(question: Self.question(gated), detections: [], localConfidence: 0,
-                                                          maxWords: max(12, gated.joined(separator: " ").split(separator: " ").count * 2 + 4), timeout: timeout))
+                                                          maxWords: max(12, gated.joined(separator: " ").split(separator: " ").count * 2 + 4), timeout: timeout, raw: true))
         guard outcome.source == .cloud else { return gated }
         let result = Self.parse(outcome.answer, fallback: gated)
         remember(key, result)

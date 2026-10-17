@@ -12,7 +12,10 @@ set -euo pipefail
 SLUG="${SLUG:-echoguide-vision}"
 DOMAIN="${DOMAIN:-$SLUG.style.dev}"
 PORT=8080
-MODEL="${MODEL:-ggml-org/SmolVLM2-2.2B-Instruct-GGUF}"
+MODEL="${MODEL:-ggml-org/SmolVLM2-500M-Video-Instruct-GGUF}"   # measured: 3.9 s per scene, names colours and printed text; the 2.2B took 9.7 s
+TEXT_MODEL="${TEXT_MODEL:-bartowski/Qwen2.5-1.5B-Instruct-GGUF:Q4_K_M}"  # OCR correction: 0.4-1.6 s with the worked-example prompt
+TEXT_PORT=8081
+TEXT_DOMAIN="${TEXT_DOMAIN:-echoguide-text.style.dev}"
 IMAGE="${IMAGE:-ghcr.io/ggml-org/llama.cpp:server}"
 FS="npx -y freestyle@latest"
 
@@ -34,7 +37,11 @@ $FS vm exec "$SLUG" --linux-user root -- sh -c "docker run -d --name vlm --resta
   -p $PORT:$PORT -v /srv/llama-cache:/root/.cache/llama.cpp $IMAGE \
   -hf $MODEL --host 0.0.0.0 --port $PORT -c 4096 -t 8 -np 2 --no-warmup"
 
-echo "waiting for the model to download and load (first time: a few minutes)"
+# Text-only model for OCR correction, same VM.
+$FS vm exec "$SLUG" --linux-user root -- sh -c "docker rm -f txt >/dev/null 2>&1 || true; docker run -d --name txt --restart unless-stopped \
+  -p $TEXT_PORT:$TEXT_PORT $IMAGE -hf $TEXT_MODEL --host 0.0.0.0 --port $TEXT_PORT -c 4096 -t 4 -np 2 --no-warmup"
+
+echo "waiting for the models to download and load (first time: a few minutes)"
 for i in $(seq 1 150); do
   # Single-line probe: the CLI mangles multi-line arguments.
   CODE=$($FS vm exec "$SLUG" --linux-user root -- python3 -c "import urllib.request as u; print(u.urlopen('http://localhost:$PORT/health',timeout=5).status)" 2>/dev/null | tr -d '\r\n')
@@ -46,7 +53,11 @@ echo "vision server answers locally with HTTP ${CODE:-000}"
 if ! $FS --output json tls list --vm "$SLUG" 2>/dev/null | grep -q "\"$DOMAIN\""; then
   $FS tls create --domain "$DOMAIN" --from public --to "vm=$SLUG,port=$PORT" >/dev/null
 fi
+if ! $FS --output json tls list --vm "$SLUG" 2>/dev/null | grep -q "\"$TEXT_DOMAIN\""; then
+  $FS tls create --domain "$TEXT_DOMAIN" --from public --to "vm=$SLUG,port=$TEXT_PORT" >/dev/null
+fi
 echo
 echo "vision:  https://$DOMAIN   (OpenAI-compatible: POST /v1/chat/completions)"
+echo "text:    https://$TEXT_DOMAIN   -> \"textURL\" in echoguide.json"
 echo "app:     \"visionURL\": \"https://$DOMAIN\" in echoguide.json"
 echo "Snapshot once it works:  npx -y freestyle@latest snapshot create $SLUG --slug $SLUG-ok"
