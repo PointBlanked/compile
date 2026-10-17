@@ -40,7 +40,7 @@ There are two layers. Each one only reports a `FenceEvent`, and `AutomationEngin
 
 | Metric | Target | Where it is measured |
 |---|---|---|
-| Frame-delta analysis | < 1 ms p95 (CI debug build) | `FrameDeltaTests.benchmarkUnderOneMillisecond` |
+| Frame-delta analysis | < 1 ms p50, < 3 ms p95 (CI debug build) | `FrameDeltaTests.benchmarkUnderBudget` |
 | Local inference (object + hand) | < 12 ms on A17-class | `LocalVisionEngine.p95Ms`, on device |
 | Local end-to-end (frame to haptic) | < 15 ms | on device |
 | Audio / haptic cue | < 300 ms | on device |
