@@ -50,7 +50,7 @@ Produced by `swift run -c release EchoGuideBench`. This runs the shipping engine
 | Agent decision (detections in → what to say) | **6.6 µs** |
 | Button labels read / barcode decoded (synthetic panel) | 100% / 100% |
 
-**Phone numbers** come from the in-app speed test (Settings → Measure on-device speed) and are added here once measured on an A17-class iPhone. Recognition rates above use rendered labels in perfect light, so treat them as an upper bound, not field accuracy. Field results go through [`benchmarks/PROTOCOL.md`](benchmarks/PROTOCOL.md).
+CI reruns this suite on every push as a regression check. CI runners are virtual Macs without Neural Engine or GPU acceleration, so their vision timings are about 15x slower and are not speed claims. **Phone numbers** come from the in-app speed test (Settings → Measure on-device speed) and are added here once measured on an A17-class iPhone. Recognition rates above use rendered labels in perfect light, so treat them as an upper bound, not field accuracy. Field results go through [`benchmarks/PROTOCOL.md`](benchmarks/PROTOCOL.md).
 
 ## Architecture
 

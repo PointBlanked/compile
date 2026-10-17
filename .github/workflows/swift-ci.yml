@@ -27,7 +27,11 @@ jobs:
       - name: Benchmarks (real engine code, this runner)
         run: |
           swift run -c release EchoGuideBench
-          cat benchmarks/results/*.md >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "> **CI runners are virtual Macs without Neural Engine or GPU acceleration for Vision**, so the vision rows here run roughly 15x slower than on real Apple silicon. This job is a regression check (correctness, skip rate, decision cost), not a speed claim. Speed claims come from real hardware: see benchmarks/results in the repo and the in-app speed test."
+            echo
+            cat benchmarks/results/*.md
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
