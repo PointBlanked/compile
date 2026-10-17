@@ -37,6 +37,10 @@ public struct AutomationConfig: Sendable {
     /// While scanning with nothing to offer, say so this often. Silence is
     /// ambiguous for a blind user: is it working, or has it crashed?
     public var scanningReminderInterval: TimeInterval = 8
+    /// Find guides only to what the user asked for, by voice or text. Without
+    /// a goal it waits and says so, instead of picking something on its own.
+    /// The app turns this on; engine tests drive the mechanics without a goal.
+    public var requiresGoal = false
     /// A finished target is off the menu for this long, so "done" moves on to
     /// the next step instead of guiding the finger back to the same button.
     public var completedCooldown: TimeInterval = 8
@@ -221,6 +225,17 @@ public actor AutomationEngine {
             await runTask(frame, at: now)
             return
         }
+        if config.requiresGoal, isolation.goal == nil {
+            // A barcode is read on sight even without a goal: it guides no hand.
+            completedUntil = completedUntil.filter { $0.value > now }
+            if let code = frame.targets.first(where: { $0.kind == .barcode && completedUntil[$0.stepKey] == nil }) {
+                let step = ActionStep(targetLabel: code.label, instruction: "", guidance: .announce, target: code)
+                if await fireReadOnlyTool(for: step, at: now) { return }
+            }
+            if state != .scanning, state != .completed(""), case .completed = state {} else if state != .scanning { await haptics.stop(); transition(.scanning) }
+            await remindScanning(at: now)
+            return
+        }
 
         // Recently finished targets are off the menu; prune expired ones.
         completedUntil = completedUntil.filter { $0.value > now }
@@ -351,7 +366,11 @@ public actor AutomationEngine {
         let since = max(lastReminderAt, lastSpokenAt)
         guard now - since >= config.scanningReminderInterval else { return }
         lastReminderAt = now
-        await audio.speak(isolation.goal.map { "Looking for \($0)." } ?? "Looking.", azimuth: 0)
+        if config.requiresGoal, isolation.goal == nil, task == nil {
+            await audio.speak("Say or type what you want to find.", azimuth: 0)
+        } else {
+            await audio.speak(isolation.goal.map { "Looking for \($0)." } ?? "Looking.", azimuth: 0)
+        }
     }
 
     /// True when a `.none` side-effect tool claimed the target and was run.

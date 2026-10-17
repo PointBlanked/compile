@@ -19,13 +19,19 @@ public struct LocalVisionConfig: Sendable {
     /// Vision's accurate recogniser with language correction: roughly ten
     /// times slower than fast, far better on small print. Read mode turns it
     /// on; Explore and Find keep the fast level inside the frame budget.
-    public var accurateText = false
+    public var accurateText = true
+    /// Text shorter than this share of the frame height is ignored (Read mode lowers it).
+    public var minimumTextHeight: Float = 0.02
+    /// OCR candidates below this confidence are dropped at the source.
+    public var minimumTextConfidence: Float = 0.45
     public var detectFingertip = true
     /// Read mode turns the object model off: it only needs text, and skipping
     /// YOLO frees the budget for accurate OCR on every frame.
     public var detectObjects = true
     /// Name each object's dominant colour from a 4x4 sample inside its box.
-    public var sampleColors = true
+    /// Off by default: the field test showed it unreliable; colours come from
+    /// the scene reference model instead (see SceneReference).
+    public var sampleColors = false
     /// Barcodes ride the OCR cadence: both are "read the label" work.
     public var detectBarcodes = true
     /// Keep at most this many detections; cognitive isolation picks one anyway.
@@ -89,7 +95,11 @@ public actor LocalVisionEngine {
     public func setTextEveryNthFrame(_ n: Int) { config.ocrEveryNthFrame = max(0, n) }
 
     /// Read mode wants the accurate recogniser; the others want speed.
-    public func setTextQuality(accurate: Bool) { config.accurateText = accurate }
+    public func setTextQuality(accurate: Bool) {
+        config.accurateText = accurate
+        // Reading a page wants small print; walking around wants only signs.
+        config.minimumTextHeight = accurate ? 0.012 : 0.02
+    }
 
     public func setObjectDetection(enabled: Bool) { config.detectObjects = enabled }
 
@@ -108,8 +118,7 @@ public actor LocalVisionEngine {
         text.recognitionLevel = config.accurateText ? .accurate : .fast
         text.usesLanguageCorrection = config.accurateText
         text.recognitionLanguages = ["en-US"]
-        // Text smaller than ~1.5% of the frame height is noise at reading distance.
-        text.minimumTextHeight = 0.015
+        text.minimumTextHeight = config.minimumTextHeight
         let runOCR = config.ocrEveryNthFrame > 0 && frameCount % UInt64(config.ocrEveryNthFrame) == 0
         if runOCR { requests.append(text) }
 
@@ -141,7 +150,7 @@ public actor LocalVisionEngine {
 
         if runOCR {
             for obs in text.results ?? [] {
-                guard let candidate = obs.topCandidates(1).first else { continue }
+                guard let candidate = obs.topCandidates(1).first, candidate.confidence >= config.minimumTextConfidence else { continue }
                 let b = obs.boundingBox
                 detections.append(Detection(
                     label: "text",

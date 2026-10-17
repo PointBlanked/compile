@@ -155,7 +155,7 @@ public final class GuidanceModel {
     var detail: String? {
         switch state {
         case .idle: return "Tap Resume to start guiding"
-        case .scanning: return goal.map { "Looking for \"\($0)\"" } ?? "Point the camera at the task"
+        case .scanning: return goal.map { "Looking for \"\($0)\"" } ?? "Say or type what to find"
         case .guiding: return "Follow the pulses"
         case .onTarget: return "Hold still"
         case .completed: return "Next step coming"

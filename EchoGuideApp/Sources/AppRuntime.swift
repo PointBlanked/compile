@@ -58,6 +58,7 @@ final class AppRuntime {
     private var pipeline: PerceptionPipeline?
     private var vision: LocalVisionEngine?
     private let latest = LatestFrame()
+    private let motionGate = DeviceMotionGate()
     private var background: [Task<Void, Never>] = []
 
     var statusLine: String {
@@ -130,8 +131,10 @@ final class AppRuntime {
 
         // Decisions.
         let latestForTask = self.latest
+        var automationConfig = AutomationConfig()
+        automationConfig.requiresGoal = true // Find guides only to what the user asked for
         let automation = AutomationEngine(haptics: haptics, audio: audio, depth: lidar, router: router, tools: registry,
-                                          jpegProvider: { box in latestForTask.jpeg(maxSide: 512, crop: box) })
+                                          config: automationConfig, jpegProvider: { box in latestForTask.jpeg(maxSide: 512, crop: box) })
         self.automation = automation
         guidance.bind(to: automation)
         await automation.setGoal(config.goal)
@@ -144,8 +147,11 @@ final class AppRuntime {
             textRouter = CloudReasoningRouter(config: textConfig, provider: OpenAIProvider(proxyBase: text, model: "text", deviceToken: { nil }), connectivity: connectivity)
         }
         let latestForScene = self.latest
+        let motionGate = self.motionGate
+        motionGate.start()
         let agent = AgentCore(audio: audio, haptics: haptics, depth: lidar, router: router, textRouter: textRouter,
-                              jpegProvider: { box in latestForScene.jpeg(maxSide: box == nil ? 512 : 320, crop: box) })
+                              jpegProvider: { box in latestForScene.jpeg(maxSide: box == nil ? 512 : 320, crop: box) },
+                              cameraMoving: { motionGate.isMoving })
         self.agent = agent
         // What the mic heard: a question about the recent past is answered
         // from the agent's memory; anything else becomes the Find goal.
@@ -242,7 +248,7 @@ final class AppRuntime {
         case .explore:
             pipeline?.setIdleRefresh(1.0)
             await vision?.setTextEveryNthFrame(3)
-            await vision?.setTextQuality(accurate: false)
+            await vision?.setTextQuality(accurate: false) // accurate recogniser, sign-sized text only
             await vision?.setObjectDetection(enabled: true)
         case .find:
             pipeline?.setIdleRefresh(3.0)

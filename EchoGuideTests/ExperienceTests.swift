@@ -748,9 +748,11 @@ struct StubListener: GoalListening {
         #expect(first)
         s.asked(at: 3, labels: ["chair"])
         let soon = s.wantsScene(objects(["chair"], t: 4))
-        let sameLater = s.wantsScene(objects(["chair"], t: 30))
+        let sameInsideRefresh = s.wantsScene(objects(["chair"], t: 12))
+        let periodicRefresh = s.wantsScene(objects(["chair"], t: 30))
         #expect(!soon)
-        #expect(!sameLater)
+        #expect(!sameInsideRefresh)
+        #expect(periodicRefresh) // the reference is refreshed every 15 s while something is in view
     }
 
     @Test func materialChangeAfterIntervalAsksAgain() {
@@ -763,8 +765,8 @@ struct StubListener: GoalListening {
         #expect(!inside)
         #expect(halfTurnedOver)
         s.asked(at: 20, labels: ["chair", "microwave"])
-        let sameScene = s.wantsScene(objects(["microwave", "chair"], t: 40))
-        let newRoom = s.wantsScene(objects(["bed", "tv"], t: 41))
+        let sameScene = s.wantsScene(objects(["microwave", "chair"], t: 30))
+        let newRoom = s.wantsScene(objects(["bed", "tv"], t: 31))
         #expect(!sameScene)
         #expect(newRoom)
     }
@@ -780,7 +782,9 @@ struct StubListener: GoalListening {
             let seen: Counter
             func resolve(_ q: ReasoningQuery) async -> ReasoningOutcome {
                 if q.jpeg != nil { await seen.inc() }
-                return ReasoningOutcome(answer: "A small kitchen. A red kettle sits on the white counter ahead.", source: .cloud, latencyMs: 900)
+                // Step 1 (with the photo) answers in prose; step 2 (text only) structures it.
+                let answer = q.jpeg != nil ? "A small kitchen. A red kettle sits on the white counter ahead." : "place: small kitchen\nobjects: red kettle (centre)\nhazard: none"
+                return ReasoningOutcome(answer: answer, source: .cloud, latencyMs: 900)
             }
         }
         let seen = Counter(), a = RecordingAudio()
@@ -793,7 +797,7 @@ struct StubListener: GoalListening {
         await agent.ingest(frame([det("kettle", x: 0.5, y: 0.5, conf: 0.9)], t: 0.2), fence: nil)
         var spokenScene = false
         for _ in 0..<200 where !spokenScene {
-            spokenScene = await a.spoken.contains { $0.hasPrefix("A small kitchen") }
+            spokenScene = await a.spoken.contains { $0.hasPrefix("Small kitchen") }
             if !spokenScene { try? await Task.sleep(nanoseconds: 5_000_000) }
         }
         #expect(spokenScene)
@@ -1154,5 +1158,190 @@ struct StubListener: GoalListening {
     @Test func paddedCropStaysInsideTheFrame() {
         let p = AgentCore.padded(ImageRect(x: 0.9, y: 0.0, width: 0.2, height: 0.2))
         #expect(p.x >= 0 && p.y >= 0 && p.x + p.width <= 1.0001 && p.y + p.height <= 1.0001)
+    }
+}
+
+// MARK: - Text stability, stricter gate, camera motion
+
+@Suite struct StabilityAndEgomotionTests {
+    func txt(_ s: String, x: Float, y: Float, conf: Float = 0.9) -> Detection { det("text", x: x, y: y, conf: conf, kind: .text, text: s) }
+
+    @Test func textMustPersistAcrossOCRFrames() {
+        var st = TextStabilizer()
+        #expect(st.stable(in: frame([txt("EXIT", x: 0.5, y: 0.2)], t: 0)).isEmpty)                // seen once
+        #expect(st.stable(in: frame([txt("exit", x: 0.5, y: 0.2), txt("l|l", x: 0.1, y: 0.1)], t: 0.3)).map { $0.text } == ["exit"]) // twice, case-insensitive
+        #expect(st.stable(in: frame([det("chair", x: 0.5, y: 0.5)], t: 0.4)).isEmpty)            // no OCR this frame: window untouched
+        #expect(st.stable(in: frame([txt("EXIT", x: 0.5, y: 0.2)], t: 0.6)).count == 1)
+        // Moved elsewhere: a different sign, not yet stable.
+        #expect(st.stable(in: frame([txt("EXIT", x: 0.1, y: 0.8)], t: 0.9)).isEmpty)
+    }
+
+    @Test func stricterGateRejectsDebris() {
+        for bad in ["lI", "rn", "l|l1", "qzxvwkjp", "~", "x", "mn", "TTT"] { #expect(!TextVerifier.plausible(bad), "\(bad)") }
+        for good in ["TV", "WC", "EXIT", "230", "4B", "Push to open", "START", "No. 7"] { #expect(TextVerifier.plausible(good), "\(good)") }
+    }
+
+    @Test func staticThingsDefineCameraMotion() {
+        // The user walks forward: table and door grow together; the person ahead grows the same way: no alert.
+        var n = SceneNarrator()
+        func scene(_ k: Float) -> [Detection] {
+            [det("dining table", x: 0.3, y: 0.7, size: 0.2 * k, conf: 0.9), det("door", x: 0.8, y: 0.4, size: 0.2 * k, conf: 0.9), det("person", x: 0.5, y: 0.4, size: 0.2 * k, conf: 0.9)]
+        }
+        _ = n.observe(frame(scene(1.0), t: 0))
+        _ = n.observe(frame(scene(1.1), t: 0.3))
+        #expect(n.observe(frame(scene(1.5), t: 0.9))?.kind != .motion)
+        // Camera still (static things fixed) but the person rushes across: alert.
+        var m = SceneNarrator()
+        func rush(_ x: Float) -> [Detection] { [det("dining table", x: 0.3, y: 0.7, size: 0.2, conf: 0.9), det("person", x: x, y: 0.4, size: 0.2, conf: 0.9)] }
+        _ = m.observe(frame(rush(0.1), t: 0))
+        _ = m.observe(frame(rush(0.2), t: 0.3))
+        let a = m.observe(frame(rush(0.6), t: 0.9))
+        #expect(a?.kind == .motion)
+        #expect(a?.text == "A person, moving fast, ahead.")
+    }
+
+    @Test func gyroscopeSilencesMotionAlerts() {
+        var n = SceneNarrator()
+        var p = det("person", x: 0.1, y: 0.4, size: 0.2, conf: 0.9)
+        _ = n.observe(frame([p], t: 0)); p = det("person", x: 0.2, y: 0.4, size: 0.2, conf: 0.9)
+        _ = n.observe(frame([p], t: 0.3)); p = det("person", x: 0.6, y: 0.4, size: 0.2, conf: 0.9)
+        // Phone is turning: the same frames produce no motion alert.
+        #expect(n.observe(frame([p], t: 0.9), cameraMoving: true)?.kind != .motion)
+    }
+
+    @Test func signsAreSpokenOnlyAfterTheTextModelAgrees() async {
+        struct Fixer: ReasoningRouting {
+            func resolve(_ q: ReasoningQuery) async -> ReasoningOutcome { ReasoningOutcome(answer: q.question.contains("EX1T") ? "EXIT" : "NONE", source: .cloud, latencyMs: 10) }
+        }
+        let a = RecordingAudio()
+        var quiet = SceneIntelligenceConfig(); quiet.warmup = 1_000
+        let agent = AgentCore(audio: a, haptics: RecordingHaptics(), router: nil, textRouter: Fixer(), scene: quiet, clock: { 100 })
+        await agent.setMode(.explore, announce: false)
+        // Stable across two OCR frames, then corrected by the model before speaking.
+        await agent.ingest(frame([txt("EX1T", x: 0.5, y: 0.2)], t: 0), fence: nil)
+        await agent.ingest(frame([txt("EX1T", x: 0.5, y: 0.2)], t: 0.3), fence: nil)
+        for _ in 0..<100 where await a.spoken.isEmpty { try? await Task.sleep(nanoseconds: 5_000_000) }
+        #expect(await a.spoken == ["Sign: EXIT."])
+    }
+}
+
+// MARK: - Slow-fast scene reference, goal-only Find
+
+@Suite struct SceneReferenceTests {
+    let sample = """
+    place: street
+    objects: blue and white bus (centre); white coat (centre); red jacket (right); man (left)
+    text: bus, man, walking
+    hazard: none
+    """
+
+    @Test func parsesTheStructuredFields() throws {
+        let r = try #require(SceneReference.parse(sample, at: 10))
+        #expect(r.place == "street")
+        #expect(r.objects.count == 4)
+        #expect(r.objects[0] == .init(name: "bus", color: "blue", position: "centre"))
+        #expect(r.objects[2] == .init(name: "jacket", color: "red", position: "right"))
+        #expect(r.objects[3] == .init(name: "man", color: nil, position: "left"))
+        #expect(r.hazard == nil)
+        #expect(SceneReference.parse("nothing useful", at: 0) == nil)
+        #expect(SceneReference.parse("place: kitchen\nhazard: hot kettle", at: 0)?.hazard == "hot kettle")
+    }
+
+    @Test func lookupUsesSynonymsAndSpeaksAScene() throws {
+        let r = try #require(SceneReference.parse("place: kitchen counter\nobjects: red kettle (left); white microwave oven (centre); blue mug (right)\nhazard: hot kettle", at: 0))
+        #expect(r.colour(for: "cup") == "blue")          // mug -> cup
+        #expect(r.colour(for: "microwave") == "white")   // "microwave oven" ends with the label
+        #expect(r.mentions("kettle"))
+        #expect(!r.mentions("laptop"))
+        #expect(r.spokenLine == "Kitchen counter. A red kettle on your left, a white microwave oven ahead, a blue mug on your right. Careful: hot kettle.")
+        let same = try #require(SceneReference.parse("place: kitchen counter\nobjects: red kettle (left); white microwave oven (centre); blue mug (right); spoon (left)", at: 5))
+        #expect(r.sameScene(as: same))
+    }
+
+    @Test func fusionColoursAndFiltersTheFastLoop() throws {
+        let ref = try #require(SceneReference.parse("place: desk\nobjects: silver laptop (centre); red mug (right)", at: 100))
+        let dets = [det("laptop", x: 0.5, y: 0.5, conf: 0.9), det("cup", x: 0.8, y: 0.5, conf: 0.8),
+                    det("suitcase", x: 0.2, y: 0.5, conf: 0.55), det("chair", x: 0.2, y: 0.8, conf: 0.9), tip(x: 0.1, y: 0.1)]
+        let fused = ReferenceFusion.apply(ref, to: dets, now: 105)
+        #expect(fused.map(\.label) == ["laptop", "cup", "chair", "fingertip"]) // uncertain suitcase dropped, confident chair kept
+        #expect(fused[0].color == "silver")
+        #expect(fused[1].color == "red")
+        #expect(fused[2].color == nil)
+        // Stale reference: no colours, nothing dropped.
+        let stale = ReferenceFusion.apply(ref, to: dets, now: 200)
+        #expect(stale.count == 5 && stale.allSatisfy { $0.color == nil })
+    }
+
+    @Test func referenceRefreshesPeriodically() {
+        var s = SceneIntelligence()
+        s.reset(at: 0)
+        let f = { (t: TimeInterval) in frame([det("chair", x: 0.5, y: 0.5, conf: 0.9)], t: t) }
+        _ = s.wantsScene(f(3)); s.asked(at: 3, labels: ["chair"])
+        let tooSoon = s.wantsScene(f(10))
+        let refresh = s.wantsScene(f(19))
+        #expect(!tooSoon)
+        #expect(refresh)
+    }
+
+    @Test func agentBuildsTheReferenceFromTwoModels() async {
+        struct Vision: ReasoningRouting {
+            func resolve(_ q: ReasoningQuery) async -> ReasoningOutcome {
+                ReasoningOutcome(answer: q.jpeg != nil ? "A red kettle sits on the left of a white counter." : "", source: .cloud, latencyMs: 1)
+            }
+        }
+        struct Text: ReasoningRouting {
+            func resolve(_ q: ReasoningQuery) async -> ReasoningOutcome {
+                ReasoningOutcome(answer: "place: kitchen counter\nobjects: red kettle (left)\nhazard: none", source: .cloud, latencyMs: 1)
+            }
+        }
+        let a = RecordingAudio()
+        var cfg = SceneIntelligenceConfig(); cfg.warmup = 0
+        let agent = AgentCore(audio: a, haptics: RecordingHaptics(), router: Vision(), textRouter: Text(), scene: cfg,
+                              jpegProvider: { _ in Data([1]) }, clock: { 100 })
+        await agent.setMode(.explore, announce: false)
+        await agent.ingest(frame([det("kettle", x: 0.2, y: 0.5, conf: 0.9)], t: 0.1), fence: nil)
+        await agent.ingest(frame([det("kettle", x: 0.2, y: 0.5, conf: 0.9)], t: 0.2), fence: nil)
+        for _ in 0..<200 where await !(a.spoken.contains("Kitchen counter. A red kettle on your left.")) { try? await Task.sleep(nanoseconds: 5_000_000) }
+        #expect(await agent.reference?.place == "kitchen counter")
+        #expect(await a.spoken.contains("Kitchen counter. A red kettle on your left."))
+        // The fast loop now colours the kettle from the reference (memory records after its 2 s spacing).
+        await agent.ingest(frame([det("kettle", x: 0.2, y: 0.5, conf: 0.9)], t: 3), fence: nil)
+        #expect(await agent.recentObservations.last?.colors["kettle"] == "red")
+    }
+}
+
+@Suite struct GoalOnlyFindTests {
+    @Test func findWaitsForAGoal() async {
+        var c = CognitiveConfig(); c.settleFrames = 1
+        var cfg = AutomationConfig(); cfg.requiresGoal = true
+        let h = RecordingHaptics(), a = RecordingAudio()
+        let e = AutomationEngine(haptics: h, audio: a, cognitive: CognitiveTaskIsolation(config: c), config: cfg)
+        await e.start()
+        await e.ingest(frame([det("cup", x: 0.7, y: 0.5), tip(x: 0.4, y: 0.5)], t: 0))
+        #expect(await e.state == .scanning)
+        #expect(await h.guides == 0)
+        #expect(await a.spoken == ["Say or type what you want to find."])
+        await e.setGoal("cup")
+        await e.ingest(frame([det("cup", x: 0.7, y: 0.5), tip(x: 0.4, y: 0.5)], t: 1))
+        guard case .guiding = await e.state else { Issue.record("expected guiding once a goal is set"); return }
+        #expect(await h.guides == 1)
+    }
+
+    @Test func barcodesStillReadWithoutAGoal() async {
+        let registry = PluginRegistry()
+        let looked = Counter()
+        await registry.register(ToolDescriptor(name: "product_lookup", description: "", sideEffect: .none, claim: ToolClaim(anyBarcode: true), parameters: ["text"]) { _ in
+            await looked.inc(); return "Oat milk."
+        })
+        var cfg = AutomationConfig(); cfg.requiresGoal = true
+        let a = RecordingAudio()
+        let e = AutomationEngine(haptics: RecordingHaptics(), audio: a, tools: registry, config: cfg)
+        await e.start()
+        let code = det("barcode", x: 0.6, y: 0.4, kind: .barcode, text: "5000112637922")
+        await e.ingest(frame([code], t: 0))
+        #expect(await looked.value == 1)
+        #expect(await a.spoken == ["Oat milk."])
+        await e.ingest(frame([code], t: 0.5))
+        #expect(await looked.value == 1) // cooldown
     }
 }

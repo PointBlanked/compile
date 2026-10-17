@@ -68,6 +68,12 @@ public actor AgentCore {
     private var scene = SceneIntelligence()
     private var sceneInFlight = false
     private var memory = ObservationMemory()
+    private var textStabilizer = TextStabilizer()
+    /// The slow model's latest structured view of the scene.
+    public private(set) var reference: SceneReference?
+    private var lastSpokenReference: SceneReference?
+    /// Phone gyroscope/accelerometer: true while the user turns or steps.
+    private let cameraMoving: (@Sendable () -> Bool)?
     private let verifier = TextVerifier()
     private var readInFlight = false
     private var pendingLines: [String] = []
@@ -88,7 +94,9 @@ public actor AgentCore {
                 textRouter: ReasoningRouting? = nil,
                 narrator: NarratorConfig = NarratorConfig(), scene: SceneIntelligenceConfig = SceneIntelligenceConfig(),
                 jpegProvider: (@Sendable (ImageRect?) -> Data?)? = nil,
+                cameraMoving: (@Sendable () -> Bool)? = nil,
                 clock: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSince1970 }) {
+        self.cameraMoving = cameraMoving
         self.audio = audio
         self.haptics = haptics
         self.depth = depth
@@ -123,6 +131,8 @@ public actor AgentCore {
         narrator.reset()
         reader.reset()
         scene.reset()
+        textStabilizer.reset()
+        lastSpokenReference = nil
         busyUntil = 0
         await haptics.stop()
         if announce { await say(m.spokenHelp, source: .system, urgent: true) }
@@ -132,7 +142,15 @@ public actor AgentCore {
     /// AutomationEngine (Find mode), which then also handles the fence.
     @discardableResult
     public func ingest(_ frame: VisionFrameResult, fence: FenceEvent?) async -> Bool {
+        // Text that has not persisted across OCR frames is dropped here, so the
+        // narrator, the reader, memory and the overlay all see the same thing.
+        // The Describe and Read buttons are explicit asks and see the raw frame.
         lastFrame = frame
+        let stableText = textStabilizer.stable(in: frame)
+        var frame = frame
+        // Fast loop consults the slow reference: colours from it, contradicted
+        // uncertain detections dropped, text only when stable across frames.
+        frame.detections = ReferenceFusion.apply(reference, to: frame.detections.filter { $0.kind != .text }, now: frame.timestamp) + stableText
         telemetry.framesSeen += 1
         memory.record(frame)
         if mode == .find { return true }
@@ -162,8 +180,14 @@ public actor AgentCore {
                 let snapshot = frame
                 Task { await self.describeScene(snapshot, jpeg: jpegProvider(nil)) }
             }
-            guard let a = narrator.observe(frame, depths: depths, aheadMetres: ahead) else { return false }
+            guard let a = narrator.observe(frame, depths: depths, aheadMetres: ahead, cameraMoving: cameraMoving?() ?? false) else { return false }
             if !a.urgent, clock() < busyUntil { return false }
+            // Signs go through the text model like Read lines; spoken only if it agrees.
+            if a.kind == .text, textRouter != nil || router != nil {
+                let line = a.text.replacingOccurrences(of: "Sign: ", with: "").trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+                Task { await self.verifyAndSaySign(line, azimuth: a.azimuth) }
+                return false
+            }
             // Check pipeline: an uncertain object is confirmed against the
             // vision model on its crop before it is spoken. Off the frame path;
             // confident detections and urgent alerts are spoken at once.
@@ -197,6 +221,13 @@ public actor AgentCore {
         return false
     }
 
+    private func verifyAndSaySign(_ line: String, azimuth: Float) async {
+        let cleaned = await verifier.verify([line], router: textRouter ?? router)
+        guard let text = cleaned.first, mode == .explore else { return }
+        telemetry.announcements += 1
+        await say("Sign: \(text).", source: .narrator, azimuth: azimuth)
+    }
+
     /// Vision-model yes/no on the crop; speaks only if confirmed, otherwise the
     /// label is doubted for a while so the narrator does not keep offering it.
     private func confirmAndSay(_ a: Announcement, detection d: Detection, jpeg: Data?, router: ReasoningRouting) async {
@@ -224,22 +255,31 @@ public actor AgentCore {
     /// on-device fallback would just repeat what the narrator already said.
     private func describeScene(_ frame: VisionFrameResult, jpeg: Data?) async {
         defer { sceneInFlight = false }
-        guard let router, mode == .explore else { return }
-        let outcome = await router.resolve(ReasoningQuery(
-            question: SceneIntelligence.question,
-            detections: frame.detections.filter { $0.kind != .fingertip },
-            localConfidence: 0,
-            jpeg: jpeg,
-            maxWords: 32,
-            timeout: 10
-        ))
-        guard outcome.source == .cloud, !outcome.answer.isEmpty, mode == .explore else { return }
+        guard let router, mode == .explore, jpeg != nil else { return }
+        // Slow step 1: the vision model describes the frame in prose.
+        let prose = await router.resolve(ReasoningQuery(question: SceneReference.describePrompt, detections: [], localConfidence: 0,
+                                                        jpeg: jpeg, maxWords: 60, timeout: 12, raw: true))
+        guard prose.source == .cloud, !prose.answer.isEmpty else { return }
+        // Slow step 2: the text model turns the prose into fields the fast loop can use.
+        var parsed: SceneReference?
+        if let structured = await (textRouter ?? router).resolve(ReasoningQuery(question: SceneReference.structurePrompt(prose.answer), detections: [], localConfidence: 0,
+                                                                                maxWords: 60, timeout: 6, raw: true)) as ReasoningOutcome?,
+           structured.source == .cloud {
+            parsed = SceneReference.parse(structured.answer, at: frame.timestamp)
+        }
+        guard mode == .explore else { return }
         telemetry.sceneDescriptions += 1
-        memory.noteScene(outcome.answer, at: frame.timestamp)
-        // Wait for whatever is being said, then speak.
+        memory.noteScene(prose.answer, at: frame.timestamp)
+        guard let ref = parsed else { return }
+        reference = ref
+        // Speak only when the place or the main things changed.
+        if let last = lastSpokenReference, ref.sameScene(as: last) { return }
+        lastSpokenReference = ref
+        let line = ref.spokenLine
+        guard !line.isEmpty else { return }
         let wait = busyUntil - clock()
         if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(min(wait, 4) * 1_000_000_000)) }
-        await say(outcome.answer, source: .scene)
+        await say(line, source: .scene)
     }
 
     /// The Describe button: what is in front of me, all of it, in a few sentences.

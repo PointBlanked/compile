@@ -16,7 +16,7 @@ public struct TextReader: Sendable {
     public mutating func reset() { readAt = [:] }
 
     /// Everything readable in this frame, in reading order, ignoring history.
-    public static func lines(in frame: VisionFrameResult, minimumConfidence: Float = 0.4) -> [String] {
+    public static func lines(in frame: VisionFrameResult, minimumConfidence: Float = 0.5) -> [String] {
         let items = frame.detections
             .filter { $0.kind == .text && $0.confidence >= minimumConfidence }
             .compactMap { d -> (ImageRect, String)? in

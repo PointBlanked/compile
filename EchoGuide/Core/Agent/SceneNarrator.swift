@@ -146,7 +146,9 @@ public struct SceneNarrator: Sendable {
 
     /// `depths` holds metres per detection index when LiDAR is available.
     /// `aheadMetres` is the depth at the frame centre (the walking path).
-    public mutating func observe(_ frame: VisionFrameResult, depths: [Int: Float] = [:], aheadMetres: Float? = nil) -> Announcement? {
+    /// `cameraMoving` comes from the phone's gyroscope and accelerometer: while
+    /// the user turns or steps, nothing may be called "moving".
+    public mutating func observe(_ frame: VisionFrameResult, depths: [Int: Float] = [:], aheadMetres: Float? = nil, cameraMoving: Bool = false) -> Announcement? {
         let now = frame.timestamp
         updateTracks(frame, now: now)
 
@@ -161,7 +163,7 @@ public struct SceneNarrator: Sendable {
         }
 
         // 1b. Something moving fast, or growing fast (coming at the user): interrupts too.
-        if let moving = fastestMover(now), cooled("motion:" + moving.label, now, config.motionCooldown) {
+        if !cameraMoving, let moving = fastestMover(now), cooled("motion:" + moving.label, now, config.motionCooldown) {
             let name = frame.detections.first { $0.label == moving.label && $0.box.iou(moving.box) > 0.3 }?.describedLabel ?? moving.label
             let text = "\(SceneVocabulary.article(name).capitalizedFirstLetter), \(moving.approaching ? "coming toward you" : "moving fast"), \(SceneVocabulary.place(moving.box.midX))."
             return mark(Announcement(text: text, kind: .motion, azimuth: SceneVocabulary.azimuth(moving.box.midX), urgent: true),
@@ -212,7 +214,7 @@ public struct SceneNarrator: Sendable {
     /// Plausible sign text in this frame.
     private func signs(in frame: VisionFrameResult) -> [(Detection, String)] {
         frame.detections
-            .filter { $0.kind == .text && $0.confidence >= config.minimumConfidence }
+            .filter { $0.kind == .text && $0.confidence >= max(0.6, config.minimumConfidence) }
             .compactMap { d -> (Detection, String)? in
                 guard let t = d.text.map(TextReader.clean), t.count >= 3, TextVerifier.plausible(t) else { return nil }
                 return (d, t)
@@ -244,15 +246,23 @@ public struct SceneNarrator: Sendable {
     private func fastestMover(_ now: TimeInterval) -> (label: String, box: ImageRect, approaching: Bool)? {
         let live = tracks.filter { $0.frames >= config.settleFrames && $0.lastSeen == now && $0.lastSeen > $0.pastAt }
         guard !live.isEmpty else { return nil }
-        // Camera egomotion: the median displacement and growth of all tracks.
+        // Camera egomotion: the median displacement and growth of things that
+        // cannot move on their own (chairs, tables, doors). Without any static
+        // reference in view, a lone mover cannot be told from the camera, so
+        // only the gyroscope (cameraMoving, checked by the caller) protects us.
         func velocity(_ t: Track) -> (dx: Float, dy: Float, growth: Float) {
             let dt = Float(max(0.2, t.lastSeen - t.pastAt))
             return ((t.box.midX - t.pastBox.midX) / dt, (t.box.midY - t.pastBox.midY) / dt, t.pastBox.area > 0 ? t.box.area / t.pastBox.area : 1)
         }
         let vs = live.map(velocity)
         func median(_ xs: [Float]) -> Float { let s = xs.sorted(); return s[s.count / 2] }
-        let ego = (dx: median(vs.map(\.dx)), dy: median(vs.map(\.dy)), growth: median(vs.map(\.growth)))
-        let sharedMotion = live.count >= 2 // with one track there is nothing to compare against
+        let staticV = zip(live, vs).filter { !SceneVocabulary.mobile.contains($0.0.label) }.map(\.1)
+        let sharedMotion = !staticV.isEmpty
+        let ego = sharedMotion
+            ? (dx: median(staticV.map(\.dx)), dy: median(staticV.map(\.dy)), growth: median(staticV.map(\.growth)))
+            : (dx: Float(0), dy: Float(0), growth: Float(1))
+        // Static things themselves moving a lot means the camera is moving fast: say nothing.
+        if sharedMotion, (ego.dx * ego.dx + ego.dy * ego.dy).squareRoot() > config.fastSpeed * 0.8 || ego.growth > 1.4 || ego.growth < 0.7 { return nil }
 
         var best: (score: Float, label: String, box: ImageRect, approaching: Bool)?
         for (t, v) in zip(live, vs) where SceneVocabulary.mobile.contains(t.label) {

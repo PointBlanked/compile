@@ -13,7 +13,9 @@ import EchoGuideContracts
 
 public struct SceneIntelligenceConfig: Sendable {
     /// Seconds between two scene descriptions, however much changes.
-    public var minInterval: TimeInterval = 15
+    public var minInterval: TimeInterval = 8
+    /// Refresh the reference this often even when the scene has not turned over.
+    public var refreshInterval: TimeInterval = 15
     /// Share of the label set that must turn over to count as a new scene (Jaccard distance).
     public var changeThreshold: Float = 0.5
     /// Wait this long after entering the mode before the first description.
@@ -52,6 +54,7 @@ public struct SceneIntelligence: Sendable {
         guard now - (startedAt ?? now) >= config.warmup, now - lastAskedAt >= config.minInterval else { return false }
         let current = labels(in: frame)
         if !described { return !current.isEmpty }
+        if !current.isEmpty, now - lastAskedAt >= config.refreshInterval { return true }
         let union = current.union(lastLabels)
         guard !union.isEmpty else { return false }
         let distance = 1 - Float(current.intersection(lastLabels).count) / Float(union.count)

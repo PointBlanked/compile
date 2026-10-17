@@ -32,18 +32,22 @@ public actor TextVerifier {
     public static func plausible(_ raw: String) -> Bool {
         let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard s.count >= 2 else { return false }
+        // Two-character strings are debris unless they are a known short word or a number.
+        if s.count == 2, !shortWords.contains(s.uppercased()), s.rangeOfCharacter(from: .decimalDigits) == nil { return false }
         let scalars = s.unicodeScalars
         let alnum = scalars.filter { CharacterSet.alphanumerics.contains($0) }.count
         guard Double(alnum) / Double(scalars.count) >= 0.6 else { return false }
-        // A short string with any symbol in it ("l|l1", "S+ART") is OCR debris.
-        let symbols = scalars.filter { !CharacterSet.alphanumerics.contains($0) && !CharacterSet.whitespaces.contains($0) }.count
-        if s.count < 6, symbols > 0 { return false }
+        // A short string with an odd symbol in it ("l|l1", "S+ART") is OCR debris; ordinary punctuation is fine ("No. 7").
+        let punctuation = CharacterSet(charactersIn: ".,:;!?'%$£€&-/()")
+        let odd = scalars.filter { !CharacterSet.alphanumerics.contains($0) && !CharacterSet.whitespaces.contains($0) && !punctuation.contains($0) }.count
+        if s.count < 6, odd > 0 { return false }
         let letters = scalars.filter { CharacterSet.letters.contains($0) }
         let digits = scalars.filter { CharacterSet.decimalDigits.contains($0) }.count
         if digits > 0, letters.count <= 2 { return true }               // "230", "4B"
         let lower = String(String.UnicodeScalarView(letters)).lowercased()
         let vowels = lower.filter { "aeiouy".contains($0) }.count
-        guard vowels > 0 || lower.count <= 3 else { return false }      // "qzxvwkjp" out, "TV" in
+        // No vowel: only a known short word (TV, WC, PM) or a mostly-numeric string passes.
+        if vowels == 0, letters.count > 0, !shortWords.contains(String(String.UnicodeScalarView(letters)).uppercased()), digits == 0 { return false }
         // Runs of consonants longer than five are not English words.
         var run = 0
         for c in lower {
@@ -62,6 +66,8 @@ public actor TextVerifier {
         #endif
         return true
     }
+
+    static let shortWords: Set<String> = ["TV", "WC", "PM", "AM", "ML", "KG", "CM", "MM", "KM", "HD", "OK", "ON", "NO", "GO", "UP", "DR", "ST", "MR", "MS", "EXIT", "WIFI", "ATM"]
 
     public static func gate(_ lines: [String]) -> [String] { lines.filter(plausible) }
 

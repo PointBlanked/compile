@@ -11,6 +11,7 @@
 		353C0228E90A352BE56AD794 /* AppRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF490F8AE51962283E50B561 /* AppRuntime.swift */; };
 		919657EDF72BAF9CFFFCE51A /* BenchmarkReport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31876A8878587ADCBBF59F43 /* BenchmarkReport.swift */; };
 		CC09AA3C10C407305E64D271 /* CameraPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 87CD410DC9D1DAF6EDCED907 /* CameraPreview.swift */; };
+		CF2B55BCA403CFEA24B0766E /* DeviceMotionGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FA57D9D377E640BA96C22D2 /* DeviceMotionGate.swift */; };
 		0459EACAAA5564535521EB1A /* EchoGuideApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47616655E11BEC9506AFC0AF /* EchoGuideApp.swift */; };
 		E5CE96FC9D16D36A99088B5A /* MainView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D14A3E69BEB6CABD230E139F /* MainView.swift */; };
 		7CF4D7277DFBDA985417C955 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 160F2521AC368CCA20755FCE /* OnboardingView.swift */; };
@@ -27,6 +28,7 @@
 		EF490F8AE51962283E50B561 /* AppRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRuntime.swift; sourceTree = "<group>"; };
 		31876A8878587ADCBBF59F43 /* BenchmarkReport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchmarkReport.swift; sourceTree = "<group>"; };
 		87CD410DC9D1DAF6EDCED907 /* CameraPreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraPreview.swift; sourceTree = "<group>"; };
+		6FA57D9D377E640BA96C22D2 /* DeviceMotionGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceMotionGate.swift; sourceTree = "<group>"; };
 		47616655E11BEC9506AFC0AF /* EchoGuideApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EchoGuideApp.swift; sourceTree = "<group>"; };
 		D14A3E69BEB6CABD230E139F /* MainView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainView.swift; sourceTree = "<group>"; };
 		160F2521AC368CCA20755FCE /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
@@ -66,6 +68,7 @@
 				EF490F8AE51962283E50B561 /* AppRuntime.swift */,
 				31876A8878587ADCBBF59F43 /* BenchmarkReport.swift */,
 				87CD410DC9D1DAF6EDCED907 /* CameraPreview.swift */,
+				6FA57D9D377E640BA96C22D2 /* DeviceMotionGate.swift */,
 				47616655E11BEC9506AFC0AF /* EchoGuideApp.swift */,
 				D14A3E69BEB6CABD230E139F /* MainView.swift */,
 				160F2521AC368CCA20755FCE /* OnboardingView.swift */,
@@ -168,6 +171,7 @@
 				353C0228E90A352BE56AD794 /* AppRuntime.swift in Sources */,
 				919657EDF72BAF9CFFFCE51A /* BenchmarkReport.swift in Sources */,
 				CC09AA3C10C407305E64D271 /* CameraPreview.swift in Sources */,
+				CF2B55BCA403CFEA24B0766E /* DeviceMotionGate.swift in Sources */,
 				0459EACAAA5564535521EB1A /* EchoGuideApp.swift in Sources */,
 				E5CE96FC9D16D36A99088B5A /* MainView.swift in Sources */,
 				7CF4D7277DFBDA985417C955 /* OnboardingView.swift in Sources */,
