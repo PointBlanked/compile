@@ -6,22 +6,24 @@ set -euo pipefail
 TARGET="${1:-auto-vision-audio-engine}"
 REMOTE_URL="${REMOTE_URL:-https://github.com/PointBlanked/compile.git}"
 
-mkdir -p .github .github/workflows EchoGuide/Core/Audio EchoGuide/Core/Automation EchoGuide/Core/Camera EchoGuide/Core/Cognitive EchoGuide/Core/Contracts EchoGuide/Core/Depth EchoGuide/Core/Fence EchoGuide/Core/Haptics EchoGuide/Core/Plugins EchoGuide/Core/Router EchoGuide/Core/Vision EchoGuide/UI EchoGuideTests plugins
+mkdir -p .github .github/workflows EchoGuide/Core/Audio EchoGuide/Core/Automation EchoGuide/Core/Camera EchoGuide/Core/Cognitive EchoGuide/Core/Contracts EchoGuide/Core/Depth EchoGuide/Core/Fence EchoGuide/Core/Haptics EchoGuide/Core/Plugins EchoGuide/Core/Router EchoGuide/Core/Vision EchoGuide/UI EchoGuideApp EchoGuideApp/Assets.xcassets EchoGuideApp/Assets.xcassets/AppIcon.appiconset EchoGuideApp/EchoGuideApp.xcodeproj EchoGuideApp/EchoGuideApp.xcodeproj/xcshareddata/xcschemes EchoGuideApp/Resources EchoGuideApp/Resources/Models EchoGuideApp/Sources EchoGuideTests plugins proxy
 
 cat > '.github/CODEOWNERS' <<'EOF_AVAE'
 # Two owners. PRs touching a path need that owner's review.
-# Replace @maxwell / @bryan with real GitHub usernames.
+# @bryan is a placeholder: replace it with Bryan's GitHub username.
 
 # Maxwell: perception + infrastructure
-/EchoGuide/Core/Camera/      @maxwell
-/EchoGuide/Core/Vision/      @maxwell
-/EchoGuide/Core/Depth/       @maxwell
-/EchoGuide/Core/Plugins/     @maxwell
-/EchoGuide/Core/Router/      @maxwell
-/EchoGuideTests/             @maxwell
-/.github/                    @maxwell
-/Package.swift               @maxwell
-/plugins/                    @maxwell
+/EchoGuide/Core/Camera/      @mkhavari-spec
+/EchoGuide/Core/Vision/      @mkhavari-spec
+/EchoGuide/Core/Depth/       @mkhavari-spec
+/EchoGuide/Core/Plugins/     @mkhavari-spec
+/EchoGuide/Core/Router/      @mkhavari-spec
+/EchoGuideTests/             @mkhavari-spec
+/.github/                    @mkhavari-spec
+/Package.swift               @mkhavari-spec
+/plugins/                    @mkhavari-spec
+/proxy/                      @mkhavari-spec
+/EchoGuideApp/               @mkhavari-spec
 
 # Bryan: everything the user feels, hears and sees
 /EchoGuide/Core/Fence/       @bryan
@@ -32,7 +34,139 @@ cat > '.github/CODEOWNERS' <<'EOF_AVAE'
 /EchoGuide/UI/               @bryan
 
 # Shared contracts: both sign off.
-/EchoGuide/Core/Contracts/   @maxwell @bryan
+/EchoGuide/Core/Contracts/   @mkhavari-spec @bryan
+EOF_AVAE
+
+cat > '.github/workflows/export-model.yml' <<'EOF_AVAE'
+# Owner: Maxwell. Manual: exports YOLO to Core ML INT8 with NMS and attaches it
+# as a build artifact. Download it, put it in EchoGuideApp/Resources/Models/.
+# Ultralytics YOLO is AGPL-3.0: a closed-source app needs an Ultralytics
+# Enterprise license, or swap in a permissively licensed detector.
+
+name: export-model
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Ultralytics weights"
+        default: "yolo11n.pt"
+        required: true
+      imgsz:
+        description: "Input size"
+        default: "640"
+        required: true
+
+jobs:
+  export:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Export
+        run: |
+          python -m pip install --quiet "ultralytics>=8.3" "coremltools>=8"
+          yolo export model="${{ inputs.model }}" format=coreml int8=True nms=True imgsz=${{ inputs.imgsz }}
+          ls -la
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coreml-model
+          path: "*.mlpackage"
+EOF_AVAE
+
+cat > '.github/workflows/ios-release.yml' <<'EOF_AVAE'
+# Owner: Maxwell. Manual TestFlight upload. Uses Xcode cloud signing with an
+# App Store Connect API key, so no certificates or profiles live in the repo.
+#
+# Repo secrets needed (Settings > Secrets and variables > Actions):
+#   APPLE_TEAM_ID        10-character team id
+#   ASC_KEY_ID           App Store Connect API key id (Admin or App Manager role)
+#   ASC_ISSUER_ID        issuer id
+#   ASC_KEY_P8_BASE64    base64 of the AuthKey_XXXX.p8 file
+#   EG_PROXY_BASE_URL    deployed proxy URL baked into the build (optional)
+# The bundle id app.echoguide.EchoGuide must exist in App Store Connect.
+
+name: ios-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: "Build number (must increase every upload)"
+        required: true
+
+jobs:
+  testflight:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check secrets
+        env:
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          KEY: ${{ secrets.ASC_KEY_ID }}
+          ISSUER: ${{ secrets.ASC_ISSUER_ID }}
+          P8: ${{ secrets.ASC_KEY_P8_BASE64 }}
+        run: |
+          missing=""
+          [ -z "$TEAM" ] && missing="$missing APPLE_TEAM_ID"
+          [ -z "$KEY" ] && missing="$missing ASC_KEY_ID"
+          [ -z "$ISSUER" ] && missing="$missing ASC_ISSUER_ID"
+          [ -z "$P8" ] && missing="$missing ASC_KEY_P8_BASE64"
+          if [ -n "$missing" ]; then echo "::error::Missing secrets:$missing"; exit 1; fi
+
+      - name: Write API key
+        env:
+          P8: ${{ secrets.ASC_KEY_P8_BASE64 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/asc"
+          echo "$P8" | base64 --decode > "$RUNNER_TEMP/asc/key.p8"
+
+      - name: Archive
+        run: |
+          xcodebuild archive \
+            -project EchoGuideApp/EchoGuideApp.xcodeproj \
+            -scheme EchoGuideApp \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/EchoGuide.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc/key.p8" \
+            -authenticationKeyID "${{ secrets.ASC_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_ISSUER_ID }}" \
+            DEVELOPMENT_TEAM="${{ secrets.APPLE_TEAM_ID }}" \
+            CURRENT_PROJECT_VERSION="${{ inputs.build_number }}" \
+            EG_PROXY_BASE_URL="${{ secrets.EG_PROXY_BASE_URL }}" | tail -n 60
+          exit ${PIPESTATUS[0]}
+
+      - name: Upload to TestFlight
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>${{ secrets.APPLE_TEAM_ID }}</string>
+            <key>signingStyle</key><string>automatic</string>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/EchoGuide.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc/key.p8" \
+            -authenticationKeyID "${{ secrets.ASC_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_ISSUER_ID }}" | tail -n 40
+          exit ${PIPESTATUS[0]}
+
+      - name: Remove key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/asc"
 EOF_AVAE
 
 cat > '.github/workflows/swift-ci.yml' <<'EOF_AVAE'
@@ -80,6 +214,35 @@ jobs:
             -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO | tail -n 40
           exit ${PIPESTATUS[0]}
+
+  app-build:
+    name: Build the iOS app (EchoGuideApp)
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app for iOS Simulator
+        run: |
+          xcodebuild build \
+            -project EchoGuideApp/EchoGuideApp.xcodeproj \
+            -scheme EchoGuideApp \
+            -destination 'generic/platform=iOS Simulator' \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO | tail -n 40
+          exit ${PIPESTATUS[0]}
+
+  proxy-test:
+    name: Proxy tests (Node)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Test
+        working-directory: proxy
+        run: node --test
 EOF_AVAE
 
 cat > '.gitignore' <<'EOF_AVAE'
@@ -127,20 +290,29 @@ public actor SpatialAudioEngine: SpatialAudioCueing {
     private let synth = AVSpeechSynthesizer()
     private let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)!
     private var pingBuffer: AVAudioPCMBuffer?
+    private var wired = false
     private var started = false
+    private var observers: [NSObjectProtocol] = []
 
     public init() {}
 
+    /// Builds the graph once; (re)starts the engine whenever it is down.
+    /// A phone call, a route change (headphones out) or backgrounding stops
+    /// AVAudioEngine; the next cue brings it back instead of going silent.
     private func startIfNeeded() {
-        guard !started else { return }
-        engine.attach(environment)
-        engine.attach(player)
-        // Mono source into the environment node is what makes it positional.
-        engine.connect(player, to: environment, format: format)
-        engine.connect(environment, to: engine.mainMixerNode, format: nil)
-        player.renderingAlgorithm = .auto
-        environment.listenerPosition = AVAudio3DPoint(x: 0, y: 0, z: 0)
-        pingBuffer = Self.makePing(format: format)
+        if !wired {
+            engine.attach(environment)
+            engine.attach(player)
+            // Mono source into the environment node is what makes it positional.
+            engine.connect(player, to: environment, format: format)
+            engine.connect(environment, to: engine.mainMixerNode, format: nil)
+            player.renderingAlgorithm = .auto
+            environment.listenerPosition = AVAudio3DPoint(x: 0, y: 0, z: 0)
+            pingBuffer = Self.makePing(format: format)
+            observeInterruptions()
+            wired = true
+        }
+        guard !started || !engine.isRunning else { return }
         do {
             #if os(iOS)
             let s = AVAudioSession.sharedInstance()
@@ -156,12 +328,33 @@ public actor SpatialAudioEngine: SpatialAudioCueing {
         }
     }
 
+    private func observeInterruptions() {
+        let center = NotificationCenter.default
+        var names: [Notification.Name] = [.AVAudioEngineConfigurationChange]
+        #if os(iOS)
+        names += [AVAudioSession.interruptionNotification, AVAudioSession.routeChangeNotification]
+        #endif
+        for name in names {
+            observers.append(center.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
+                Task { await self?.markStopped() }
+            })
+        }
+    }
+
+    private func markStopped() { started = false }
+
     public func ping(azimuth: Float, elevation: Float) async {
         startIfNeeded()
         guard started, let pingBuffer else { return }
         let p = SpatialAudioMath.position(azimuth: azimuth, elevation: elevation)
         player.position = AVAudio3DPoint(x: p.x, y: p.y, z: p.z)
-        player.scheduleBuffer(pingBuffer, at: nil, options: .interrupts, completionHandler: nil)
+        schedule(pingBuffer)
+    }
+
+    /// Synchronous on purpose: the async `scheduleBuffer` variant would hold
+    /// the actor until the buffer has played.
+    private func schedule(_ buffer: AVAudioPCMBuffer) {
+        player.scheduleBuffer(buffer, at: nil, options: .interrupts, completionHandler: nil)
     }
 
     public func speak(_ text: String, azimuth: Float) async {
@@ -213,7 +406,10 @@ public enum AutomationState: Sendable, Equatable {
     case guiding(ActionStep)
     case onTarget(ActionStep)
     case completed(String)
+    /// Hand inside a spatial hazard zone.
     case warning(String)
+    /// User has walked out of a safe location region (dementia wandering).
+    case outsideSafeArea(String)
 }
 
 public struct AutomationConfig: Sendable {
@@ -228,6 +424,9 @@ public struct AutomationConfig: Sendable {
     /// Directional ping cadence while the target is off to one side.
     public var pingInterval: TimeInterval = 0.9
     public var fenceWarningInterval: TimeInterval = 3
+    /// A finished target is off the menu for this long, so "done" moves on to
+    /// the next step instead of guiding the finger back to the same button.
+    public var completedCooldown: TimeInterval = 8
 
     public init() {}
 }
@@ -248,7 +447,7 @@ public actor AutomationEngine {
     private var lastPingAt: TimeInterval = -.infinity
     private var lastSeenAt: TimeInterval = -.infinity
     private var onTargetSince: TimeInterval?
-    private var completedLabel: String?
+    private var completedUntil: [String: TimeInterval] = [:]
     private var lastFenceWarning: [String: TimeInterval] = [:]
     private var routedLabels: Set<String> = []
     private var continuations: [UUID: AsyncStream<AutomationState>.Continuation] = [:]
@@ -287,14 +486,29 @@ public actor AutomationEngine {
     public func setGoal(_ goal: String?) {
         isolation.goal = goal
         isolation.reset()
-        completedLabel = nil
+        completedUntil = [:]
+        lastSpokenLabel = nil
+        onTargetSince = nil
     }
 
-    public func start() { transition(.scanning) }
+    public var goal: String? { isolation.goal }
+
+    public func start() {
+        forgetTarget()
+        transition(.scanning)
+    }
 
     public func stop() async {
+        forgetTarget()
         transition(.idle)
         await haptics.stop()
+    }
+
+    private func forgetTarget() {
+        isolation.reset()
+        onTargetSince = nil
+        lastSpokenLabel = nil
+        lastSeenAt = -.infinity
     }
 
     // MARK: - Input
@@ -304,25 +518,33 @@ public actor AutomationEngine {
         let now = frame.timestamp
 
         if let fence, await handle(fence, at: now) { return }
+        // Wandering outside the safe area is cleared only by coming back.
+        if case .outsideSafeArea = state { return }
 
-        guard let step = isolation.isolate(frame) else {
+        // Recently finished targets are off the menu; prune expired ones.
+        completedUntil = completedUntil.filter { $0.value > now }
+        let excluded = Set(completedUntil.keys)
+        if excluded != isolation.excludedLabels { isolation.excludedLabels = excluded }
+
+        let step = isolation.isolate(frame)
+        if step != nil, isolation.isCurrentVisible { lastSeenAt = now }
+
+        // Nothing settled, or the settled target has not been seen for a while.
+        guard let step, isolation.isCurrentVisible || now - lastSeenAt <= config.lostTargetTimeout else {
             if now - lastSeenAt > config.lostTargetTimeout, state != .scanning {
+                // Drop only a remembered target; a challenger still settling
+                // keeps its frame count (frames are sparse in a still scene).
+                if step != nil { isolation.reset() }
                 onTargetSince = nil
+                lastSpokenLabel = nil
                 await haptics.stop()
                 transition(.scanning)
             }
             return
         }
-        lastSeenAt = now
-
-        // Finished target stays finished until the finger moves off it.
-        if step.targetLabel == completedLabel {
-            if case .align(let dx, let dy) = step.guidance, (dx * dx + dy * dy).squareRoot() > Alignment.tolerance * 3 {
-                completedLabel = nil
-            } else {
-                return
-            }
-        }
+        // The target dropped out of this frame: keep the last cue going, but
+        // do not announce, confirm or complete against a remembered box.
+        guard isolation.isCurrentVisible else { return }
 
         await announceIfNeeded(step, at: now)
 
@@ -351,7 +573,7 @@ public actor AutomationEngine {
         transition(.onTarget(step))
 
         if let since = onTargetSince, now - since >= config.dwellToConfirm {
-            await complete(step)
+            await complete(step, at: now)
         }
     }
 
@@ -385,9 +607,11 @@ public actor AutomationEngine {
         await audio.speak(sentence, azimuth: azimuth)
     }
 
-    private func complete(_ step: ActionStep) async {
+    private func complete(_ step: ActionStep, at now: TimeInterval) async {
         onTargetSince = nil
-        completedLabel = step.targetLabel
+        completedUntil[step.targetLabel] = now + config.completedCooldown
+
+        await haptics.stop()
 
         guard let target = step.target, let tools, let match = await tools.match(target) else {
             transition(.completed(step.targetLabel))
@@ -402,7 +626,6 @@ public actor AutomationEngine {
             await audio.speak("That did not work.", azimuth: 0)
             transition(.completed(step.targetLabel))
         }
-        await haptics.stop()
     }
 
     // MARK: - Fence
@@ -411,6 +634,9 @@ public actor AutomationEngine {
     private func handle(_ event: FenceEvent, at now: TimeInterval) async -> Bool {
         switch event {
         case .breached(let zone):
+            // A hazard cancels any dwell in progress: the finger must settle on
+            // the target again, from scratch, before a physical tool can fire.
+            onTargetSince = nil
             await haptics.warn()
             if throttle(zone, at: now) { await audio.speak("Stop. \(zone.capitalizedFirst).", azimuth: 0) }
             transition(.warning(zone))
@@ -428,11 +654,12 @@ public actor AutomationEngine {
                 told = (try? await tools.invoke(alert)) != nil
             }
             await audio.speak(told ? "You have left \(region). Your carer has been told." : "You have left \(region).", azimuth: 0)
-            transition(.warning(region))
+            transition(.outsideSafeArea(region))
             return true
         case .returnedToSafeArea(let region):
             await audio.speak("You are back at \(region).", azimuth: 0)
-            transition(.scanning)
+            // Only the wandering alert is cleared; a paused engine stays paused.
+            if case .outsideSafeArea = state { transition(.scanning) }
             return false
         }
     }
@@ -827,10 +1054,23 @@ public struct CognitiveTaskIsolation: Sendable {
     public var config: CognitiveConfig
     /// When set, only matching labels or text are eligible ("start", "microwave").
     public var goal: String?
+    /// Labels temporarily off the menu, e.g. a target the user just finished.
+    /// AutomationEngine sets this so "done" moves on to the next step instead
+    /// of guiding the finger straight back to the same button.
+    public var excludedLabels: Set<String> = [] {
+        didSet {
+            if let cur = current, excludedLabels.contains(cur.label) { current = nil }
+            if let c = candidate, excludedLabels.contains(c.label) { candidate = nil; candidateFrames = 0 }
+        }
+    }
 
     private var current: Detection?
     private var candidate: Detection?
     private var candidateFrames = 0
+    /// True when the step returned by the last `isolate` came from a detection
+    /// in that frame; false when it is the remembered target of an earlier
+    /// frame. The caller uses this to time out a target that has gone away.
+    public private(set) var isCurrentVisible = false
 
     public init(config: CognitiveConfig = CognitiveConfig(), goal: String? = nil) {
         self.config = config
@@ -841,12 +1081,14 @@ public struct CognitiveTaskIsolation: Sendable {
         current = nil
         candidate = nil
         candidateFrames = 0
+        isCurrentVisible = false
     }
 
     /// The one step for this frame, or nil when nothing is settled yet.
     public mutating func isolate(_ frame: VisionFrameResult) -> ActionStep? {
         let anchor = frame.fingertip?.box.mid ?? .center
         let eligible = frame.targets.filter(isEligible)
+        isCurrentVisible = false
         guard let best = eligible.max(by: { score($0, anchor: anchor) < score($1, anchor: anchor) }) else {
             candidate = nil
             candidateFrames = 0
@@ -859,6 +1101,7 @@ public struct CognitiveTaskIsolation: Sendable {
         // best rival is clearly better.
         if let cur = current, let refreshed = eligible.first(where: { isSame($0, cur) }) {
             current = refreshed
+            isCurrentVisible = true
             let rivalWins = !isSame(best, refreshed)
                 && score(best, anchor: anchor) > score(refreshed, anchor: anchor) * config.switchMargin
             if !rivalWins {
@@ -872,13 +1115,13 @@ public struct CognitiveTaskIsolation: Sendable {
         if let c = candidate, isSame(c, best) {
             candidateFrames += 1
         } else {
-            candidate = best
             candidateFrames = 1
         }
         candidate = best
 
-        if candidateFrames >= config.settleFrames || current == nil && config.settleFrames <= 1 {
+        if candidateFrames >= config.settleFrames {
             current = best
+            isCurrentVisible = true
             candidate = nil
             candidateFrames = 0
         }
@@ -896,7 +1139,7 @@ public struct CognitiveTaskIsolation: Sendable {
     }
 
     private func isEligible(_ d: Detection) -> Bool {
-        if config.ignoredLabels.contains(d.label) { return false }
+        if config.ignoredLabels.contains(d.label) || excludedLabels.contains(d.label) { return false }
         if let goal { return matches(d, goal) }
         return true
     }
@@ -1434,34 +1677,61 @@ public struct SpatialFence: Sendable {
     ])
 
     /// Evaluate one frame. `handDepth` and `zoneDepth` are metres from LiDAR,
-    /// nil when unknown (then the 2-D test alone decides). Returns the most
-    /// severe event: a breach beats an approach.
+    /// nil when unknown (then the 2-D test alone decides). One `zoneDepth`
+    /// applies to every zone; use `evaluate(_:depth:)` to sample each zone.
+    /// Returns the most severe event: a breach beats an approach.
     public func evaluate(_ frame: VisionFrameResult, handDepth: Float? = nil, zoneDepth: Float? = nil) -> FenceEvent? {
         guard let tip = frame.fingertip?.box.mid else { return nil }
+        let gap: Float? = {
+            guard let h = handDepth, let z = zoneDepth else { return nil }
+            return abs(z - h)
+        }()
+        return resolve(tip: tip, candidates: candidates(in: frame).map { ($0.zone, $0.rect, gap) })
+    }
+
+    /// Evaluate one frame against a live depth source (LiDAR). The hand and
+    /// the centre of every zone rect are sampled, so a hob at 1.2 m and a
+    /// knife at 0.4 m each get their own distance to the hand. A zone whose
+    /// depth is unknown falls back to the 2-D test.
+    public func evaluate(_ frame: VisionFrameResult, depth: DepthProviding?) async -> FenceEvent? {
+        guard let tip = frame.fingertip?.box.mid else { return nil }
+        let pairs = candidates(in: frame)
+        guard let depth, !pairs.isEmpty, let hand = await depth.depth(at: tip) else {
+            return resolve(tip: tip, candidates: pairs.map { ($0.zone, $0.rect, nil) })
+        }
+        var withGap: [(SpatialFenceZone, ImageRect, Float?)] = []
+        withGap.reserveCapacity(pairs.count)
+        for (zone, rect) in pairs {
+            let z = await depth.depth(at: rect.mid)
+            withGap.append((zone, rect, z.map { abs($0 - hand) }))
+        }
+        return resolve(tip: tip, candidates: withGap)
+    }
+
+    private func candidates(in frame: VisionFrameResult) -> [(zone: SpatialFenceZone, rect: ImageRect)] {
+        zones.flatMap { zone in rects(for: zone, in: frame).map { (zone, $0) } }
+    }
+
+    /// `candidates` carries each zone rect with the hand-to-zone depth gap in
+    /// metres (nil when unknown).
+    private func resolve(tip: ImagePoint, candidates: [(SpatialFenceZone, ImageRect, Float?)]) -> FenceEvent? {
         var approaching: FenceEvent?
 
-        for zone in zones {
-            for rect in rects(for: zone, in: frame) {
-                let depthGap: Float? = {
-                    guard let h = handDepth, let z = zoneDepth else { return nil }
-                    return abs(z - h)
-                }()
-
-                if rect.contains(tip) {
-                    // Overlapping in 2-D but clearly far apart in depth is not contact.
-                    if let gap = depthGap, gap > zone.warningDepthMetres {
-                        approaching = approaching ?? .approaching(zone: zone.name, metres: gap)
-                        continue
-                    }
-                    return .breached(zone: zone.name)
+        for (zone, rect, depthGap) in candidates {
+            if rect.contains(tip) {
+                // Overlapping in 2-D but clearly far apart in depth is not contact.
+                if let gap = depthGap, gap > zone.warningDepthMetres {
+                    approaching = approaching ?? .approaching(zone: zone.name, metres: gap)
+                    continue
                 }
+                return .breached(zone: zone.name)
+            }
 
-                let m = zone.warningMargin
-                let warn = ImageRect(x: rect.x - m, y: rect.y - m, width: rect.width + 2 * m, height: rect.height + 2 * m)
-                if warn.contains(tip), approaching == nil {
-                    if let gap = depthGap, gap > zone.warningDepthMetres { continue }
-                    approaching = .approaching(zone: zone.name, metres: depthGap)
-                }
+            let m = zone.warningMargin
+            let warn = ImageRect(x: rect.x - m, y: rect.y - m, width: rect.width + 2 * m, height: rect.height + 2 * m)
+            if warn.contains(tip), approaching == nil {
+                if let gap = depthGap, gap > zone.warningDepthMetres { continue }
+                approaching = .approaching(zone: zone.name, metres: depthGap)
             }
         }
         return approaching
@@ -1516,16 +1786,24 @@ public struct SafeArea: Sendable, Equatable, Codable {
 public struct LocationFence: Sendable {
     public var areas: [SafeArea]
     /// Must be outside every area for this long before `leftSafeArea` fires.
-    public var exitDwell: TimeInterval = 45
+    public var exitDwell: TimeInterval
     /// Fixes worse than this are ignored (indoor GPS can be 100 m+ off).
-    public var maxAccuracyMetres: Double = 65
+    public var maxAccuracyMetres: Double
 
-    private(set) var insideArea: String?
+    /// Name of the area the last good fix was inside, nil when outside all.
+    public private(set) var insideArea: String?
     private var outsideSince: TimeInterval?
     private var reportedExit = false
     private var lastArea: String?
 
-    public init(areas: [SafeArea]) { self.areas = areas }
+    /// True once an exit has been reported and not yet cancelled by a return.
+    public var isOutside: Bool { reportedExit }
+
+    public init(areas: [SafeArea], exitDwell: TimeInterval = 45, maxAccuracyMetres: Double = 65) {
+        self.areas = areas
+        self.exitDwell = exitDwell
+        self.maxAccuracyMetres = maxAccuracyMetres
+    }
 
     public mutating func update(_ c: GeoCoordinate, accuracyMetres: Double, at t: TimeInterval) -> FenceEvent? {
         guard accuracyMetres <= maxAccuracyMetres else { return nil }
@@ -1646,11 +1924,15 @@ public actor SpatialHapticEngine: HapticCueing {
     private var engine: CHHapticEngine?
     private var loop: Task<Void, Never>?
     private var current: HapticPulse?
-    private var lastConfirm: TimeInterval = 0
+    private var lastConfirm: Double = -.infinity
+    private let clock = FrameTimer()
 
     public init() {}
 
     public var isSupported: Bool { CHHapticEngine.capabilitiesForHardware().supportsHaptics }
+
+    /// True while the guidance pulse train is running (for telemetry and tests).
+    public var isGuiding: Bool { current != nil }
 
     private func ensureEngine() throws -> CHHapticEngine? {
         guard isSupported else { return nil }
@@ -1680,9 +1962,11 @@ public actor SpatialHapticEngine: HapticCueing {
     }
 
     public func confirm() async {
+        // On target: the guidance train stops, whoever called us.
+        current = nil
         // Debounce: hovering on target should not buzz continuously.
-        let now = Date().timeIntervalSince1970
-        guard now - lastConfirm > 1.0 else { return }
+        let now = clock.elapsedMs
+        guard now - lastConfirm > 1_000 else { return }
         lastConfirm = now
         play([(0, 1.0, 0.9), (0.09, 1.0, 0.9)])
     }
@@ -1714,7 +1998,12 @@ public actor SpatialHapticEngine: HapticCueing {
         return p
     }
 
-    private func loopEnded() { loop = nil }
+    private func loopEnded() {
+        loop = nil
+        // A guide() that landed between the loop's last tick and this call
+        // would otherwise wait for the next frame; pick it up now.
+        if current != nil { startLoop() }
+    }
 
     /// (relativeTime, intensity, sharpness) transients.
     private func play(_ events: [(TimeInterval, Float, Float)]) {
@@ -2675,6 +2964,235 @@ public final class PathConnectivity: Connectivity, @unchecked Sendable {
 #endif
 EOF_AVAE
 
+cat > 'EchoGuide/Core/Router/VoiceLoop.swift' <<'EOF_AVAE'
+// Owner: Maxwell. Optional voice layer on top of the hands-free core.
+//
+//   mic (16 kHz PCM16) --WebSocket--> Deepgram live STT --> transcripts
+//   text --HTTP stream--> ElevenLabs TTS (through the proxy) --> PCM chunks
+//
+// Keys never ship: the proxy mints a 30-second Deepgram token per session and
+// forwards TTS. Offline, none of this runs and on-device speech carries on;
+// voice is a convenience ("find the start button"), never a requirement.
+
+import Foundation
+import EchoGuideContracts
+
+public struct Transcript: Sendable, Equatable {
+    public var text: String
+    /// Deepgram `is_final`: this segment will not be revised.
+    public var isFinal: Bool
+    /// Deepgram `speech_final`: the speaker paused; act on it now.
+    public var endOfUtterance: Bool
+}
+
+/// What a spoken sentence asks for. Deliberately tiny: two intents cover the
+/// hands-free product; anything else becomes a question for the router.
+public enum VoiceIntent: Sendable, Equatable {
+    case find(String)
+    case stop
+    case question(String)
+
+    public static func parse(_ raw: String) -> VoiceIntent? {
+        let s = raw.lowercased().trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+        guard !s.isEmpty else { return nil }
+        if ["stop", "cancel", "never mind", "nevermind"].contains(s) { return .stop }
+        for prefix in ["find the ", "find my ", "find ", "where is the ", "where is my ", "where's the ", "where is ", "show me the "] where s.hasPrefix(prefix) {
+            let target = String(s.dropFirst(prefix.count))
+            if !target.isEmpty { return .find(target) }
+        }
+        return .question(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+}
+
+enum DeepgramMessage {
+    /// Parses one Deepgram live `Results` message; nil for metadata/keepalive.
+    static func transcript(from data: Data) -> Transcript? {
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              json["type"] as? String == "Results",
+              let channel = json["channel"] as? [String: Any],
+              let alts = channel["alternatives"] as? [[String: Any]],
+              let text = alts.first?["transcript"] as? String, !text.isEmpty else { return nil }
+        return Transcript(text: text, isFinal: json["is_final"] as? Bool ?? false, endOfUtterance: json["speech_final"] as? Bool ?? false)
+    }
+}
+
+public actor DeepgramSTTClient {
+    private let proxyBase: URL
+    private let transport: HTTPTransport
+    private let deviceToken: @Sendable () async -> String?
+    private let session: URLSession
+    private var socket: URLSessionWebSocketTask?
+    private var keepAlive: Task<Void, Never>?
+
+    public init(proxyBase: URL, transport: HTTPTransport = URLSessionTransport(), session: URLSession = .shared,
+                deviceToken: @escaping @Sendable () async -> String?) {
+        self.proxyBase = proxyBase
+        self.transport = transport
+        self.session = session
+        self.deviceToken = deviceToken
+    }
+
+    /// Opens a live session. Feed audio with `send(_:)`; read from the stream.
+    public func start(model: String = "nova-3", language: String = "en") async throws -> AsyncThrowingStream<Transcript, Error> {
+        let grant = try await transport.postJSON(proxyBase.appendingPathComponent("v1/voice/stt-token"), body: [:], bearer: await deviceToken())
+        guard let token = grant["access_token"] as? String else { throw URLError(.userAuthenticationRequired) }
+
+        var comps = URLComponents(string: "wss://api.deepgram.com/v1/listen")!
+        comps.queryItems = [
+            .init(name: "model", value: model), .init(name: "language", value: language),
+            .init(name: "encoding", value: "linear16"), .init(name: "sample_rate", value: "16000"), .init(name: "channels", value: "1"),
+            .init(name: "interim_results", value: "true"), .init(name: "endpointing", value: "300"), .init(name: "smart_format", value: "true"),
+        ]
+        var req = URLRequest(url: comps.url!)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let ws = session.webSocketTask(with: req)
+        socket = ws
+        ws.resume()
+
+        // Deepgram closes idle sockets after ~10 s without audio.
+        keepAlive = Task { [weak ws] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                try? await ws?.send(.string(#"{"type":"KeepAlive"}"#))
+            }
+        }
+
+        return AsyncThrowingStream { continuation in
+            let reader = Task {
+                do {
+                    while true {
+                        let message = try await ws.receive()
+                        let data: Data
+                        switch message {
+                        case .string(let s): data = Data(s.utf8)
+                        case .data(let d): data = d
+                        @unknown default: continue
+                        }
+                        if let t = DeepgramMessage.transcript(from: data) { continuation.yield(t) }
+                    }
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in reader.cancel() }
+        }
+    }
+
+    /// 16 kHz mono little-endian PCM16.
+    public func send(_ pcm: Data) async throws {
+        try await socket?.send(.data(pcm))
+    }
+
+    public func stop() async {
+        keepAlive?.cancel()
+        try? await socket?.send(.string(#"{"type":"CloseStream"}"#))
+        socket?.cancel(with: .normalClosure, reason: nil)
+        socket = nil
+    }
+}
+
+public struct ElevenLabsTTSClient: Sendable {
+    public var proxyBase: URL
+    public var voiceID: String
+    public var session: URLSession
+    public var deviceToken: @Sendable () async -> String?
+
+    public init(proxyBase: URL, voiceID: String, session: URLSession = .shared, deviceToken: @escaping @Sendable () async -> String?) {
+        self.proxyBase = proxyBase
+        self.voiceID = voiceID
+        self.session = session
+        self.deviceToken = deviceToken
+    }
+
+    /// Streams 16 kHz mono PCM16 in chunks as they arrive, so playback starts
+    /// on the first chunk rather than after the whole sentence.
+    public func speak(_ text: String, chunkBytes: Int = 3200, onChunk: @Sendable (Data) async -> Void) async throws {
+        var req = URLRequest(url: proxyBase.appendingPathComponent("v1/voice/tts"))
+        req.httpMethod = "POST"
+        req.timeoutInterval = 8
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = await deviceToken() { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["text": text, "voice_id": voiceID])
+
+        let (bytes, response) = try await session.bytes(for: req)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw HTTPStatusError(status: (response as? HTTPURLResponse)?.statusCode ?? 0)
+        }
+        var buffer = Data()
+        buffer.reserveCapacity(chunkBytes)
+        for try await byte in bytes {
+            buffer.append(byte)
+            if buffer.count >= chunkBytes {
+                await onChunk(buffer)
+                buffer.removeAll(keepingCapacity: true)
+            }
+        }
+        if !buffer.isEmpty { await onChunk(buffer) }
+    }
+}
+
+#if canImport(AVFoundation) && os(iOS)
+import AVFoundation
+
+/// Microphone -> 16 kHz mono PCM16 for Deepgram, plus a streaming PCM player
+/// for ElevenLabs. Shares the app's AVAudioSession; does not change category.
+public final class VoiceAudioIO: @unchecked Sendable {
+    private let engine = AVAudioEngine()
+    private let player = AVAudioPlayerNode()
+    private let pcm16k = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000, channels: 1, interleaved: true)!
+    private let playFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
+    private var converter: AVAudioConverter?
+
+    public init() {
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: playFormat)
+    }
+
+    public func startCapture(onAudio: @escaping @Sendable (Data) -> Void) throws {
+        let input = engine.inputNode
+        let inFormat = input.outputFormat(forBus: 0)
+        converter = AVAudioConverter(from: inFormat, to: pcm16k)
+        input.installTap(onBus: 0, bufferSize: 1024, format: inFormat) { [weak self] buffer, _ in
+            guard let self, let converter = self.converter else { return }
+            let ratio = 16_000 / inFormat.sampleRate
+            let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
+            guard let out = AVAudioPCMBuffer(pcmFormat: self.pcm16k, frameCapacity: capacity) else { return }
+            var fed = false
+            var error: NSError?
+            converter.convert(to: out, error: &error) { _, status in
+                if fed { status.pointee = .noDataNow; return nil }
+                fed = true
+                status.pointee = .haveData
+                return buffer
+            }
+            guard error == nil, out.frameLength > 0, let ch = out.int16ChannelData else { return }
+            onAudio(Data(bytes: ch[0], count: Int(out.frameLength) * 2))
+        }
+        if !engine.isRunning { try engine.start() }
+        player.play()
+    }
+
+    public func stopCapture() {
+        engine.inputNode.removeTap(onBus: 0)
+    }
+
+    /// Queue one PCM16 chunk from ElevenLabs for gapless playback.
+    public func play(pcm16 chunk: Data) {
+        let frames = chunk.count / 2
+        guard frames > 0, let buf = AVAudioPCMBuffer(pcmFormat: playFormat, frameCapacity: AVAudioFrameCount(frames)),
+              let out = buf.floatChannelData?[0] else { return }
+        buf.frameLength = AVAudioFrameCount(frames)
+        chunk.withUnsafeBytes { raw in
+            let src = raw.bindMemory(to: Int16.self)
+            for i in 0..<frames { out[i] = Float(Int16(littleEndian: src[i])) / 32768 }
+        }
+        if !engine.isRunning { try? engine.start(); player.play() }
+        player.scheduleBuffer(buf, completionHandler: nil)
+    }
+}
+#endif
+EOF_AVAE
+
 cat > 'EchoGuide/Core/Vision/LocalVisionEngine.swift' <<'EOF_AVAE'
 // Owner: Maxwell. On-device inference for frames FrameDeltaEngine let through:
 //   * YOLOv8n / YOLO11n INT8 Core ML (exported with nms=True) on the Neural Engine
@@ -2852,6 +3370,8 @@ cat > 'EchoGuide/UI/GuidanceView.swift' <<'EOF_AVAE'
 // Owner: Bryan. The screen is secondary: audio and haptics carry the product.
 // What is shown is for low-vision users and carers: one step, huge, yellow on
 // black, Dynamic Type, and VoiceOver reads the same sentence the audio speaks.
+// A carer gets one big Pause/Resume control and the current goal; nothing
+// else competes with the step.
 
 #if canImport(SwiftUI)
 import SwiftUI
@@ -2862,19 +3382,46 @@ import EchoGuideContracts
 @Observable
 public final class GuidanceModel {
     public private(set) var state: AutomationState = .idle
+    public private(set) var goal: String?
+    private var engine: AutomationEngine?
     private var task: Task<Void, Never>?
 
     public init() {}
 
     public func bind(to engine: AutomationEngine) {
+        self.engine = engine
         task?.cancel()
         task = Task { [weak self] in
             for await s in await engine.states() {
                 self?.state = s
             }
         }
+        Task { [weak self] in
+            let g = await engine.goal
+            self?.goal = g
+        }
     }
 
+    public var isPaused: Bool { state == .idle }
+
+    /// Carer control. Pausing silences haptics; resuming returns to scanning.
+    public func togglePaused() {
+        guard let engine else { return }
+        let resume = isPaused
+        Task {
+            if resume { await engine.start() } else { await engine.stop() }
+        }
+    }
+
+    public func setGoal(_ goal: String?) {
+        let trimmed = goal?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = (trimmed?.isEmpty ?? true) ? nil : trimmed
+        self.goal = value
+        guard let engine else { return }
+        Task { await engine.setGoal(value) }
+    }
+
+    /// The one line that matters, in the words the audio speaks.
     var headline: String {
         switch state {
         case .idle: return "Paused"
@@ -2882,38 +3429,941 @@ public final class GuidanceModel {
         case .guiding(let step), .onTarget(let step): return step.instruction
         case .completed(let what): return "Done. \(what)"
         case .warning(let what): return "Stop. \(what.capitalizedFirst)"
+        case .outsideSafeArea(let region): return "You have left \(region)"
+        }
+    }
+
+    /// Secondary line: what happens next, for a carer reading over a shoulder.
+    var detail: String? {
+        switch state {
+        case .idle: return "Tap Resume to start guiding"
+        case .scanning: return goal.map { "Looking for \"\($0)\"" } ?? "Point the camera at the task"
+        case .guiding: return "Follow the pulses"
+        case .onTarget: return "Hold still"
+        case .completed: return "Next step coming"
+        case .warning: return "Move your hand away"
+        case .outsideSafeArea: return "Go back the way you came"
         }
     }
 
     var isWarning: Bool {
-        if case .warning = state { return true }
+        switch state {
+        case .warning, .outsideSafeArea: return true
+        default: return false
+        }
+    }
+
+    var isOnTarget: Bool {
+        if case .onTarget = state { return true }
         return false
     }
 }
 
 public struct GuidanceView: View {
     @State private var model: GuidanceModel
+    /// Set to show the goal field; carers type "start" or "microwave".
+    public var showsGoalField: Bool
+    @State private var goalDraft = ""
 
-    public init(model: GuidanceModel) {
+    public init(model: GuidanceModel, showsGoalField: Bool = true) {
         _model = State(initialValue: model)
+        self.showsGoalField = showsGoalField
     }
+
+    private var background: Color {
+        if model.isWarning { return .red }
+        if model.isOnTarget { return Color(red: 0, green: 0.35, blue: 0) }
+        return .black
+    }
+
+    private var foreground: Color { model.isWarning ? .white : .yellow }
 
     public var body: some View {
         ZStack {
-            (model.isWarning ? Color.red : Color.black).ignoresSafeArea()
-            Text(model.headline)
-                .font(.system(.largeTitle, design: .rounded, weight: .heavy))
-                .foregroundStyle(model.isWarning ? Color.white : Color.yellow)
-                .multilineTextAlignment(.center)
-                .minimumScaleFactor(0.5)
-                .padding(24)
-                .accessibilityAddTraits(.updatesFrequently)
+            background.ignoresSafeArea()
+                .animation(.easeInOut(duration: 0.2), value: model.isWarning)
+
+            VStack(spacing: 16) {
+                Spacer(minLength: 0)
+
+                Text(model.headline)
+                    .font(.system(.largeTitle, design: .rounded, weight: .heavy))
+                    .foregroundStyle(foreground)
+                    .multilineTextAlignment(.center)
+                    .minimumScaleFactor(0.5)
+                    .padding(.horizontal, 24)
+                    .accessibilityAddTraits(.updatesFrequently)
+
+                if let detail = model.detail {
+                    Text(detail)
+                        .font(.system(.title2, design: .rounded, weight: .semibold))
+                        .foregroundStyle(foreground.opacity(0.8))
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 24)
+                }
+
+                Spacer(minLength: 0)
+
+                if showsGoalField {
+                    goalField
+                }
+
+                Button(action: model.togglePaused) {
+                    Label(model.isPaused ? "Resume" : "Pause", systemImage: model.isPaused ? "play.fill" : "pause.fill")
+                        .font(.system(.title, design: .rounded, weight: .bold))
+                        .frame(maxWidth: .infinity, minHeight: 72)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(model.isPaused ? .green : .gray)
+                .foregroundStyle(.white)
+                .padding(.horizontal, 24)
+                .padding(.bottom, 16)
+                .accessibilityHint(model.isPaused ? "Starts guiding again" : "Stops haptics and speech")
+            }
         }
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
         .accessibilityLabel(model.headline)
+        .accessibilityValue(model.detail ?? "")
+    }
+
+    private var goalField: some View {
+        HStack(spacing: 12) {
+            TextField("Goal, e.g. start", text: $goalDraft)
+                .font(.system(.title3, design: .rounded))
+                .textFieldStyle(.roundedBorder)
+                .submitLabel(.done)
+                .onSubmit { model.setGoal(goalDraft) }
+                .accessibilityLabel("Goal")
+                .accessibilityHint("Only matching buttons or words are offered")
+            if model.goal != nil {
+                Button("Clear") {
+                    goalDraft = ""
+                    model.setGoal(nil)
+                }
+                .font(.system(.title3, design: .rounded, weight: .semibold))
+                .foregroundStyle(foreground)
+            }
+        }
+        .padding(.horizontal, 24)
+        .onAppear { goalDraft = model.goal ?? "" }
     }
 }
 #endif
+EOF_AVAE
+
+cat > 'EchoGuideApp/Assets.xcassets/AppIcon.appiconset/Contents.json' <<'EOF_AVAE'
+{
+  "images" : [ { "filename" : "icon-1024.png", "idiom" : "universal", "platform" : "ios", "size" : "1024x1024" } ],
+  "info" : { "author" : "xcode", "version" : 1 }
+}
+EOF_AVAE
+
+base64 --decode > 'EchoGuideApp/Assets.xcassets/AppIcon.appiconset/icon-1024.png' <<'EOF_AVAE'
+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
+EOF_AVAE
+
+cat > 'EchoGuideApp/Assets.xcassets/Contents.json' <<'EOF_AVAE'
+{ "info" : { "author" : "xcode", "version" : 1 } }
+EOF_AVAE
+
+cat > 'EchoGuideApp/EchoGuideApp.xcodeproj/project.pbxproj' <<'EOF_AVAE'
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 60;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0459EACAAA5564535521EB1A /* EchoGuideApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47616655E11BEC9506AFC0AF /* EchoGuideApp.swift */; };
+		353C0228E90A352BE56AD794 /* AppRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF490F8AE51962283E50B561 /* AppRuntime.swift */; };
+		3583E46383EC623FB6C309F3 /* AppConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = E7317046C94C5A60F7F5DD7D /* AppConfig.swift */; };
+		919657EDF72BAF9CFFFCE51A /* BenchmarkReport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31876A8878587ADCBBF59F43 /* BenchmarkReport.swift */; };
+		262673F27DBD85E2AEF9A09A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = BBE03F3784F40D95E23D8465 /* Assets.xcassets */; };
+		0EB3440FE35D7D55FB80BBA6 /* echoguide.sample.json in Resources */ = {isa = PBXBuildFile; fileRef = 51C0FCA7140C933DC84EB2E5 /* echoguide.sample.json */; };
+		64329A7C11B75311EA1E5D86 /* Models in Resources */ = {isa = PBXBuildFile; fileRef = 4BBB164D9E56DFB73145D0D2 /* Models */; };
+		897E45C50F8B0A538BECDBE0 /* EchoGuide in Frameworks */ = {isa = PBXBuildFile; productRef = 2BAFBE90D711F96380E9193E /* EchoGuide */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		7F6D01D6546BCD07518D8398 /* EchoGuideApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = EchoGuideApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		47616655E11BEC9506AFC0AF /* EchoGuideApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EchoGuideApp.swift; sourceTree = "<group>"; };
+		EF490F8AE51962283E50B561 /* AppRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRuntime.swift; sourceTree = "<group>"; };
+		E7317046C94C5A60F7F5DD7D /* AppConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfig.swift; sourceTree = "<group>"; };
+		31876A8878587ADCBBF59F43 /* BenchmarkReport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BenchmarkReport.swift; sourceTree = "<group>"; };
+		BBE03F3784F40D95E23D8465 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Assets.xcassets; path = Assets.xcassets; sourceTree = "<group>"; };
+		51C0FCA7140C933DC84EB2E5 /* echoguide.sample.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; name = echoguide.sample.json; path = Resources/echoguide.sample.json; sourceTree = "<group>"; };
+		4BBB164D9E56DFB73145D0D2 /* Models */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Models; path = Resources/Models; sourceTree = "<group>"; };
+		A15033AD4B7792BAAA520C3A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		3806DEFC96CD30D22C0E71FE /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				897E45C50F8B0A538BECDBE0 /* EchoGuide in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		2B731CEFC6751AAE0EC69B98 = {
+			isa = PBXGroup;
+			children = (
+				D8DBA3F9900DD17689CA0C4D /* Sources */,
+				307A90002D1285ED8C05A9E0 /* Resources */,
+				A15033AD4B7792BAAA520C3A /* Info.plist */,
+				A8CBE22D73EBCC4E5F27B59C /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		D8DBA3F9900DD17689CA0C4D /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				47616655E11BEC9506AFC0AF /* EchoGuideApp.swift */,
+				EF490F8AE51962283E50B561 /* AppRuntime.swift */,
+				E7317046C94C5A60F7F5DD7D /* AppConfig.swift */,
+				31876A8878587ADCBBF59F43 /* BenchmarkReport.swift */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		307A90002D1285ED8C05A9E0 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				BBE03F3784F40D95E23D8465 /* Assets.xcassets */,
+				51C0FCA7140C933DC84EB2E5 /* echoguide.sample.json */,
+				4BBB164D9E56DFB73145D0D2 /* Models */,
+			);
+			name = Resources;
+			sourceTree = "<group>";
+		};
+		A8CBE22D73EBCC4E5F27B59C /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				7F6D01D6546BCD07518D8398 /* EchoGuideApp.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		42AEFBAE01D2DFD981F7DA7D /* EchoGuideApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 94E92F4374F7B1A84E405A21 /* Build configuration list for PBXNativeTarget "EchoGuideApp" */;
+			buildPhases = (
+				DBAEDAAE674BE07D23447E75 /* Sources */,
+				3806DEFC96CD30D22C0E71FE /* Frameworks */,
+				B098093DFB498EF325D85EDF /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = EchoGuideApp;
+			packageProductDependencies = (
+				2BAFBE90D711F96380E9193E /* EchoGuide */,
+			);
+			productName = EchoGuideApp;
+			productReference = 7F6D01D6546BCD07518D8398 /* EchoGuideApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		46F86FAA6BBF9AC94A7E4595 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+			};
+			buildConfigurationList = 82BEFE99DEE50030C2229134 /* Build configuration list for PBXProject "EchoGuideApp" */;
+			compatibilityVersion = "Xcode 15.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 2B731CEFC6751AAE0EC69B98;
+			packageReferences = (
+				715E1E3F015A64BA0327CAEF /* XCLocalSwiftPackageReference ".." */,
+			);
+			productRefGroup = A8CBE22D73EBCC4E5F27B59C /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				42AEFBAE01D2DFD981F7DA7D /* EchoGuideApp */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		B098093DFB498EF325D85EDF /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				262673F27DBD85E2AEF9A09A /* Assets.xcassets in Resources */,
+				0EB3440FE35D7D55FB80BBA6 /* echoguide.sample.json in Resources */,
+				64329A7C11B75311EA1E5D86 /* Models in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		DBAEDAAE674BE07D23447E75 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0459EACAAA5564535521EB1A /* EchoGuideApp.swift in Sources */,
+				353C0228E90A352BE56AD794 /* AppRuntime.swift in Sources */,
+				3583E46383EC623FB6C309F3 /* AppConfig.swift in Sources */,
+				919657EDF72BAF9CFFFCE51A /* BenchmarkReport.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		4257995D5FEB097455192277 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				ONLY_ACTIVE_ARCH = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		CE7A3CB3B7BB14CB7E72BBF7 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				SWIFT_COMPILATION_MODE = wholemodule;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		A3F61B41957AEA1EFA63EB05 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				EG_PROXY_BASE_URL = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = app.echoguide.EchoGuide;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		FF8312F936D3A28646D453F8 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				EG_PROXY_BASE_URL = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks";
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = app.echoguide.EchoGuide;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		82BEFE99DEE50030C2229134 /* Build configuration list for PBXProject "EchoGuideApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4257995D5FEB097455192277 /* Debug */,
+				CE7A3CB3B7BB14CB7E72BBF7 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		94E92F4374F7B1A84E405A21 /* Build configuration list for PBXNativeTarget "EchoGuideApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A3F61B41957AEA1EFA63EB05 /* Debug */,
+				FF8312F936D3A28646D453F8 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		715E1E3F015A64BA0327CAEF /* XCLocalSwiftPackageReference ".." */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ..;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		2BAFBE90D711F96380E9193E /* EchoGuide */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = EchoGuide;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 46F86FAA6BBF9AC94A7E4595 /* Project object */;
+}
+EOF_AVAE
+
+cat > 'EchoGuideApp/EchoGuideApp.xcodeproj/xcshareddata/xcschemes/EchoGuideApp.xcscheme' <<'EOF_AVAE'
+<?xml version="1.0" encoding="UTF-8"?>
+<Scheme LastUpgradeVersion = "1600" version = "1.7">
+   <BuildAction parallelizeBuildables = "YES" buildImplicitDependencies = "YES">
+      <BuildActionEntries>
+         <BuildActionEntry buildForTesting = "YES" buildForRunning = "YES" buildForProfiling = "YES" buildForArchiving = "YES" buildForAnalyzing = "YES">
+            <BuildableReference BuildableIdentifier = "primary" BlueprintIdentifier = "42AEFBAE01D2DFD981F7DA7D" BuildableName = "EchoGuideApp.app" BlueprintName = "EchoGuideApp" ReferencedContainer = "container:EchoGuideApp.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
+      </BuildActionEntries>
+   </BuildAction>
+   <LaunchAction buildConfiguration = "Debug" selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB" launchStyle = "0" useCustomWorkingDirectory = "NO" ignoresPersistentStateOnLaunch = "NO" debugDocumentVersioning = "YES" debugServiceExtension = "internal" allowLocationSimulation = "YES">
+      <BuildableProductRunnable runnableDebuggingMode = "0">
+         <BuildableReference BuildableIdentifier = "primary" BlueprintIdentifier = "42AEFBAE01D2DFD981F7DA7D" BuildableName = "EchoGuideApp.app" BlueprintName = "EchoGuideApp" ReferencedContainer = "container:EchoGuideApp.xcodeproj">
+         </BuildableReference>
+      </BuildableProductRunnable>
+      <CommandLineArguments>
+         <CommandLineArgument argument = "-benchmark" isEnabled = "NO">
+         </CommandLineArgument>
+      </CommandLineArguments>
+   </LaunchAction>
+   <ArchiveAction buildConfiguration = "Release" revealArchiveInOrganizer = "YES">
+   </ArchiveAction>
+</Scheme>
+EOF_AVAE
+
+cat > 'EchoGuideApp/Info.plist' <<'EOF_AVAE'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>EchoGuide</string>
+	<key>EGProxyBaseURL</key>
+	<string>$(EG_PROXY_BASE_URL)</string>
+	<key>NSCameraUsageDescription</key>
+	<string>EchoGuide watches through the camera to find the one thing you need and guide your hand to it.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>If you turn on voice, EchoGuide listens for requests like "find the start button".</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>EchoGuide uses your location to tell your carer if you leave a safe area.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>EchoGuide uses your location, even when the screen is off, to tell your carer if you leave a safe area.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>location</string>
+	</array>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+		<string>still-camera</string>
+	</array>
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UIColorName</key>
+		<string></string>
+	</dict>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+</dict>
+</plist>
+EOF_AVAE
+
+cat > 'EchoGuideApp/Resources/Models/README.txt' <<'EOF_AVAE'
+Put the exported model here as yolo11n.mlpackage (or yolov8n.mlpackage).
+It is copied into the app as-is and compiled on first launch.
+Get it from the "export-model" GitHub Actions workflow (Actions tab > export-model > Run).
+Models are git-ignored. Check the Ultralytics AGPL-3.0 license before shipping (see README).
+EOF_AVAE
+
+cat > 'EchoGuideApp/Resources/echoguide.sample.json' <<'EOF_AVAE'
+{
+  "goal": null,
+  "plugins": { "productLookup": true },
+  "safeAreas": []
+}
+EOF_AVAE
+
+cat > 'EchoGuideApp/Sources/AppConfig.swift' <<'EOF_AVAE'
+// Owner: Maxwell. Everything the app reads at launch: the per-home config
+// file, secrets from the Keychain, and the vision model.
+
+import CoreML
+import Foundation
+import Security
+import EchoGuideInfra
+import EchoGuideVision
+
+/// Per-home setup. Lives at Application Support/echoguide.json (written by the
+/// care provider's setup flow); the bundled sample is the fallback.
+struct AppConfig: Decodable {
+    var plugins: PluginManifest?
+    var safeAreas: [SafeArea]?
+    /// Start narrowed to one task ("start"), nil for open scanning.
+    var goal: String?
+
+    static func load() -> AppConfig {
+        let candidates = [
+            FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?.appendingPathComponent("echoguide.json"),
+            Bundle.main.url(forResource: "echoguide.sample", withExtension: "json"),
+        ].compactMap { $0 }
+        for url in candidates {
+            if let data = try? Data(contentsOf: url), let config = try? JSONDecoder().decode(AppConfig.self, from: data) {
+                return config
+            }
+        }
+        return AppConfig()
+    }
+}
+
+enum AppSettings {
+    /// Proxy base URL from Info.plist (`EGProxyBaseURL`). Empty = no cloud at all.
+    static var proxyBase: URL? {
+        guard let s = Bundle.main.object(forInfoDictionaryKey: "EGProxyBaseURL") as? String, !s.isEmpty else { return nil }
+        return URL(string: s)
+    }
+
+    static var imageConsent: Bool { UserDefaults.standard.bool(forKey: "cloudImageConsent") }
+    static var voiceEnabled: Bool { UserDefaults.standard.bool(forKey: "voiceEnabled") }
+    static var elevenLabsVoiceID: String? { UserDefaults.standard.string(forKey: "elevenLabsVoiceID") }
+    static var isBenchmark: Bool { ProcessInfo.processInfo.arguments.contains("-benchmark") }
+}
+
+/// Generic-password Keychain items, service "EchoGuide". The setup flow writes
+/// `device_token` (proxy auth) and any secret a manifest names.
+enum Keychain {
+    static func read(_ account: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "EchoGuide",
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var out: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &out) == errSecSuccess, let data = out as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    @discardableResult
+    static func write(_ value: String, for account: String) -> Bool {
+        let base: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "EchoGuide",
+            kSecAttrAccount as String: account,
+        ]
+        SecItemDelete(base as CFDictionary)
+        var add = base
+        add[kSecValueData as String] = Data(value.utf8)
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
+    }
+}
+
+/// Finds the YOLO model. Ships as `Resources/Models/<name>.mlpackage` (copied
+/// as a folder, not compiled by Xcode), compiled on first launch and cached.
+enum ModelStore {
+    static let names = ["yolo11n", "yolov8n"]
+
+    static func locate() -> URL? {
+        let fm = FileManager.default
+        guard let cacheDir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?.appendingPathComponent("Models") else { return nil }
+        try? fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+
+        for name in names {
+            let cached = cacheDir.appendingPathComponent("\(name).mlmodelc")
+            if fm.fileExists(atPath: cached.path) { return cached }
+            if let compiled = Bundle.main.url(forResource: name, withExtension: "mlmodelc") { return compiled }
+
+            let models = Bundle.main.resourceURL?.appendingPathComponent("Models")
+            guard let package = models?.appendingPathComponent("\(name).mlpackage"), fm.fileExists(atPath: package.path),
+                  let temp = try? MLModel.compileModel(at: package) else { continue }
+            try? fm.removeItem(at: cached)
+            if (try? fm.moveItem(at: temp, to: cached)) != nil { return cached }
+            return temp
+        }
+        return nil
+    }
+}
+EOF_AVAE
+
+cat > 'EchoGuideApp/Sources/AppRuntime.swift' <<'EOF_AVAE'
+// Owner: Maxwell. Composition root: the only place every engine is built and
+// wired together. Engines never see each other; they meet here through the
+// protocols in EchoGuideContracts.
+//
+//   LiDAR (ARKit) or CameraFeed -> PerceptionPipeline -> SpatialFence -> AutomationEngine
+//                                                                          |-> haptics, audio
+//                                                                          |-> plugins, router
+//   LocationFenceMonitor ---------------------------------------------------^
+//   VoiceLoop (optional) -> goal / question
+
+import Foundation
+import Observation
+import os
+import EchoGuideAutomation
+import EchoGuideContracts
+import EchoGuideInfra
+import EchoGuideSpatial
+import EchoGuideVision
+
+private let log = Logger(subsystem: "app.echoguide", category: "runtime")
+
+@MainActor
+@Observable
+final class AppRuntime {
+    let guidance = GuidanceModel()
+    private(set) var status = "Starting"
+    private(set) var benchmarkSummary: String?
+
+    private var automation: AutomationEngine?
+    private var pipeline: PerceptionPipeline?
+    private var vision: LocalVisionEngine?
+    private var lidar: LiDARDepthEngine?
+    private var camera: CameraFeed?
+    private var location: LocationFenceMonitor?
+    private var voiceIO: VoiceAudioIO?
+    private var stt: DeepgramSTTClient?
+    private var background: [Task<Void, Never>] = []
+    private let lastDetections = DetectionBox()
+
+    func start() async {
+        guard automation == nil else { return }
+        let config = AppConfig.load()
+
+        // Perception (local, always).
+        let modelURL = ModelStore.locate()
+        if modelURL == nil { log.warning("No YOLO model bundled; running hands, text and barcodes only") }
+        let vision: LocalVisionEngine
+        do {
+            vision = try LocalVisionEngine(modelURL: modelURL)
+        } catch {
+            log.error("Model failed to load: \(error.localizedDescription, privacy: .public)")
+            vision = try! LocalVisionEngine(modelURL: nil)
+        }
+        self.vision = vision
+        let lidar = LiDARDepthEngine.isSupported ? LiDARDepthEngine() : nil
+        self.lidar = lidar
+
+        // Output.
+        let haptics = SpatialHapticEngine()
+        let audio = SpatialAudioEngine()
+
+        // Cloud (optional) and tools.
+        let connectivity = PathConnectivity()
+        let deviceToken: @Sendable () async -> String? = { Keychain.read("device_token") }
+        var routerConfig = CloudRouterConfig()
+        routerConfig.imageConsent = AppSettings.imageConsent
+        let provider: ReasoningProvider? = AppSettings.proxyBase.map { GeminiProvider(proxyBase: $0, deviceToken: deviceToken) }
+        let router = CloudReasoningRouter(config: routerConfig, provider: provider, connectivity: connectivity)
+
+        let registry = PluginRegistry()
+        var caregiver: CaregiverAlerts?
+        if let manifest = config.plugins {
+            let outbox = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+                .appendingPathComponent("caregiver-outbox.json")
+            let installed = await registry.install(manifest, secrets: { Keychain.read($0) }, outboxURL: outbox)
+            caregiver = installed.caregiver
+            for url in installed.failedRemotes { log.warning("Plugin server unreachable: \(url.absoluteString, privacy: .public)") }
+        }
+
+        // Decisions.
+        let automation = AutomationEngine(haptics: haptics, audio: audio, depth: lidar, router: router, tools: registry)
+        self.automation = automation
+        guidance.bind(to: automation)
+        await automation.setGoal(config.goal)
+        await automation.start()
+
+        // Pipeline: frame -> detections -> fence -> automation.
+        let fence = SpatialFence.kitchenDefaults
+        let detections = lastDetections
+        let pipeline = PerceptionPipeline(vision: vision) { result, _ in
+            await detections.set(result.targets)
+            // Depth is sampled per zone, so two hazards at different distances are judged separately.
+            let event = await fence.evaluate(result, depth: lidar)
+            await automation.ingest(result, fence: event)
+        }
+        self.pipeline = pipeline
+
+        // Camera: ARKit owns it when LiDAR is present, otherwise AVCapture.
+        if let lidar {
+            lidar.onFrame = { pipeline.submit($0) }
+            lidar.start()
+            status = "Running with LiDAR"
+        } else {
+            let camera = CameraFeed()
+            do {
+                try camera.start { pipeline.submit($0) }
+                self.camera = camera
+                status = "Running"
+            } catch {
+                status = "Camera unavailable"
+            }
+        }
+
+        // Location fence (dementia wandering).
+        if let areas = config.safeAreas, !areas.isEmpty {
+            let monitor = LocationFenceMonitor(areas: areas) { event in
+                Task { await automation.ingest(fence: event, at: Date().timeIntervalSince1970) }
+            }
+            monitor.start()
+            location = monitor
+        }
+
+        // Deliver caregiver alerts queued while offline.
+        if let caregiver {
+            background.append(Task {
+                while !Task.isCancelled {
+                    if await connectivity.isOnline() { await caregiver.flush() }
+                    try? await Task.sleep(nanoseconds: 30_000_000_000)
+                }
+            })
+        }
+
+        if AppSettings.voiceEnabled, let proxy = AppSettings.proxyBase {
+            await startVoice(proxy: proxy, audio: audio, automation: automation, router: router, deviceToken: deviceToken)
+        }
+
+        if AppSettings.isBenchmark { runBenchmark() }
+    }
+
+    func stop() async {
+        background.forEach { $0.cancel() }
+        lidar?.stop()
+        camera?.stop()
+        location?.stop()
+        voiceIO?.stopCapture()
+        await stt?.stop()
+        await automation?.stop()
+    }
+
+    // MARK: - Voice
+
+    private func startVoice(proxy: URL, audio: SpatialAudioEngine, automation: AutomationEngine,
+                            router: CloudReasoningRouter, deviceToken: @escaping @Sendable () async -> String?) async {
+        // SpatialAudioEngine sets a playback-only session on its first sound;
+        // make it do that now, then widen the session so the microphone can record.
+        await audio.ping(azimuth: 0, elevation: 0)
+        do {
+            try AudioSessionSetup.enableRecording()
+            let stt = DeepgramSTTClient(proxyBase: proxy, deviceToken: deviceToken)
+            let transcripts = try await stt.start()
+            let io = VoiceAudioIO()
+            try io.startCapture { pcm in Task { try? await stt.send(pcm) } }
+            self.stt = stt
+            voiceIO = io
+            let detections = lastDetections
+            background.append(Task {
+                do {
+                    for try await t in transcripts where t.endOfUtterance {
+                        switch VoiceIntent.parse(t.text) {
+                        case .find(let target):
+                            await automation.setGoal(target)
+                            await audio.speak("Looking for \(target).", azimuth: 0)
+                        case .stop:
+                            await automation.setGoal(nil)
+                            await audio.speak("Okay.", azimuth: 0)
+                        case .question(let q):
+                            let seen = await detections.value
+                            let answer = await router.resolve(ReasoningQuery(question: q, detections: seen, localConfidence: 0))
+                            await audio.speak(answer.answer, azimuth: 0)
+                        case nil:
+                            break
+                        }
+                    }
+                } catch {
+                    log.warning("Voice loop ended: \(error.localizedDescription, privacy: .public)")
+                }
+            })
+        } catch {
+            log.warning("Voice unavailable: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    // MARK: - Benchmark
+
+    /// `-benchmark` launch argument: run for 20 s on the live camera, then
+    /// write the real on-device numbers to Documents/benchmark-<time>.json.
+    private func runBenchmark() {
+        background.append(Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 20_000_000_000)
+            guard let self, let pipeline = self.pipeline, let vision = self.vision else { return }
+            let report = await BenchmarkReport.capture(pipeline: pipeline, vision: vision, lidar: self.lidar != nil)
+            let url = report.write()
+            self.benchmarkSummary = report.summary
+            log.notice("Benchmark: \(report.summary, privacy: .public) -> \(url?.path ?? "not written", privacy: .public)")
+        })
+    }
+}
+
+/// Last frame's detections, for spoken questions ("what is this?").
+actor DetectionBox {
+    private(set) var value: [Detection] = []
+    func set(_ d: [Detection]) { value = d }
+}
+EOF_AVAE
+
+cat > 'EchoGuideApp/Sources/BenchmarkReport.swift' <<'EOF_AVAE'
+// Owner: Maxwell. Real on-device numbers for the README targets, captured
+// from the live camera. CI can only measure the frame-delta step on a Mac.
+
+import Foundation
+import UIKit
+import EchoGuideVision
+
+struct BenchmarkReport: Codable {
+    var device: String
+    var system: String
+    var lidar: Bool
+    var framesSeen: UInt64
+    var framesInferred: UInt64
+    var computeSaved: Double
+    var endToEndP50Ms: Double
+    var endToEndP95Ms: Double
+    var visionP95Ms: Double
+    var visionOverBudgetFrames: Int
+    var capturedAt: Date
+
+    /// The README target: local end-to-end (frame to cue) under 15 ms.
+    var meetsLocalTarget: Bool { endToEndP95Ms < 15 }
+
+    var summary: String {
+        String(format: "e2e p50 %.1f ms, p95 %.1f ms %@ | vision p95 %.1f ms | skipped %.0f%% of %llu frames",
+               endToEndP50Ms, endToEndP95Ms, meetsLocalTarget ? "(meets 15 ms)" : "(MISSES 15 ms)",
+               visionP95Ms, computeSaved * 100, framesSeen)
+    }
+
+    @MainActor
+    static func capture(pipeline: PerceptionPipeline, vision: LocalVisionEngine, lidar: Bool) async -> BenchmarkReport {
+        let s = pipeline.stats
+        var info = utsname()
+        uname(&info)
+        let machine = withUnsafeBytes(of: &info.machine) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+        return BenchmarkReport(
+            device: machine,
+            system: "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)",
+            lidar: lidar,
+            framesSeen: s.framesSeen,
+            framesInferred: s.framesInferred,
+            computeSaved: s.computeSaved,
+            endToEndP50Ms: s.totalP50Ms,
+            endToEndP95Ms: s.totalP95Ms,
+            visionP95Ms: await vision.p95Ms,
+            visionOverBudgetFrames: await vision.overBudgetFrames,
+            capturedAt: Date()
+        )
+    }
+
+    func write() -> URL? {
+        guard let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return nil }
+        let url = dir.appendingPathComponent("benchmark-\(Int(capturedAt.timeIntervalSince1970)).json")
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        enc.dateEncodingStrategy = .iso8601
+        guard let data = try? enc.encode(self), (try? data.write(to: url)) != nil else { return nil }
+        return url
+    }
+}
+EOF_AVAE
+
+cat > 'EchoGuideApp/Sources/EchoGuideApp.swift' <<'EOF_AVAE'
+// Owner: Maxwell (app shell). The screen is Bryan's GuidanceView; this file
+// only starts the runtime and keeps the phone awake while guiding.
+
+import AVFoundation
+import SwiftUI
+import UIKit
+import EchoGuideAutomation
+
+@main
+struct EchoGuideApp: App {
+    @State private var runtime = AppRuntime()
+    @Environment(\.scenePhase) private var phase
+
+    var body: some Scene {
+        WindowGroup {
+            ZStack(alignment: .bottom) {
+                GuidanceView(model: runtime.guidance)
+                if let summary = runtime.benchmarkSummary {
+                    Text(summary)
+                        .font(.system(.footnote, design: .monospaced))
+                        .foregroundStyle(.white)
+                        .padding(12)
+                        .background(.black.opacity(0.8))
+                        .accessibilityLabel("Benchmark result. \(summary)")
+                }
+            }
+            .statusBarHidden()
+            .task { await runtime.start() }
+        }
+        .onChange(of: phase) { _, new in
+            // Guidance needs the camera; never let the screen lock mid-task.
+            UIApplication.shared.isIdleTimerDisabled = new == .active
+        }
+    }
+}
+
+enum AudioSessionSetup {
+    /// Voice mode needs the mic. Keep mixing and ducking so a carer's call or
+    /// music is never silenced, and route to the speaker, not the earpiece.
+    static func enableRecording() throws {
+        let s = AVAudioSession.sharedInstance()
+        try s.setCategory(.playAndRecord, mode: .voiceChat,
+                          options: [.defaultToSpeaker, .mixWithOthers, .duckOthers, .allowBluetoothA2DP])
+        try s.setActive(true)
+    }
+}
 EOF_AVAE
 
 cat > 'EchoGuideTests/EngineTests.swift' <<'EOF_AVAE'
@@ -3336,6 +4786,260 @@ actor Counter {
 }
 EOF_AVAE
 
+cat > 'EchoGuideTests/ExperienceTests.swift' <<'EOF_AVAE'
+// Owner: Bryan. Tests for the experience + safety layer: automation state
+// machine, cognitive isolation, haptic mapping, and the digital fence. Shares
+// the helpers (det, tip, frame, RecordingHaptics, RecordingAudio) defined in
+// EngineTests.swift.
+
+import Foundation
+import Testing
+@testable import EchoGuideAutomation
+import EchoGuideContracts
+@testable import EchoGuideInfra
+import EchoGuideSpatial
+import EchoGuideVision
+
+/// Depth stub keyed by label: the hand and each zone get their own distance.
+struct TableDepth: DepthProviding {
+    var byPoint: [(ImagePoint, Float)]
+    func depth(at point: ImagePoint) async -> Float? {
+        byPoint.first { $0.0.distance(to: point) < 0.02 }?.1
+    }
+}
+
+@Suite struct FenceDepthTests {
+    @Test func eachZoneGetsItsOwnDepth() async {
+        // Hob and knife overlap the finger on screen. Hob is 1.2 m away, the
+        // knife is 0.4 m away, the hand 0.3 m: only the knife is a breach.
+        let fence = SpatialFence.kitchenDefaults
+        let hob = det("oven", x: 0.5, y: 0.5, size: 0.3)
+        let knife = det("knife", x: 0.3, y: 0.3, size: 0.1)
+        let f = frame([hob, knife, tip(x: 0.3, y: 0.3)], t: 0)
+        let depth = TableDepth(byPoint: [(hob.box.mid, 1.2), (knife.box.mid, 0.4), (ImagePoint(x: 0.3, y: 0.3), 0.3)])
+        #expect(await fence.evaluate(f, depth: depth) == .breached(zone: "knife"))
+    }
+
+    @Test func farZoneOverlapIsOnlyAnApproach() async {
+        let fence = SpatialFence.kitchenDefaults
+        let hob = det("oven", x: 0.5, y: 0.5, size: 0.3)
+        let f = frame([hob, tip(x: 0.42, y: 0.5)], t: 0) // inside the hob box
+        let depth = TableDepth(byPoint: [(hob.box.mid, 1.2), (ImagePoint(x: 0.42, y: 0.5), 0.3)])
+        guard case .approaching(let zone, let metres) = await fence.evaluate(f, depth: depth) else {
+            Issue.record("expected approach"); return
+        }
+        #expect(zone == "hob")
+        #expect(metres.map { abs($0 - 0.9) < 1e-5 } == true)
+    }
+
+    @Test func unknownDepthFallsBackToTwoD() async {
+        let fence = SpatialFence.kitchenDefaults
+        let f = frame([det("oven", x: 0.5, y: 0.5, size: 0.3), tip(x: 0.5, y: 0.5)], t: 0)
+        #expect(await fence.evaluate(f, depth: nil) == .breached(zone: "hob"))
+        #expect(await fence.evaluate(f, depth: TableDepth(byPoint: [])) == .breached(zone: "hob"))
+    }
+
+    @Test func fixedRegionZone() {
+        let fence = SpatialFence(zones: [SpatialFenceZone(name: "stairs", anchor: .region(ImageRect(x: 0, y: 0.8, width: 1, height: 0.2)))])
+        #expect(fence.evaluate(frame([tip(x: 0.5, y: 0.9)], t: 0)) == .breached(zone: "stairs"))
+        #expect(fence.evaluate(frame([tip(x: 0.5, y: 0.75)], t: 0)) == .approaching(zone: "stairs", metres: nil))
+        #expect(fence.evaluate(frame([tip(x: 0.5, y: 0.5)], t: 0)) == nil)
+    }
+
+    @Test func locationFenceExposesWhereTheUserIs() {
+        let home = GeoCoordinate(latitude: 51.5145, longitude: -0.1165)
+        var fence = LocationFence(areas: [SafeArea(name: "home", center: home, radiusMetres: 80)], exitDwell: 10)
+        _ = fence.update(home, accuracyMetres: 5, at: 0)
+        #expect(fence.insideArea == "home")
+        #expect(!fence.isOutside)
+        let away = GeoCoordinate(latitude: 51.5175, longitude: -0.1165)
+        _ = fence.update(away, accuracyMetres: 5, at: 1)
+        #expect(fence.insideArea == nil)
+        #expect(fence.update(away, accuracyMetres: 5, at: 12) == .leftSafeArea(region: "home"))
+        #expect(fence.isOutside)
+    }
+}
+
+@Suite struct CognitiveIsolationTests {
+    @Test func reportsWhenTheTargetVanishes() {
+        var c = CognitiveConfig()
+        c.settleFrames = 1
+        var iso = CognitiveTaskIsolation(config: c)
+        #expect(iso.isolate(frame([det("button", x: 0.6, y: 0.5)], t: 0)) != nil)
+        #expect(iso.isCurrentVisible)
+        // Dropped frame: the remembered step is still returned, but flagged.
+        #expect(iso.isolate(frame([], t: 0.1))?.targetLabel == "button")
+        #expect(!iso.isCurrentVisible)
+    }
+
+    @Test func excludedLabelDropsCurrentTarget() {
+        var c = CognitiveConfig()
+        c.settleFrames = 1
+        var iso = CognitiveTaskIsolation(config: c)
+        let dets = [det("start", x: 0.5, y: 0.5), det("stop", x: 0.2, y: 0.2)]
+        #expect(iso.isolate(frame(dets, t: 0))?.targetLabel == "start")
+        iso.excludedLabels = ["start"]
+        #expect(iso.isolate(frame(dets, t: 0.1))?.targetLabel == "stop")
+        iso.excludedLabels = []
+        // "start" sits under the finger and is clearly better, so it wins back.
+        #expect(iso.isolate(frame(dets, t: 0.2))?.targetLabel == "start")
+    }
+}
+
+@Suite struct HapticEngineTests {
+    @Test func confirmSilencesGuidance() async {
+        // No actuator on the CI host: the engine still tracks its state.
+        let h = SpatialHapticEngine()
+        await h.guide(offset: 0.3, 0.1, distanceMetres: nil)
+        #expect(await h.isGuiding)
+        await h.confirm()
+        #expect(await !h.isGuiding)
+        await h.guide(offset: 0.3, 0.1, distanceMetres: nil)
+        #expect(await h.isGuiding)
+        await h.warn()
+        #expect(await !h.isGuiding)
+        await h.stop()
+    }
+
+    @Test func alignedGuideIsConfirmNotPulse() async {
+        let h = SpatialHapticEngine()
+        await h.guide(offset: 0.01, 0.01, distanceMetres: nil)
+        #expect(await !h.isGuiding)
+    }
+
+    @Test func lidarWeakensDistantHand() throws {
+        let near = try #require(HapticMapping.pulse(dx: 0.2, dy: 0, distanceMetres: 0.2))
+        let far = try #require(HapticMapping.pulse(dx: 0.2, dy: 0, distanceMetres: 0.8))
+        #expect(far.intensity < near.intensity)
+        #expect(far.intensity >= 0.6 * 0.35) // floor keeps it feelable
+    }
+}
+
+@Suite struct AutomationSafetyTests {
+    func engine(tools: ToolInvoking? = nil, config: AutomationConfig = AutomationConfig()) -> (AutomationEngine, RecordingHaptics, RecordingAudio) {
+        var c = CognitiveConfig()
+        c.settleFrames = 1
+        let h = RecordingHaptics(), a = RecordingAudio()
+        return (AutomationEngine(haptics: h, audio: a, tools: tools, cognitive: CognitiveTaskIsolation(config: c), config: config), h, a)
+    }
+
+    func physicalTool(_ fired: Counter) async -> PluginRegistry {
+        let registry = PluginRegistry()
+        await registry.register(ToolDescriptor(name: "go", description: "", sideEffect: .physical, claim: ToolClaim(labels: ["button"])) { _ in
+            await fired.inc()
+            return "ok"
+        })
+        return registry
+    }
+
+    @Test func breachResetsTheDwell() async {
+        let fired = Counter()
+        let (e, h, _) = engine(tools: await physicalTool(fired))
+        await e.start()
+        let onIt = [det("button", x: 0.5, y: 0.5), tip(x: 0.5, y: 0.5)]
+        await e.ingest(frame(onIt, t: 0))
+        guard case .onTarget = await e.state else { Issue.record("expected onTarget"); return }
+        // 0.5 s in, the hand strays into the hob zone.
+        await e.ingest(frame(onIt, t: 0.5), fence: .breached(zone: "hob"))
+        #expect(await e.state == .warning("hob"))
+        #expect(await h.warns == 1)
+        // 0.9 s after the first touch: without the reset this would fire.
+        await e.ingest(frame(onIt, t: 0.9))
+        #expect(await fired.value == 0)
+        guard case .onTarget = await e.state else { Issue.record("expected onTarget again"); return }
+        await e.ingest(frame(onIt, t: 1.8))
+        #expect(await fired.value == 1)
+    }
+
+    @Test func vanishedTargetTimesOutToScanning() async {
+        let (e, h, _) = engine()
+        await e.start()
+        await e.ingest(frame([det("button", x: 0.7, y: 0.5), tip(x: 0.4, y: 0.5)], t: 0))
+        guard case .guiding = await e.state else { Issue.record("expected guiding"); return }
+        // Target gone, within the timeout: cue carries on, state unchanged.
+        await e.ingest(frame([tip(x: 0.4, y: 0.5)], t: 0.5))
+        guard case .guiding = await e.state else { Issue.record("expected still guiding"); return }
+        #expect(await h.stops == 0)
+        // Past the timeout: haptics silenced, back to scanning.
+        await e.ingest(frame([tip(x: 0.4, y: 0.5)], t: 1.5))
+        #expect(await e.state == .scanning)
+        #expect(await h.stops == 1)
+        // The target returning is announced afresh, not treated as "already said".
+        await e.ingest(frame([det("button", x: 0.7, y: 0.5), tip(x: 0.4, y: 0.5)], t: 2))
+        guard case .guiding = await e.state else { Issue.record("expected guiding again"); return }
+    }
+
+    @Test func completedTargetMovesOnToTheNextStep() async {
+        var config = AutomationConfig()
+        config.completedCooldown = 5
+        let (e, h, a) = engine(config: config)
+        await e.start()
+        let both = { (tipX: Float) in [det("start", x: 0.5, y: 0.5), det("stop", x: 0.2, y: 0.2, size: 0.08), tip(x: tipX, y: 0.5)] }
+        await e.ingest(frame(both(0.5), t: 0))
+        await e.ingest(frame(both(0.5), t: 1))
+        #expect(await e.state == .completed("start"))
+        #expect(await h.stops >= 1)
+        // Finger still on the finished button: it is not offered again...
+        await e.ingest(frame(both(0.5), t: 1.1))
+        guard case .guiding(let step) = await e.state else { Issue.record("expected guiding to next"); return }
+        #expect(step.targetLabel == "stop")
+        #expect(await a.spoken.last?.hasPrefix("Stop.") == true)
+        // ...until the cooldown has passed and nothing else is around.
+        await e.ingest(frame([det("start", x: 0.5, y: 0.5), tip(x: 0.3, y: 0.5)], t: 7))
+        guard case .guiding(let again) = await e.state else { Issue.record("expected guiding to start"); return }
+        #expect(again.targetLabel == "start")
+    }
+
+    @Test func wanderingIsStickyUntilReturn() async {
+        let (e, _, a) = engine()
+        await e.start()
+        await e.ingest(fence: .leftSafeArea(region: "home"), at: 0)
+        #expect(await e.state == .outsideSafeArea("home"))
+        #expect(await a.spoken == ["You have left home."])
+        // Frames do not clear a wandering alert.
+        await e.ingest(frame([det("button", x: 0.7, y: 0.5), tip(x: 0.4, y: 0.5)], t: 1))
+        #expect(await e.state == .outsideSafeArea("home"))
+        await e.ingest(fence: .returnedToSafeArea(region: "home"), at: 60)
+        #expect(await e.state == .scanning)
+    }
+
+    @Test func caregiverToldWhenToolExists() async {
+        let registry = PluginRegistry()
+        let told = Counter()
+        await registry.register(ToolDescriptor(name: "notify_caregiver", description: "", sideEffect: .none, parameters: ["region"]) { args in
+            await told.inc()
+            return "Carer told: left \(args["region"] ?? "")."
+        })
+        let (e, _, a) = engine(tools: registry)
+        await e.start()
+        await e.ingest(fence: .leftSafeArea(region: "home"), at: 0)
+        #expect(await told.value == 1)
+        #expect(await a.spoken == ["You have left home. Your carer has been told."])
+    }
+
+    @Test func returnDoesNotUnpause() async {
+        let (e, _, _) = engine()
+        await e.ingest(fence: .returnedToSafeArea(region: "home"), at: 0)
+        #expect(await e.state == .idle)
+    }
+
+    @Test func stopSilencesAndForgets() async {
+        let (e, h, a) = engine()
+        await e.start()
+        await e.ingest(frame([det("button", x: 0.7, y: 0.5), tip(x: 0.4, y: 0.5)], t: 0))
+        await e.stop()
+        #expect(await e.state == .idle)
+        #expect(await h.stops == 1)
+        await e.ingest(frame([det("button", x: 0.7, y: 0.5), tip(x: 0.4, y: 0.5)], t: 1))
+        #expect(await e.state == .idle)
+        await e.start()
+        await e.ingest(frame([det("button", x: 0.7, y: 0.5), tip(x: 0.4, y: 0.5)], t: 2))
+        // Spoken again after a restart.
+        #expect(await a.spoken.count == 2)
+    }
+}
+EOF_AVAE
+
 cat > 'EchoGuideTests/PerceptionAndPluginTests.swift' <<'EOF_AVAE'
 // Owner: Maxwell. Perception pipeline back-pressure and the built-in plugins,
 // all against stubs: no camera, no network.
@@ -3587,6 +5291,39 @@ func waitUntil(_ timeout: TimeInterval = 2, _ condition: () async -> Bool) async
 }
 EOF_AVAE
 
+cat > 'EchoGuideTests/VoiceTests.swift' <<'EOF_AVAE'
+// Owner: Maxwell. Voice intent parsing and Deepgram message handling.
+
+import Foundation
+import Testing
+@testable import EchoGuideInfra
+
+@Suite struct VoiceTests {
+    @Test func findIntents() {
+        #expect(VoiceIntent.parse("Find the start button.") == .find("start button"))
+        #expect(VoiceIntent.parse("where's the kettle") == .find("kettle"))
+        #expect(VoiceIntent.parse("Find my keys") == .find("keys"))
+    }
+
+    @Test func stopAndQuestions() {
+        #expect(VoiceIntent.parse("Stop!") == .stop)
+        #expect(VoiceIntent.parse("What does this say?") == .question("What does this say?"))
+        #expect(VoiceIntent.parse("   ") == nil)
+    }
+
+    @Test func deepgramResults() {
+        let msg = #"{"type":"Results","is_final":true,"speech_final":true,"channel":{"alternatives":[{"transcript":"find the kettle","confidence":0.98}]}}"#
+        #expect(DeepgramMessage.transcript(from: Data(msg.utf8)) == Transcript(text: "find the kettle", isFinal: true, endOfUtterance: true))
+    }
+
+    @Test func deepgramIgnoresMetadataAndSilence() {
+        #expect(DeepgramMessage.transcript(from: Data(#"{"type":"Metadata"}"#.utf8)) == nil)
+        let empty = #"{"type":"Results","channel":{"alternatives":[{"transcript":""}]}}"#
+        #expect(DeepgramMessage.transcript(from: Data(empty.utf8)) == nil)
+    }
+}
+EOF_AVAE
+
 cat > 'Package.swift' <<'EOF_AVAE'
 // swift-tools-version: 5.10
 // Owner: Maxwell (infrastructure). Targets split by engine; ownership between the two
@@ -3672,6 +5409,8 @@ cat > 'README.md' <<'EOF_AVAE'
 
 Hands-free spatial vision for people with visual impairment or dementia. The camera watches. When something changes, the engine works out the **one** next step and guides the hand there with haptic pulses and directional audio. It calls a tool only when the user holds their finger on the target. The phone screen is optional.
 
+* NOT A MEDICAL DEVICE OR FDA APPROVED CURRENTLY JUST FOR TESTING
+
 ```
 camera ─► FrameDeltaEngine ─► LocalVisionEngine ─► DigitalFence ─┐
  (ARKit or AVCapture)  skip ~99% static     YOLO INT8 + hand + OCR       │
@@ -3689,7 +5428,7 @@ Two owners. Engines meet only through `EchoGuideContracts`, so the two never edi
 
 | Owner | Area | Paths | Files |
 |---|---|---|---|
-| Maxwell | Perception + infrastructure: what the phone senses, and the plumbing | `EchoGuide/Core/Camera/`, `Vision/`, `Depth/`, `Plugins/`, `Router/`, `.github/`, `EchoGuideTests/`, `Package.swift`, `plugins/` | `FrameDeltaEngine`, `CameraFeed`, `LocalVisionEngine`, `LiDARDepthEngine`, `PluginRegistry`, `CloudReasoningRouter`, CI, tests |
+| Maxwell | Perception + infrastructure: what the phone senses, and the plumbing | `EchoGuide/Core/Camera/`, `Vision/`, `Depth/`, `Plugins/`, `Router/`, `EchoGuideApp/`, `proxy/`, `.github/`, `EchoGuideTests/`, `Package.swift`, `plugins/` | `FrameDeltaEngine`, `PerceptionPipeline`, `CameraFeed`, `LocalVisionEngine`, `LiDARDepthEngine`, `PluginRegistry`, built-in plugins, `CloudReasoningRouter`, `VoiceLoop`, the iOS app, the key proxy, CI/CD, tests |
 | Bryan | Experience + safety: everything the user feels, hears and sees | `EchoGuide/Core/Fence/`, `Haptics/`, `Audio/`, `Automation/`, `Cognitive/`, `EchoGuide/UI/` | `DigitalFenceEngine`, `SpatialHapticEngine`, `SpatialAudioEngine`, `AutomationEngine`, `CognitiveTaskIsolation`, `GuidanceView` |
 | Both | Shared contracts | `EchoGuide/Core/Contracts/` | `Contracts.swift` (needs both approvals) |
 
@@ -3703,8 +5442,17 @@ The split follows the pipeline: Maxwell owns everything up to "a detection with 
 
 There are two layers. Each one only reports a `FenceEvent`, and `AutomationEngine` decides how the user hears or feels it.
 
-- **Spatial fence:** hazard zones the camera can see, such as the hob or a knife. A zone follows a detected label or covers a fixed part of the frame. When the fingertip comes near a zone, the user gets "Careful" and a warning pulse. When it enters the zone, they get "Stop" and the warning preempts all other guidance. If LiDAR is available, its depth reading rules out cases where the hand only overlaps the zone on screen but is not near it.
-- **Location fence:** safe areas for dementia wandering. A position must stay outside the area for 45 s before it counts as leaving, and fixes with poor accuracy are ignored. The event is reported once, and a `notify_caregiver` MCP tool is called if one is registered.
+- **Spatial fence:** hazard zones the camera can see, such as the hob or a knife. A zone follows a detected label or covers a fixed part of the frame. When the fingertip comes near a zone, the user gets "Careful" and a warning pulse. When it enters the zone, they get "Stop", the warning preempts all other guidance, and any dwell in progress is cancelled so a physical tool cannot fire straight after a hazard. If LiDAR is available, `SpatialFence.evaluate(_:depth:)` samples the hand and the centre of every zone through `DepthProviding`, so a hob at 1.2 m and a knife at 0.4 m each get their own distance; a hand that only overlaps a zone on screen is an approach, not a breach.
+- **Location fence:** safe areas for dementia wandering. A position must stay outside the area for 45 s before it counts as leaving, and fixes with poor accuracy are ignored. The event is reported once, and a `notify_caregiver` MCP tool is called if one is registered. The engine enters `outsideSafeArea`, which camera frames do not clear; only `returnedToSafeArea` does, and a paused engine stays paused.
+
+## Automation (Bryan)
+
+`AutomationEngine` runs `scanning -> guiding -> onTarget -> completed -> scanning`. Details that matter for the demo:
+
+- A target that drops out of the frame keeps its last haptic cue for `lostTargetTimeout` (1.2 s), then haptics stop and the engine goes back to scanning. It never announces, confirms or completes against a remembered box.
+- A finished target is excluded for `completedCooldown` (8 s), so "done" moves on to the next step instead of guiding the finger back to the same button.
+- On target, the guidance pulse train stops and a double tap plays once; hovering does not buzz.
+- `GuidanceView` shows the step huge and yellow on black, a second line for carers ("Hold still", "Follow the pulses"), a goal field, and one big Pause/Resume button.
 
 ## Targets
 
@@ -3727,20 +5475,41 @@ Read these honestly:
 ## Build
 
 ```bash
-swift build && swift test        # macOS host: pure logic, 36 tests
+swift build && swift test        # macOS host: pure logic, 69 tests (plus `cd proxy && node --test`: 6)
 ```
 
 The iOS-only paths (ARKit, the camera, the haptic actuator) are behind `#if canImport(...) && os(iOS)`. The `ios-build` CI job compiles them with `xcodebuild` for the iOS Simulator. Real latency numbers need a device.
 
-### What the app target has to supply
+### The iOS app (`EchoGuideApp/`)
 
-This package is the engine. An Xcode iOS app target links the `EchoGuide` library and does the following:
+Open `EchoGuideApp/EchoGuideApp.xcodeproj` in Xcode 16+, set your team, and run it on an iPhone. `AppRuntime.swift` is the only place every engine is built and connected:
 
-1. Bundles a YOLO Core ML model and passes it to `LocalVisionEngine(modelURL:)`. Export it with `yolo export model=yolo11n.pt format=coreml int8=True nms=True`. Models are git-ignored.
-2. Sets up the camera feed. With LiDAR, it runs `LiDARDepthEngine` and feeds its `onFrame` into `FrameDeltaEngine`. ARKit owns the camera, so `CameraFeed` cannot run at the same time. Without LiDAR, it uses `CameraFeed`.
-3. Builds a `PerceptionPipeline(vision: LocalVisionEngine(...))` and calls `submit` from the camera queue. The pipeline skips static frames, keeps at most one inference in flight (frames that arrive while it is busy are dropped, not queued), and times every stage. In `onResult`, run `SpatialFence.evaluate`, then `AutomationEngine.ingest(_:fence:)`.
-4. Adds `Info.plist` keys: `NSCameraUsageDescription` and `NSLocationAlwaysAndWhenInUseUsageDescription`, plus the `location` background mode for the location fence.
-5. Points `GeminiProvider` / `OpenAIProvider` at a proxy you run. No API keys ship in the app.
+- With LiDAR, ARKit owns the camera and `LiDARDepthEngine` feeds the pipeline. Without LiDAR, `CameraFeed` does.
+- `PerceptionPipeline` → `SpatialFence` → `AutomationEngine` → haptics, audio, plugins and router.
+- The location fence, the caregiver outbox flush (every 30 s when online) and the optional voice loop start here too.
+
+Per-home setup goes in `Application Support/echoguide.json` (plugins, safe areas, starting goal); the bundled `echoguide.sample.json` is the fallback. Secrets (the proxy `device_token`, Home Assistant token, webhook signing key) are read from the Keychain, service `EchoGuide`.
+
+**Model:** run the `export-model` workflow (Actions tab), download the `.mlpackage`, and drop it in `EchoGuideApp/Resources/Models/`. It is compiled on first launch. Without it, the app runs hands, text and barcodes only.
+
+> **License:** Ultralytics YOLO (v8 and 11) is **AGPL-3.0**. Shipping it in a closed-source app requires an Ultralytics Enterprise license, or a switch to a permissively licensed detector. Decide this before any public release.
+
+**On-device benchmark:** enable the `-benchmark` launch argument in the scheme, point the phone at a scene with some movement for 20 s, and read the result on screen. The full JSON is in Documents (visible in the Files app). This is how the < 15 ms local target is checked for real.
+
+**TestFlight:** the `ios-release` workflow (manual) archives with cloud signing and uploads. It needs four repo secrets, listed at the top of `.github/workflows/ios-release.yml`.
+
+## Cloud proxy (`proxy/`)
+
+The only place the Gemini, OpenAI, Deepgram and ElevenLabs keys live. It is zero-dependency Node 20+ (`node server.mjs`, tests with `node --test`).
+
+- Devices send `Authorization: Bearer <device token>`. The proxy stores only SHA-256 hashes of allowed tokens (`DEVICE_TOKEN_SHA256S`).
+- Per-device rate limit (default 30 per minute), model allow-list, output capped at 120 tokens, 2 MB body cap, 10 s upstream timeout.
+- `/v1/voice/stt-token` mints a 30-second Deepgram token, so the phone opens the speech WebSocket directly and the long-lived key never leaves the server. `/v1/voice/tts` streams ElevenLabs audio back as it arrives.
+- Deploy it anywhere that runs Node (Fly, Render, Railway, a small VM) and set `EG_PROXY_BASE_URL` for the app build.
+
+## Voice (optional)
+
+Off by default; the product works without it. With voice on (the `voiceEnabled` setting plus a proxy), Deepgram live speech-to-text understands "find the start button" (narrows guidance to that target), "stop", and any other sentence as a question for the router. ElevenLabs streaming TTS is available through the proxy; on-device speech remains the default so everything works offline.
 
 ## Plugins (MCP)
 
@@ -3752,9 +5521,9 @@ Remote tools are registered as `physical` unless told otherwise. A physical tool
 
 ## Not built yet
 
-- The WebSocket voice loop (Deepgram STT / ElevenLabs TTS). On-device `AVSpeechSynthesizer` is used for now, so the app works offline.
 - The OpenAI Realtime API (multi-turn). The router uses one-shot Chat Completions.
-- The Xcode app target and the bundled model.
+- A care-provider setup flow that writes `echoguide.json` and the Keychain secrets (today: by hand or MDM).
+- Real measurements: run the on-device benchmark on an A17-class iPhone and put the numbers in the targets table.
 EOF_AVAE
 
 cat > 'plugins/smart_home_server.py' <<'EOF_AVAE'
@@ -3784,6 +5553,245 @@ def notify_caregiver(region: str) -> str:
 
 if __name__ == "__main__":
     mcp.run(transport="http", port=8765)
+EOF_AVAE
+
+cat > 'proxy/package.json' <<'EOF_AVAE'
+{
+  "name": "echoguide-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Holds the cloud API keys for EchoGuide devices. Zero dependencies.",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test"
+  }
+}
+EOF_AVAE
+
+cat > 'proxy/server.mjs' <<'EOF_AVAE'
+// Owner: Maxwell. The only place the Gemini, OpenAI, Deepgram and ElevenLabs
+// keys live. Devices authenticate with a per-device bearer token; the proxy
+// checks it against SHA-256 hashes (so a leaked env file does not leak device
+// tokens), rate-limits per device, allow-lists models, clamps output length
+// and caps body size, then forwards to the provider.
+//
+// Env:
+//   PORT                       default 8787
+//   DEVICE_TOKEN_SHA256S       comma-separated hex sha256 of allowed device tokens
+//   GEMINI_API_KEY, OPENAI_API_KEY, DEEPGRAM_API_KEY, ELEVENLABS_API_KEY
+//   ALLOWED_MODELS             default "gemini-2.5-flash,gpt-4o"
+//   RATE_PER_MINUTE            default 30 requests per device per minute
+//   *_BASE                     upstream overrides (tests)
+
+import { createServer } from 'node:http';
+import { createHash, timingSafeEqual } from 'node:crypto';
+
+export function createProxy(env = process.env) {
+  const tokenHashes = (env.DEVICE_TOKEN_SHA256S ?? '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+    .map(h => Buffer.from(h, 'hex'));
+  const allowedModels = new Set((env.ALLOWED_MODELS ?? 'gemini-2.5-flash,gpt-4o').split(',').map(s => s.trim()));
+  const ratePerMinute = Number(env.RATE_PER_MINUTE ?? 30);
+  const maxBody = 2 * 1024 * 1024; // one low-detail JPEG plus prompt
+  const base = {
+    gemini: env.GEMINI_BASE ?? 'https://generativelanguage.googleapis.com',
+    openai: env.OPENAI_BASE ?? 'https://api.openai.com',
+    deepgram: env.DEEPGRAM_BASE ?? 'https://api.deepgram.com',
+    eleven: env.ELEVENLABS_BASE ?? 'https://api.elevenlabs.io',
+  };
+  const buckets = new Map(); // device hash -> { tokens, at }
+
+  function authorize(req) {
+    const m = /^Bearer (.+)$/.exec(req.headers.authorization ?? '');
+    if (!m) return null;
+    const digest = createHash('sha256').update(m[1]).digest();
+    return tokenHashes.some(h => h.length === digest.length && timingSafeEqual(h, digest)) ? digest.toString('hex') : null;
+  }
+
+  function allow(device) {
+    const now = Date.now();
+    const b = buckets.get(device) ?? { tokens: ratePerMinute, at: now };
+    b.tokens = Math.min(ratePerMinute, b.tokens + ((now - b.at) / 60000) * ratePerMinute);
+    b.at = now;
+    if (b.tokens < 1) { buckets.set(device, b); return false; }
+    b.tokens -= 1;
+    buckets.set(device, b);
+    return true;
+  }
+
+  async function readJSON(req) {
+    let size = 0;
+    const chunks = [];
+    for await (const c of req) {
+      size += c.length;
+      if (size > maxBody) throw Object.assign(new Error('body too large'), { status: 413 });
+      chunks.push(c);
+    }
+    try { return chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}; }
+    catch { throw Object.assign(new Error('invalid json'), { status: 400 }); }
+  }
+
+  function send(res, status, obj) {
+    res.writeHead(status, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(obj));
+  }
+
+  async function forward(res, url, init) {
+    const upstream = await fetch(url, { ...init, signal: AbortSignal.timeout(10000) });
+    const headers = { 'content-type': upstream.headers.get('content-type') ?? 'application/octet-stream' };
+    res.writeHead(upstream.status, headers);
+    if (!upstream.body) return res.end();
+    for await (const chunk of upstream.body) res.write(chunk); // streams TTS audio as it arrives
+    res.end();
+  }
+
+  const clamp = (n, max) => Math.min(Number.isFinite(n) ? n : max, max);
+
+  return createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url, 'http://proxy');
+      if (req.method === 'GET' && url.pathname === '/healthz') return send(res, 200, { ok: true });
+      if (req.method !== 'POST') return send(res, 405, { error: 'method not allowed' });
+
+      const device = authorize(req);
+      if (!device) return send(res, 401, { error: 'unauthorized' });
+      if (!allow(device)) return send(res, 429, { error: 'rate limited' });
+
+      const gemini = /^\/v1beta\/models\/([\w.-]+):generateContent$/.exec(url.pathname);
+      if (gemini) {
+        if (!allowedModels.has(gemini[1])) return send(res, 400, { error: 'model not allowed' });
+        const body = await readJSON(req);
+        body.generationConfig = { ...(body.generationConfig ?? {}), maxOutputTokens: clamp(body.generationConfig?.maxOutputTokens, 120) };
+        return forward(res, `${base.gemini}/v1beta/models/${gemini[1]}:generateContent`, {
+          method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': env.GEMINI_API_KEY ?? '' },
+          body: JSON.stringify({ contents: body.contents, generationConfig: body.generationConfig }),
+        });
+      }
+
+      if (url.pathname === '/v1/chat/completions') {
+        const body = await readJSON(req);
+        if (!allowedModels.has(body.model)) return send(res, 400, { error: 'model not allowed' });
+        return forward(res, `${base.openai}/v1/chat/completions`, {
+          method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${env.OPENAI_API_KEY ?? ''}` },
+          body: JSON.stringify({ model: body.model, messages: body.messages, max_tokens: clamp(body.max_tokens, 120), temperature: body.temperature ?? 0.2 }),
+        });
+      }
+
+      if (url.pathname === '/v1/voice/stt-token') {
+        // Short-lived Deepgram token: the device opens the WebSocket directly,
+        // the long-lived key never leaves this server.
+        return forward(res, `${base.deepgram}/v1/auth/grant`, {
+          method: 'POST', headers: { 'content-type': 'application/json', authorization: `Token ${env.DEEPGRAM_API_KEY ?? ''}` },
+          body: JSON.stringify({ ttl_seconds: 30 }),
+        });
+      }
+
+      if (url.pathname === '/v1/voice/tts') {
+        const body = await readJSON(req);
+        const text = String(body.text ?? '').slice(0, 400);
+        const voice = String(body.voice_id ?? '');
+        if (!text || !/^[A-Za-z0-9]+$/.test(voice)) return send(res, 400, { error: 'text and voice_id required' });
+        return forward(res, `${base.eleven}/v1/text-to-speech/${voice}/stream?output_format=pcm_16000`, {
+          method: 'POST', headers: { 'content-type': 'application/json', 'xi-api-key': env.ELEVENLABS_API_KEY ?? '' },
+          body: JSON.stringify({ text, model_id: 'eleven_flash_v2_5' }),
+        });
+      }
+
+      return send(res, 404, { error: 'not found' });
+    } catch (err) {
+      if (!res.headersSent) send(res, err.status ?? 502, { error: err.status ? err.message : 'upstream error' });
+      else res.end();
+    }
+  });
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const port = Number(process.env.PORT ?? 8787);
+  createProxy().listen(port, () => console.log(`echoguide proxy on :${port}`));
+}
+EOF_AVAE
+
+cat > 'proxy/server.test.mjs' <<'EOF_AVAE'
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
+import { createProxy } from './server.mjs';
+
+const TOKEN = 'device-secret';
+let upstream, proxy, proxyURL, seen = [];
+
+before(async () => {
+  upstream = createServer(async (req, res) => {
+    let body = '';
+    for await (const c of req) body += c;
+    seen.push({ url: req.url, headers: req.headers, body: body ? JSON.parse(body) : null });
+    if (req.url.startsWith('/v1/text-to-speech/')) {
+      res.writeHead(200, { 'content-type': 'audio/pcm' });
+      res.write(Buffer.alloc(3200)); res.end(Buffer.alloc(800));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(req.url === '/v1/auth/grant' ? { access_token: 'jwt', expires_in: 30 } : { ok: true }));
+  });
+  await new Promise(r => upstream.listen(0, r));
+  const u = `http://127.0.0.1:${upstream.address().port}`;
+  proxy = createProxy({
+    DEVICE_TOKEN_SHA256S: createHash('sha256').update(TOKEN).digest('hex'),
+    GEMINI_API_KEY: 'gk', OPENAI_API_KEY: 'ok', DEEPGRAM_API_KEY: 'dk', ELEVENLABS_API_KEY: 'ek',
+    GEMINI_BASE: u, OPENAI_BASE: u, DEEPGRAM_BASE: u, ELEVENLABS_BASE: u, RATE_PER_MINUTE: '12',
+  });
+  await new Promise(r => proxy.listen(0, r));
+  proxyURL = `http://127.0.0.1:${proxy.address().port}`;
+});
+
+after(() => { upstream.close(); proxy.close(); });
+
+const post = (path, body, token = TOKEN) => fetch(proxyURL + path, {
+  method: 'POST', headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+  body: JSON.stringify(body),
+});
+
+test('rejects missing or wrong device token', async () => {
+  assert.equal((await post('/v1/chat/completions', {}, null)).status, 401);
+  assert.equal((await post('/v1/chat/completions', {}, 'nope')).status, 401);
+});
+
+test('gemini: adds key, clamps tokens, drops extra fields', async () => {
+  seen = [];
+  const r = await post('/v1beta/models/gemini-2.5-flash:generateContent', { contents: [{ parts: [{ text: 'hi' }] }], generationConfig: { maxOutputTokens: 9999 }, tools: ['x'] });
+  assert.equal(r.status, 200);
+  assert.equal(seen[0].headers['x-goog-api-key'], 'gk');
+  assert.equal(seen[0].body.generationConfig.maxOutputTokens, 120);
+  assert.equal(seen[0].body.tools, undefined);
+});
+
+test('model allow-list', async () => {
+  assert.equal((await post('/v1beta/models/gemini-ultra:generateContent', {})).status, 400);
+  assert.equal((await post('/v1/chat/completions', { model: 'o3-pro', messages: [] })).status, 400);
+});
+
+test('deepgram grant returns a short-lived token', async () => {
+  seen = [];
+  const r = await post('/v1/voice/stt-token', {});
+  assert.deepEqual(await r.json(), { access_token: 'jwt', expires_in: 30 });
+  assert.equal(seen[0].headers.authorization, 'Token dk');
+  assert.equal(seen[0].body.ttl_seconds, 30);
+});
+
+test('tts streams audio bytes through', async () => {
+  const r = await post('/v1/voice/tts', { text: 'Microwave started.', voice_id: 'abc123' });
+  assert.equal(r.status, 200);
+  assert.equal((await r.arrayBuffer()).byteLength, 4000);
+  assert.equal((await post('/v1/voice/tts', { text: 'x', voice_id: '../admin' })).status, 400);
+});
+
+test('rate limits per device', async () => {
+  let last;
+  for (let i = 0; i < 20; i++) last = await post('/v1/chat/completions', { model: 'gpt-4o', messages: [] });
+  assert.equal(last.status, 429);
+});
 EOF_AVAE
 
 git init -q -b main

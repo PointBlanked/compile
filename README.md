@@ -21,7 +21,7 @@ Two owners. Engines meet only through `EchoGuideContracts`, so the two never edi
 
 | Owner | Area | Paths | Files |
 |---|---|---|---|
-| Maxwell | Perception + infrastructure: what the phone senses, and the plumbing | `EchoGuide/Core/Camera/`, `Vision/`, `Depth/`, `Plugins/`, `Router/`, `.github/`, `EchoGuideTests/`, `Package.swift`, `plugins/` | `FrameDeltaEngine`, `CameraFeed`, `LocalVisionEngine`, `LiDARDepthEngine`, `PluginRegistry`, `CloudReasoningRouter`, CI, tests |
+| Maxwell | Perception + infrastructure: what the phone senses, and the plumbing | `EchoGuide/Core/Camera/`, `Vision/`, `Depth/`, `Plugins/`, `Router/`, `EchoGuideApp/`, `proxy/`, `.github/`, `EchoGuideTests/`, `Package.swift`, `plugins/` | `FrameDeltaEngine`, `PerceptionPipeline`, `CameraFeed`, `LocalVisionEngine`, `LiDARDepthEngine`, `PluginRegistry`, built-in plugins, `CloudReasoningRouter`, `VoiceLoop`, the iOS app, the key proxy, CI/CD, tests |
 | Bryan | Experience + safety: everything the user feels, hears and sees | `EchoGuide/Core/Fence/`, `Haptics/`, `Audio/`, `Automation/`, `Cognitive/`, `EchoGuide/UI/` | `DigitalFenceEngine`, `SpatialHapticEngine`, `SpatialAudioEngine`, `AutomationEngine`, `CognitiveTaskIsolation`, `GuidanceView` |
 | Both | Shared contracts | `EchoGuide/Core/Contracts/` | `Contracts.swift` (needs both approvals) |
 
@@ -68,20 +68,41 @@ Read these honestly:
 ## Build
 
 ```bash
-swift build && swift test        # macOS host: pure logic, 65 tests
+swift build && swift test        # macOS host: pure logic, 69 tests (plus `cd proxy && node --test`: 6)
 ```
 
 The iOS-only paths (ARKit, the camera, the haptic actuator) are behind `#if canImport(...) && os(iOS)`. The `ios-build` CI job compiles them with `xcodebuild` for the iOS Simulator. Real latency numbers need a device.
 
-### What the app target has to supply
+### The iOS app (`EchoGuideApp/`)
 
-This package is the engine. An Xcode iOS app target links the `EchoGuide` library and does the following:
+Open `EchoGuideApp/EchoGuideApp.xcodeproj` in Xcode 16+, set your team, and run it on an iPhone. `AppRuntime.swift` is the only place every engine is built and connected:
 
-1. Bundles a YOLO Core ML model and passes it to `LocalVisionEngine(modelURL:)`. Export it with `yolo export model=yolo11n.pt format=coreml int8=True nms=True`. Models are git-ignored.
-2. Sets up the camera feed. With LiDAR, it runs `LiDARDepthEngine` and feeds its `onFrame` into `FrameDeltaEngine`. ARKit owns the camera, so `CameraFeed` cannot run at the same time. Without LiDAR, it uses `CameraFeed`.
-3. Builds a `PerceptionPipeline(vision: LocalVisionEngine(...))` and calls `submit` from the camera queue. The pipeline skips static frames, keeps at most one inference in flight (frames that arrive while it is busy are dropped, not queued), and times every stage. In `onResult`, run `SpatialFence.evaluate`, then `AutomationEngine.ingest(_:fence:)`.
-4. Adds `Info.plist` keys: `NSCameraUsageDescription` and `NSLocationAlwaysAndWhenInUseUsageDescription`, plus the `location` background mode for the location fence.
-5. Points `GeminiProvider` / `OpenAIProvider` at a proxy you run. No API keys ship in the app.
+- With LiDAR, ARKit owns the camera and `LiDARDepthEngine` feeds the pipeline. Without LiDAR, `CameraFeed` does.
+- `PerceptionPipeline` → `SpatialFence` → `AutomationEngine` → haptics, audio, plugins and router.
+- The location fence, the caregiver outbox flush (every 30 s when online) and the optional voice loop start here too.
+
+Per-home setup goes in `Application Support/echoguide.json` (plugins, safe areas, starting goal); the bundled `echoguide.sample.json` is the fallback. Secrets (the proxy `device_token`, Home Assistant token, webhook signing key) are read from the Keychain, service `EchoGuide`.
+
+**Model:** run the `export-model` workflow (Actions tab), download the `.mlpackage`, and drop it in `EchoGuideApp/Resources/Models/`. It is compiled on first launch. Without it, the app runs hands, text and barcodes only.
+
+> **License:** Ultralytics YOLO (v8 and 11) is **AGPL-3.0**. Shipping it in a closed-source app requires an Ultralytics Enterprise license, or a switch to a permissively licensed detector. Decide this before any public release.
+
+**On-device benchmark:** enable the `-benchmark` launch argument in the scheme, point the phone at a scene with some movement for 20 s, and read the result on screen. The full JSON is in Documents (visible in the Files app). This is how the < 15 ms local target is checked for real.
+
+**TestFlight:** the `ios-release` workflow (manual) archives with cloud signing and uploads. It needs four repo secrets, listed at the top of `.github/workflows/ios-release.yml`.
+
+## Cloud proxy (`proxy/`)
+
+The only place the Gemini, OpenAI, Deepgram and ElevenLabs keys live. It is zero-dependency Node 20+ (`node server.mjs`, tests with `node --test`).
+
+- Devices send `Authorization: Bearer <device token>`. The proxy stores only SHA-256 hashes of allowed tokens (`DEVICE_TOKEN_SHA256S`).
+- Per-device rate limit (default 30 per minute), model allow-list, output capped at 120 tokens, 2 MB body cap, 10 s upstream timeout.
+- `/v1/voice/stt-token` mints a 30-second Deepgram token, so the phone opens the speech WebSocket directly and the long-lived key never leaves the server. `/v1/voice/tts` streams ElevenLabs audio back as it arrives.
+- Deploy it anywhere that runs Node (Fly, Render, Railway, a small VM) and set `EG_PROXY_BASE_URL` for the app build.
+
+## Voice (optional)
+
+Off by default; the product works without it. With voice on (the `voiceEnabled` setting plus a proxy), Deepgram live speech-to-text understands "find the start button" (narrows guidance to that target), "stop", and any other sentence as a question for the router. ElevenLabs streaming TTS is available through the proxy; on-device speech remains the default so everything works offline.
 
 ## Plugins (MCP)
 
@@ -93,6 +114,6 @@ Remote tools are registered as `physical` unless told otherwise. A physical tool
 
 ## Not built yet
 
-- The WebSocket voice loop (Deepgram STT / ElevenLabs TTS). On-device `AVSpeechSynthesizer` is used for now, so the app works offline.
 - The OpenAI Realtime API (multi-turn). The router uses one-shot Chat Completions.
-- The Xcode app target and the bundled model.
+- A care-provider setup flow that writes `echoguide.json` and the Keychain secrets (today: by hand or MDM).
+- Real measurements: run the on-device benchmark on an A17-class iPhone and put the numbers in the targets table.

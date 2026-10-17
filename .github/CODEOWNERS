@@ -1,16 +1,18 @@
 # Two owners. PRs touching a path need that owner's review.
-# Replace @maxwell / @bryan with real GitHub usernames.
+# @bryan is a placeholder: replace it with Bryan's GitHub username.
 
 # Maxwell: perception + infrastructure
-/EchoGuide/Core/Camera/      @maxwell
-/EchoGuide/Core/Vision/      @maxwell
-/EchoGuide/Core/Depth/       @maxwell
-/EchoGuide/Core/Plugins/     @maxwell
-/EchoGuide/Core/Router/      @maxwell
-/EchoGuideTests/             @maxwell
-/.github/                    @maxwell
-/Package.swift               @maxwell
-/plugins/                    @maxwell
+/EchoGuide/Core/Camera/      @mkhavari-spec
+/EchoGuide/Core/Vision/      @mkhavari-spec
+/EchoGuide/Core/Depth/       @mkhavari-spec
+/EchoGuide/Core/Plugins/     @mkhavari-spec
+/EchoGuide/Core/Router/      @mkhavari-spec
+/EchoGuideTests/             @mkhavari-spec
+/.github/                    @mkhavari-spec
+/Package.swift               @mkhavari-spec
+/plugins/                    @mkhavari-spec
+/proxy/                      @mkhavari-spec
+/EchoGuideApp/               @mkhavari-spec
 
 # Bryan: everything the user feels, hears and sees
 /EchoGuide/Core/Fence/       @bryan
@@ -21,4 +23,4 @@
 /EchoGuide/UI/               @bryan
 
 # Shared contracts: both sign off.
-/EchoGuide/Core/Contracts/   @maxwell @bryan
+/EchoGuide/Core/Contracts/   @mkhavari-spec @bryan

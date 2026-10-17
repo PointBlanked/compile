@@ -1,0 +1,36 @@
+# Owner: Maxwell. Manual: exports YOLO to Core ML INT8 with NMS and attaches it
+# as a build artifact. Download it, put it in EchoGuideApp/Resources/Models/.
+# Ultralytics YOLO is AGPL-3.0: a closed-source app needs an Ultralytics
+# Enterprise license, or swap in a permissively licensed detector.
+
+name: export-model
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Ultralytics weights"
+        default: "yolo11n.pt"
+        required: true
+      imgsz:
+        description: "Input size"
+        default: "640"
+        required: true
+
+jobs:
+  export:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Export
+        run: |
+          python -m pip install --quiet "ultralytics>=8.3" "coremltools>=8"
+          yolo export model="${{ inputs.model }}" format=coreml int8=True nms=True imgsz=${{ inputs.imgsz }}
+          ls -la
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coreml-model
+          path: "*.mlpackage"

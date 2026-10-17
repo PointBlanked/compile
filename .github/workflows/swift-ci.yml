@@ -42,3 +42,32 @@ jobs:
             -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO | tail -n 40
           exit ${PIPESTATUS[0]}
+
+  app-build:
+    name: Build the iOS app (EchoGuideApp)
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app for iOS Simulator
+        run: |
+          xcodebuild build \
+            -project EchoGuideApp/EchoGuideApp.xcodeproj \
+            -scheme EchoGuideApp \
+            -destination 'generic/platform=iOS Simulator' \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO | tail -n 40
+          exit ${PIPESTATUS[0]}
+
+  proxy-test:
+    name: Proxy tests (Node)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Test
+        working-directory: proxy
+        run: node --test

@@ -1,0 +1,90 @@
+# Owner: Maxwell. Manual TestFlight upload. Uses Xcode cloud signing with an
+# App Store Connect API key, so no certificates or profiles live in the repo.
+#
+# Repo secrets needed (Settings > Secrets and variables > Actions):
+#   APPLE_TEAM_ID        10-character team id
+#   ASC_KEY_ID           App Store Connect API key id (Admin or App Manager role)
+#   ASC_ISSUER_ID        issuer id
+#   ASC_KEY_P8_BASE64    base64 of the AuthKey_XXXX.p8 file
+#   EG_PROXY_BASE_URL    deployed proxy URL baked into the build (optional)
+# The bundle id app.echoguide.EchoGuide must exist in App Store Connect.
+
+name: ios-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: "Build number (must increase every upload)"
+        required: true
+
+jobs:
+  testflight:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check secrets
+        env:
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          KEY: ${{ secrets.ASC_KEY_ID }}
+          ISSUER: ${{ secrets.ASC_ISSUER_ID }}
+          P8: ${{ secrets.ASC_KEY_P8_BASE64 }}
+        run: |
+          missing=""
+          [ -z "$TEAM" ] && missing="$missing APPLE_TEAM_ID"
+          [ -z "$KEY" ] && missing="$missing ASC_KEY_ID"
+          [ -z "$ISSUER" ] && missing="$missing ASC_ISSUER_ID"
+          [ -z "$P8" ] && missing="$missing ASC_KEY_P8_BASE64"
+          if [ -n "$missing" ]; then echo "::error::Missing secrets:$missing"; exit 1; fi
+
+      - name: Write API key
+        env:
+          P8: ${{ secrets.ASC_KEY_P8_BASE64 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/asc"
+          echo "$P8" | base64 --decode > "$RUNNER_TEMP/asc/key.p8"
+
+      - name: Archive
+        run: |
+          xcodebuild archive \
+            -project EchoGuideApp/EchoGuideApp.xcodeproj \
+            -scheme EchoGuideApp \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/EchoGuide.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc/key.p8" \
+            -authenticationKeyID "${{ secrets.ASC_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_ISSUER_ID }}" \
+            DEVELOPMENT_TEAM="${{ secrets.APPLE_TEAM_ID }}" \
+            CURRENT_PROJECT_VERSION="${{ inputs.build_number }}" \
+            EG_PROXY_BASE_URL="${{ secrets.EG_PROXY_BASE_URL }}" | tail -n 60
+          exit ${PIPESTATUS[0]}
+
+      - name: Upload to TestFlight
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>${{ secrets.APPLE_TEAM_ID }}</string>
+            <key>signingStyle</key><string>automatic</string>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/EchoGuide.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/asc/key.p8" \
+            -authenticationKeyID "${{ secrets.ASC_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_ISSUER_ID }}" | tail -n 40
+          exit ${PIPESTATUS[0]}
+
+      - name: Remove key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/asc"
