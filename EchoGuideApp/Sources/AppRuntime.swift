@@ -131,7 +131,7 @@ final class AppRuntime {
         // Decisions.
         let latestForTask = self.latest
         let automation = AutomationEngine(haptics: haptics, audio: audio, depth: lidar, router: router, tools: registry,
-                                          jpegProvider: { latestForTask.jpeg(maxSide: 512) })
+                                          jpegProvider: { box in latestForTask.jpeg(maxSide: 512, crop: box) })
         self.automation = automation
         guidance.bind(to: automation)
         await automation.setGoal(config.goal)
@@ -145,7 +145,7 @@ final class AppRuntime {
         }
         let latestForScene = self.latest
         let agent = AgentCore(audio: audio, haptics: haptics, depth: lidar, router: router, textRouter: textRouter,
-                              jpegProvider: { latestForScene.jpeg(maxSide: 512) })
+                              jpegProvider: { box in latestForScene.jpeg(maxSide: box == nil ? 512 : 320, crop: box) })
         self.agent = agent
         // What the mic heard: a question about the recent past is answered
         // from the agent's memory; anything else becomes the Find goal.
@@ -355,11 +355,19 @@ final class LatestFrame: @unchecked Sendable {
 
     func set(_ f: CameraFrame) { lock.withLock { frame = f } }
 
-    /// Upright, at most 768 px on the long side, ~60% quality: enough for a
-    /// multimodal model, small enough to send quickly.
-    func jpeg(maxSide: CGFloat = 768) -> Data? {
+    /// Upright, at most `maxSide` px on the long side, ~60% quality: enough for a
+    /// multimodal model, small enough to send quickly. `crop` is a normalized
+    /// upright rect (the check pipeline sends just the detection).
+    func jpeg(maxSide: CGFloat = 768, crop: ImageRect? = nil) -> Data? {
         guard let pb = lock.withLock({ frame?.pixelBuffer }) else { return nil }
         var image = CIImage(cvPixelBuffer: pb).oriented(.right)
+        if let c = crop {
+            let e = image.extent
+            // CIImage is bottom-left origin; ImageRect is top-left.
+            let rect = CGRect(x: e.minX + CGFloat(c.x) * e.width, y: e.minY + (1 - CGFloat(c.y + c.height)) * e.height,
+                              width: CGFloat(c.width) * e.width, height: CGFloat(c.height) * e.height).intersection(e)
+            if !rect.isEmpty { image = image.cropped(to: rect) }
+        }
         let scale = maxSide / max(image.extent.width, image.extent.height)
         if scale < 1 { image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale)) }
         let quality = CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String)

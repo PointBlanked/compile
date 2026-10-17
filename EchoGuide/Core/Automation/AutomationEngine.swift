@@ -55,7 +55,7 @@ public actor AutomationEngine {
     private let router: ReasoningRouting?
     private let tools: ToolInvoking?
     /// Current camera frame as JPEG, for the task guide's orientation checks.
-    private let jpegProvider: (@Sendable () -> Data?)?
+    private let jpegProvider: (@Sendable (ImageRect?) -> Data?)?
     private var task: TaskGuide?
     private var checkInFlight = false
     private var progressContinuations: [UUID: AsyncStream<TaskProgress?>.Continuation] = [:]
@@ -88,7 +88,7 @@ public actor AutomationEngine {
         tools: ToolInvoking? = nil,
         cognitive: CognitiveTaskIsolation = CognitiveTaskIsolation(),
         config: AutomationConfig = AutomationConfig(),
-        jpegProvider: (@Sendable () -> Data?)? = nil
+        jpegProvider: (@Sendable (ImageRect?) -> Data?)? = nil
     ) {
         self.haptics = haptics
         self.audio = audio
@@ -315,7 +315,7 @@ public actor AutomationEngine {
             case .check(let question):
                 guard !checkInFlight else { continue }
                 checkInFlight = true
-                let jpeg = jpegProvider?()
+                let jpeg = jpegProvider?(nil)
                 Task { await self.runCheck(question, jpeg: jpeg, detections: frame.detections) }
             case .done(let say):
                 await haptics.stop()

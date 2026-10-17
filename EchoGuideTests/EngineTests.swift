@@ -36,10 +36,11 @@ func frame(_ d: [Detection], t: TimeInterval, index: UInt64 = 0) -> VisionFrameR
 }
 
 actor RecordingHaptics: HapticCueing {
-    var guides = 0, confirms = 0, warns = 0, stops = 0
+    var guides = 0, confirms = 0, warns = 0, stops = 0, alerts = 0
     func guide(offset dx: Float, _ dy: Float, distanceMetres: Float?) async { guides += 1 }
     func confirm() async { confirms += 1 }
     func warn() async { warns += 1 }
+    func alert() async { alerts += 1 }
     func stop() async { stops += 1 }
 }
 

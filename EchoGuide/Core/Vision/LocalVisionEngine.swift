@@ -134,7 +134,8 @@ public actor LocalVisionEngine {
                 label: top.identifier,
                 confidence: top.confidence,
                 box: box,
-                color: config.sampleColors ? Self.dominantColor(in: box, of: frame.pixelBuffer) : nil
+                // Never name a colour on a person: it would read as skin tone.
+                color: config.sampleColors && !Self.noColor.contains(top.identifier) ? Self.dominantColor(in: box, of: frame.pixelBuffer) : nil
             ))
         }
 
@@ -201,6 +202,8 @@ public actor LocalVisionEngine {
     }
 }
 extension LocalVisionEngine {
+    static let noColor: Set<String> = ["person", "child", "face", "hand"]
+
     /// 16 samples from the central 60% of the box, on the biplanar YCbCr
     /// buffer both camera paths deliver; nil for other formats or no clear winner.
     static func dominantColor(in box: ImageRect, of buffer: CVPixelBuffer) -> String? {

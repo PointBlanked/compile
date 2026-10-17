@@ -787,7 +787,7 @@ struct StubListener: GoalListening {
         var cfg = SceneIntelligenceConfig()
         cfg.warmup = 0
         let agent = AgentCore(audio: a, haptics: RecordingHaptics(), router: SceneRouter(seen: seen), scene: cfg,
-                              jpegProvider: { Data([0xFF, 0xD8]) }, clock: { 100 })
+                              jpegProvider: { _ in Data([0xFF, 0xD8]) }, clock: { 100 })
         await agent.setMode(.explore, announce: false)
         await agent.ingest(frame([det("kettle", x: 0.5, y: 0.5, conf: 0.9)], t: 0.1), fence: nil)
         await agent.ingest(frame([det("kettle", x: 0.5, y: 0.5, conf: 0.9)], t: 0.2), fence: nil)
@@ -1071,5 +1071,88 @@ struct StubListener: GoalListening {
         _ = n.observe(frame(dets, t: 0))
         #expect(n.observe(frame(dets, t: 0.2))?.text == "A chair, on your left.")
         for t in stride(from: 1.0, to: 15.0, by: 0.5) { #expect(n.observe(frame(dets, t: t)) == nil) }
+    }
+}
+
+
+// MARK: - Recognition check pipeline and motion haptic
+
+@Suite struct CheckPipelineTests {
+    struct YesNoRouter: ReasoningRouting {
+        let answer: String
+        let calls: Counter
+        func resolve(_ q: ReasoningQuery) async -> ReasoningOutcome {
+            await calls.inc()
+            #expect(q.raw)
+            return ReasoningOutcome(answer: answer, source: .cloud, latencyMs: 300)
+        }
+    }
+
+    @Test func confidentDetectionsSkipTheCheckAndVerdictsAreCached() async {
+        let c = PerceptionChecker(trustAbove: 0.75)
+        #expect(await !c.needsCheck(det("chair", x: 0.5, y: 0.5, conf: 0.9)))
+        let uncertain = det("chair", x: 0.5, y: 0.5, conf: 0.6)
+        #expect(await c.needsCheck(uncertain))
+        let calls = Counter()
+        #expect(await c.check(uncertain, jpeg: Data([1]), router: YesNoRouter(answer: "No.", calls: calls)) == .rejected)
+        #expect(await !c.needsCheck(uncertain)) // cached
+        #expect(await c.check(uncertain, jpeg: Data([1]), router: YesNoRouter(answer: "Yes", calls: calls)) == .rejected) // cache wins
+        #expect(await calls.value == 1)
+        #expect(await c.check(det("cup", x: 0.1, y: 0.1, conf: 0.6), jpeg: nil, router: YesNoRouter(answer: "Yes", calls: calls)) == .unknown)
+        #expect(PerceptionChecker.question(det("oven", x: 0, y: 0)) == "Is there an oven in this picture? Answer yes or no.")
+    }
+
+    @Test func rejectedRecognitionIsNotSpokenAndIsDoubted() async {
+        let calls = Counter(), a = RecordingAudio()
+        var quiet = SceneIntelligenceConfig()
+        quiet.warmup = 1_000 // keep the scene describer out of this test
+        let agent = AgentCore(audio: a, haptics: RecordingHaptics(), router: YesNoRouter(answer: "no", calls: calls), scene: quiet,
+                              jpegProvider: { _ in Data([0xFF]) }, clock: { 100 })
+        await agent.setMode(.explore, announce: false)
+        let f = { (t: TimeInterval) in frame([det("suitcase", x: 0.5, y: 0.5, size: 0.2, conf: 0.6)], t: t) }
+        await agent.ingest(f(0), fence: nil)
+        await agent.ingest(f(0.3), fence: nil)
+        for _ in 0..<100 where await agent.stats.rejectedRecognitions == 0 { try? await Task.sleep(nanoseconds: 5_000_000) }
+        #expect(await agent.stats.rejectedRecognitions == 1)
+        #expect(await a.spoken.isEmpty)
+        // Still not offered a few seconds later.
+        await agent.ingest(f(4), fence: nil)
+        await agent.ingest(f(4.3), fence: nil)
+        #expect(await a.spoken.isEmpty)
+        #expect(await calls.value == 1)
+    }
+
+    @Test func confirmedRecognitionIsSpoken() async {
+        let calls = Counter(), a = RecordingAudio()
+        var quiet = SceneIntelligenceConfig()
+        quiet.warmup = 1_000
+        let agent = AgentCore(audio: a, haptics: RecordingHaptics(), router: YesNoRouter(answer: "Yes, there is.", calls: calls), scene: quiet,
+                              jpegProvider: { _ in Data([0xFF]) }, clock: { 100 })
+        await agent.setMode(.explore, announce: false)
+        let f = { (t: TimeInterval) in frame([det("suitcase", x: 0.5, y: 0.5, size: 0.2, conf: 0.6)], t: t) }
+        await agent.ingest(f(0), fence: nil)
+        await agent.ingest(f(0.3), fence: nil)
+        for _ in 0..<100 where await a.spoken.isEmpty { try? await Task.sleep(nanoseconds: 5_000_000) }
+        #expect(await a.spoken == ["A suitcase, ahead."])
+    }
+
+    @Test func motionAlertUsesTheRapidHaptic() async {
+        let h = RecordingHaptics(), a = RecordingAudio()
+        let agent = AgentCore(audio: a, haptics: h, clock: { 100 })
+        await agent.setMode(.explore, announce: false)
+        var bike = det("bicycle", x: 0.1, y: 0.5, size: 0.15, conf: 0.9)
+        await agent.ingest(frame([bike], t: 0), fence: nil)
+        bike = det("bicycle", x: 0.2, y: 0.5, size: 0.15, conf: 0.9)
+        await agent.ingest(frame([bike], t: 0.3), fence: nil)
+        bike = det("bicycle", x: 0.6, y: 0.5, size: 0.15, conf: 0.9)
+        await agent.ingest(frame([bike], t: 0.9), fence: nil)
+        #expect(await h.alerts == 1)
+        #expect(await h.warns == 0)
+        #expect(await a.spoken.last == "A bicycle, moving fast, ahead.")
+    }
+
+    @Test func paddedCropStaysInsideTheFrame() {
+        let p = AgentCore.padded(ImageRect(x: 0.9, y: 0.0, width: 0.2, height: 0.2))
+        #expect(p.x >= 0 && p.y >= 0 && p.x + p.width <= 1.0001 && p.y + p.height <= 1.0001)
     }
 }

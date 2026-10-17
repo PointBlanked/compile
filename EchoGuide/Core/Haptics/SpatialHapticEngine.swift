@@ -101,6 +101,13 @@ public actor SpatialHapticEngine: HapticCueing {
         play([(0, 1.0, 0.1), (0.12, 1.0, 0.1), (0.24, 1.0, 0.1), (0.36, 1.0, 0.1)])
     }
 
+    /// Motion alert: three sharp taps in under a quarter second, unlike the
+    /// slow heavy warn pattern and the gentle double-tap confirm.
+    public func alert() async {
+        current = nil
+        play([(0, 0.9, 0.8), (0.08, 0.9, 0.8), (0.16, 1.0, 0.9)])
+    }
+
     public func stop() async {
         current = nil
         loop?.cancel()

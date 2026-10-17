@@ -152,7 +152,13 @@ public protocol HapticCueing: Sendable {
     func confirm() async
     /// Strong, unmistakable warning (digital fence breach).
     func warn() async
+    /// Something is moving fast or coming at the user: three rapid taps.
+    func alert() async
     func stop() async
+}
+
+public extension HapticCueing {
+    func alert() async { await warn() }
 }
 
 public protocol SpatialAudioCueing: Sendable {

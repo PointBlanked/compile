@@ -47,6 +47,8 @@ public struct Announcement: Sendable, Equatable {
     public var azimuth: Float
     /// Obstacles also buzz.
     public var urgent: Bool
+    /// The detection behind an object announcement, for the check pipeline.
+    public var detection: Detection? = nil
 }
 
 public enum SceneVocabulary {
@@ -126,6 +128,12 @@ public struct SceneNarrator: Sendable {
     private var tracks: [Track] = []
     private var lastAnnounced: [String: TimeInterval] = [:]
     private var lastAny: TimeInterval = -.infinity
+    private var doubted: [String: TimeInterval] = [:]
+    /// A label the check pipeline rejected is not offered again for this long.
+    public var doubtCooldown: TimeInterval = 20
+
+    /// The check pipeline found no such thing: hold the label back for a while.
+    public mutating func doubt(_ label: String, at now: TimeInterval) { doubted[label] = now }
 
     public init(config: NarratorConfig = NarratorConfig()) { self.config = config }
 
@@ -133,6 +141,7 @@ public struct SceneNarrator: Sendable {
         tracks = []
         lastAnnounced = [:]
         lastAny = -.infinity
+        doubted = [:]
     }
 
     /// `depths` holds metres per detection index when LiDAR is available.
@@ -173,7 +182,8 @@ public struct SceneNarrator: Sendable {
         for (i, d) in frame.detections.enumerated() {
             guard d.kind == .object, d.confidence >= config.minimumConfidence,
                   !SceneVocabulary.silent.contains(d.label), isSettled(d),
-                  cooled(d.label, now, config.labelCooldown) else { continue }
+                  cooled(d.label, now, config.labelCooldown),
+                  doubted[d.label].map({ now - $0 >= doubtCooldown }) ?? true else { continue }
             let metres = depths[i]
             // Salience first; nearer and more central break ties.
             var score = Float(SceneVocabulary.salience(of: d.label))
@@ -185,7 +195,9 @@ public struct SceneNarrator: Sendable {
             var parts = [SceneVocabulary.article(b.d.describedLabel).capitalizedFirstLetter, SceneVocabulary.place(b.d.box.midX)]
             if let dist = SceneVocabulary.distance(b.metres) { parts.append(dist) }
             let text = parts.joined(separator: ", ") + "."
-            return mark(Announcement(text: text, kind: .object, azimuth: SceneVocabulary.azimuth(b.d.box.midX), urgent: false), keys: [b.d.label], at: now)
+            var a = Announcement(text: text, kind: .object, azimuth: SceneVocabulary.azimuth(b.d.box.midX), urgent: false)
+            a.detection = b.d
+            return mark(a, keys: [b.d.label], at: now)
         }
 
         // 3. Readable text nobody has read out yet (signs, labels).

@@ -51,6 +51,8 @@ public struct AgentTelemetry: Sendable, Equatable {
     public var describeP95Ms: Double = 0
     /// Unprompted scene descriptions spoken in Explore.
     public var sceneDescriptions = 0
+    /// Uncertain detections the check pipeline refused to announce.
+    public var rejectedRecognitions = 0
 }
 
 public actor AgentCore {
@@ -70,7 +72,10 @@ public actor AgentCore {
     private var readInFlight = false
     private var pendingLines: [String] = []
     /// Supplies the current camera frame as JPEG when the scene is worth describing.
-    private let jpegProvider: (@Sendable () -> Data?)?
+    /// Full frame when the box is nil, otherwise that region, for checks.
+    private let jpegProvider: (@Sendable (ImageRect?) -> Data?)?
+    private let checker = PerceptionChecker()
+    private var checkInFlight = false
     private var lastFrame: VisionFrameResult?
     private var lastFenceWarning: [String: TimeInterval] = [:]
     private var busyUntil: TimeInterval = 0
@@ -82,7 +87,7 @@ public actor AgentCore {
     public init(audio: SpatialAudioCueing, haptics: HapticCueing, depth: DepthProviding? = nil, router: ReasoningRouting? = nil,
                 textRouter: ReasoningRouting? = nil,
                 narrator: NarratorConfig = NarratorConfig(), scene: SceneIntelligenceConfig = SceneIntelligenceConfig(),
-                jpegProvider: (@Sendable () -> Data?)? = nil,
+                jpegProvider: (@Sendable (ImageRect?) -> Data?)? = nil,
                 clock: @escaping @Sendable () -> TimeInterval = { Date().timeIntervalSince1970 }) {
         self.audio = audio
         self.haptics = haptics
@@ -155,12 +160,21 @@ public actor AgentCore {
                 scene.asked(at: frame.timestamp, labels: labels)
                 sceneInFlight = true
                 let snapshot = frame
-                Task { await self.describeScene(snapshot, jpeg: jpegProvider()) }
+                Task { await self.describeScene(snapshot, jpeg: jpegProvider(nil)) }
             }
             guard let a = narrator.observe(frame, depths: depths, aheadMetres: ahead) else { return false }
             if !a.urgent, clock() < busyUntil { return false }
+            // Check pipeline: an uncertain object is confirmed against the
+            // vision model on its crop before it is spoken. Off the frame path;
+            // confident detections and urgent alerts are spoken at once.
+            if a.kind == .object, let d = a.detection, await checker.needsCheck(d), let router, let jpegProvider, !checkInFlight {
+                checkInFlight = true
+                let crop = jpegProvider(Self.padded(d.box))
+                Task { await self.confirmAndSay(a, detection: d, jpeg: crop, router: router) }
+                return false
+            }
             telemetry.announcements += 1
-            if a.urgent { await haptics.warn() }
+            if a.urgent { if a.kind == .motion { await haptics.alert() } else { await haptics.warn() } }
             await say(a.text, source: .narrator, azimuth: a.azimuth, urgent: a.urgent)
         case .read:
             guard clock() >= busyUntil else { return false }
@@ -181,6 +195,28 @@ public actor AgentCore {
             break
         }
         return false
+    }
+
+    /// Vision-model yes/no on the crop; speaks only if confirmed, otherwise the
+    /// label is doubted for a while so the narrator does not keep offering it.
+    private func confirmAndSay(_ a: Announcement, detection d: Detection, jpeg: Data?, router: ReasoningRouting) async {
+        defer { checkInFlight = false }
+        let verdict = await checker.check(d, jpeg: jpeg, router: router)
+        guard mode == .explore else { return }
+        switch verdict {
+        case .confirmed, .unknown:
+            telemetry.announcements += 1
+            await say(a.text, source: .narrator, azimuth: a.azimuth, urgent: a.urgent)
+        case .rejected:
+            telemetry.rejectedRecognitions += 1
+            narrator.doubt(d.label, at: lastFrame?.timestamp ?? clock())
+        }
+    }
+
+    /// A little context around the box helps the model.
+    static func padded(_ b: ImageRect) -> ImageRect {
+        let px = b.width * 0.25, py = b.height * 0.25
+        return ImageRect(x: max(0, b.x - px), y: max(0, b.y - py), width: min(1 - max(0, b.x - px), b.width + 2 * px), height: min(1 - max(0, b.y - py), b.height + 2 * py))
     }
 
     /// Unprompted: one or two sentences about the place and what is happening,
