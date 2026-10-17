@@ -82,14 +82,20 @@ public struct Detection: Sendable, Equatable, Codable {
     public var kind: DetectionKind
     /// Recognised string for `.text`, payload for `.barcode`.
     public var text: String?
+    /// Dominant colour name sampled from the frame ("red"), when clear.
+    public var color: String?
 
-    public init(label: String, confidence: Float, box: ImageRect, kind: DetectionKind = .object, text: String? = nil) {
+    public init(label: String, confidence: Float, box: ImageRect, kind: DetectionKind = .object, text: String? = nil, color: String? = nil) {
         self.label = label
         self.confidence = confidence
         self.box = box
         self.kind = kind
         self.text = text
+        self.color = color
     }
+
+    /// "red cup", or just "cup".
+    public var describedLabel: String { color.map { "\($0) \(label)" } ?? label }
 }
 
 public struct VisionFrameResult: Sendable, Equatable {

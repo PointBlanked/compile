@@ -328,7 +328,7 @@ public enum SceneSummary {
             .filter { $0.element.kind == .object && !SceneVocabulary.silent.contains($0.element.label) && $0.element.confidence >= 0.4 }
             .sorted { SceneVocabulary.salience(of: $0.element.label) > SceneVocabulary.salience(of: $1.element.label) }
         for (i, d) in objects where seenLabels.insert(d.label).inserted && seenLabels.count <= 5 {
-            var phrase = SceneVocabulary.article(d.label)
+            var phrase = SceneVocabulary.article(d.describedLabel)
             if let dist = SceneVocabulary.distance(depths[i]) { phrase += ", \(dist)" }
             groups[SceneVocabulary.place(d.box.midX), default: []].append(phrase)
         }

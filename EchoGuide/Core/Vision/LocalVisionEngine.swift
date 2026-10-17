@@ -24,6 +24,8 @@ public struct LocalVisionConfig: Sendable {
     /// Read mode turns the object model off: it only needs text, and skipping
     /// YOLO frees the budget for accurate OCR on every frame.
     public var detectObjects = true
+    /// Name each object's dominant colour from a 4x4 sample inside its box.
+    public var sampleColors = true
     /// Barcodes ride the OCR cadence: both are "read the label" work.
     public var detectBarcodes = true
     /// Keep at most this many detections; cognitive isolation picks one anyway.
@@ -127,10 +129,12 @@ public actor LocalVisionEngine {
         for case let obs as VNRecognizedObjectObservation in (config.detectObjects ? objectRequest?.results : nil) ?? [] {
             guard let top = obs.labels.first, top.confidence >= config.minimumConfidence else { continue }
             let b = obs.boundingBox
+            let box = VisionGeometry.topLeft(x: b.minX, y: b.minY, width: b.width, height: b.height)
             detections.append(Detection(
                 label: top.identifier,
                 confidence: top.confidence,
-                box: VisionGeometry.topLeft(x: b.minX, y: b.minY, width: b.width, height: b.height)
+                box: box,
+                color: config.sampleColors ? Self.dominantColor(in: box, of: frame.pixelBuffer) : nil
             ))
         }
 
@@ -196,6 +200,41 @@ public actor LocalVisionEngine {
         return VisionFrameResult(frameIndex: frame.index, timestamp: frame.timestamp, detections: detections, inferenceMs: ms)
     }
 }
+extension LocalVisionEngine {
+    /// 16 samples from the central 60% of the box, on the biplanar YCbCr
+    /// buffer both camera paths deliver; nil for other formats or no clear winner.
+    static func dominantColor(in box: ImageRect, of buffer: CVPixelBuffer) -> String? {
+        let format = CVPixelBufferGetPixelFormatType(buffer)
+        guard format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange || format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+              CVPixelBufferGetPlaneCount(buffer) >= 2 else { return nil }
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let yBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 0), let cBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 1) else { return nil }
+        let w = CVPixelBufferGetWidthOfPlane(buffer, 0), h = CVPixelBufferGetHeightOfPlane(buffer, 0)
+        let yStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0), cStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1)
+        let yPtr = yBase.assumingMemoryBound(to: UInt8.self), cPtr = cBase.assumingMemoryBound(to: UInt8.self)
+        var names: [String] = []
+        names.reserveCapacity(16)
+        for i in 0..<4 {
+            for j in 0..<4 {
+                let u = ImagePoint(x: box.x + box.width * (0.2 + 0.6 * (Float(i) + 0.5) / 4),
+                                   y: box.y + box.height * (0.2 + 0.6 * (Float(j) + 0.5) / 4))
+                let s = ColorNamer.sensorPoint(fromUpright: u)
+                let px = min(w - 1, max(0, Int(s.x * Float(w)))), py = min(h - 1, max(0, Int(s.y * Float(h))))
+                let y = yPtr[py * yStride + px]
+                let c = (py / 2) * cStride + (px / 2) * 2
+                let (r, g, b) = ColorNamer.rgb(y: y, cb: cPtr[c], cr: cPtr[c + 1])
+                names.append(ColorNamer.name(r: r, g: g, b: b))
+            }
+        }
+        // Grey and white are everywhere (walls, tables): only name a colour when it is a real colour,
+        // or when the box is overwhelmingly one neutral.
+        guard let n = ColorNamer.dominant(names, agreement: 0.5) else { return nil }
+        if ["grey", "white", "black"].contains(n), ColorNamer.dominant(names, agreement: 0.8) == nil { return nil }
+        return n
+    }
+}
+
 extension LocalVisionEngine: FrameInferring {
     public func infer(_ frame: CameraFrame) async -> VisionFrameResult { process(frame) }
 }

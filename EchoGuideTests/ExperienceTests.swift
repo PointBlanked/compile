@@ -975,3 +975,78 @@ struct StubListener: GoalListening {
         #expect(TextVerifier.parse("Sure! Here are the corrected lines:\nSTART\nSTOP\nDEFROST\nPOWER", fallback: ["START"]) == ["START"])
     }
 }
+
+// MARK: - Colour, motion and sign priority
+
+@Suite struct AdvancedPerceptionTests {
+    @Test func colourNames() {
+        #expect(ColorNamer.name(r: 220, g: 30, b: 30) == "red")
+        #expect(ColorNamer.name(r: 30, g: 60, b: 220) == "blue")
+        #expect(ColorNamer.name(r: 40, g: 180, b: 60) == "green")
+        #expect(ColorNamer.name(r: 240, g: 200, b: 30) == "yellow")
+        #expect(ColorNamer.name(r: 245, g: 140, b: 20) == "orange")
+        #expect(ColorNamer.name(r: 120, g: 70, b: 30) == "brown")
+        #expect(ColorNamer.name(r: 250, g: 250, b: 250) == "white")
+        #expect(ColorNamer.name(r: 128, g: 128, b: 128) == "grey")
+        #expect(ColorNamer.name(r: 10, g: 10, b: 10) == "black")
+        #expect(ColorNamer.dominant(["red", "red", "red", "grey"]) == "red")
+        #expect(ColorNamer.dominant(["red", "blue", "green", "grey"]) == nil)
+        let (r, g, b) = ColorNamer.rgb(y: 128, cb: 128, cr: 128)
+        #expect(r == 128 && g == 128 && b == 128)
+        #expect(ColorNamer.sensorPoint(fromUpright: ImagePoint(x: 1, y: 0)) == ImagePoint(x: 0, y: 0))
+        #expect(Detection(label: "cup", confidence: 0.9, box: ImageRect(x: 0, y: 0, width: 0.1, height: 0.1), color: "red").describedLabel == "red cup")
+    }
+
+    @Test func fastMoverInterruptsAndNamesColour() {
+        var n = SceneNarrator()
+        // A bicycle crossing the frame quickly: settled on frame 2, fast by frame 3.
+        var bike = Detection(label: "bicycle", confidence: 0.9, box: ImageRect(x: 0.05, y: 0.4, width: 0.15, height: 0.15), color: "red")
+        _ = n.observe(frame([bike], t: 0))
+        bike.box.x = 0.15
+        _ = n.observe(frame([bike], t: 0.3))
+        bike.box.x = 0.55
+        let a = n.observe(frame([bike], t: 0.9))
+        #expect(a?.kind == .motion)
+        #expect(a?.urgent == true)
+        #expect(a?.text == "A red bicycle, moving fast, ahead.")
+        // Not repeated right away.
+        bike.box.x = 0.8
+        #expect(n.observe(frame([bike], t: 1.2)) == nil)
+    }
+
+    @Test func approachingThingIsCalledOut() {
+        var n = SceneNarrator()
+        var car = det("car", x: 0.5, y: 0.5, size: 0.2, conf: 0.9)
+        _ = n.observe(frame([car], t: 0))
+        _ = n.observe(frame([car], t: 0.3))
+        car = det("car", x: 0.5, y: 0.5, size: 0.4, conf: 0.9) // box area x4 in 0.6 s
+        let a = n.observe(frame([car], t: 0.9))
+        #expect(a?.kind == .motion)
+        #expect(a?.text == "A car, coming toward you, ahead.")
+    }
+
+    @Test func importantSignBeatsObjects() {
+        var n = SceneNarrator()
+        let dets = [det("chair", x: 0.3, y: 0.5, conf: 0.9), det("text", x: 0.8, y: 0.3, conf: 0.9, kind: .text, text: "EXIT")]
+        // Signs need no settling: the very first frame reads the important one.
+        let a = n.observe(frame(dets, t: 0))
+        #expect(a?.kind == .text)
+        #expect(a?.text == "Sign: EXIT.")
+        #expect(a.map { $0.azimuth > 0 } == true) // pinged from the right
+        #expect(SceneVocabulary.isImportantSign("Wet Floor"))
+        #expect(!SceneVocabulary.isImportantSign("Oat milk"))
+        // Then the chair, once settled and after the pacing gap (tracks expire after 1.5 s of absence).
+        _ = n.observe(frame(dets, t: 1))
+        _ = n.observe(frame(dets, t: 2))
+        let b = n.observe(frame(dets, t: 3))
+        #expect(b?.text == "A chair, on your left.")
+    }
+
+    @Test func staticSceneStaysQuiet() {
+        var n = SceneNarrator()
+        let dets = [det("chair", x: 0.3, y: 0.5, conf: 0.9)]
+        _ = n.observe(frame(dets, t: 0))
+        #expect(n.observe(frame(dets, t: 0.2))?.text == "A chair, on your left.")
+        for t in stride(from: 1.0, to: 15.0, by: 0.5) { #expect(n.observe(frame(dets, t: t)) == nil) }
+    }
+}

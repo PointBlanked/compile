@@ -11,6 +11,8 @@ public struct SceneObservation: Sendable, Equatable {
     public var time: TimeInterval
     /// Most confident box per label this frame.
     public var objects: [String: ImageRect]
+    /// Colour per label when it was clear.
+    public var colors: [String: String] = [:]
     public var text: [String]
     /// The vision model's scene sentence, when one was spoken around this time.
     public var scene: String?
@@ -42,9 +44,10 @@ public struct ObservationMemory: Sendable {
     @discardableResult
     public mutating func record(_ frame: VisionFrameResult) -> Bool {
         var objects: [String: ImageRect] = [:]
+        var colors: [String: String] = [:]
         var best: [String: Float] = [:]
         for d in frame.detections where d.kind == .object && d.confidence >= minimumConfidence && !SceneVocabulary.silent.contains(d.label) {
-            if d.confidence > (best[d.label] ?? 0) { best[d.label] = d.confidence; objects[d.label] = d.box }
+            if d.confidence > (best[d.label] ?? 0) { best[d.label] = d.confidence; objects[d.label] = d.box; colors[d.label] = d.color }
         }
         let text = frame.detections.filter { $0.kind == .text && $0.confidence >= minimumConfidence }
             .compactMap { $0.text.map(TextReader.clean) }.filter { $0.count >= 3 }
@@ -52,7 +55,9 @@ public struct ObservationMemory: Sendable {
         if let last = observations.last, Set(last.objects.keys) == Set(objects.keys), frame.timestamp - last.time < minSpacing {
             return false
         }
-        observations.append(SceneObservation(time: frame.timestamp, objects: objects, text: text))
+        var o = SceneObservation(time: frame.timestamp, objects: objects, text: text)
+        o.colors = colors
+        observations.append(o)
         if observations.count > capacity { observations.removeFirst(observations.count - capacity) }
         return true
     }
@@ -99,7 +104,8 @@ public struct ObservationMemory: Sendable {
             }
             return "I have not seen \(SceneVocabulary.article(subject)) recently."
         }
-        return "I saw \(SceneVocabulary.article(label)) \(Self.ago(now - o.time)), \(SceneVocabulary.place(box.midX))."
+        let named = o.colors[label].map { "\($0) \(label)" } ?? label
+        return "I saw \(SceneVocabulary.article(named)) \(Self.ago(now - o.time)), \(SceneVocabulary.place(box.midX))."
     }
 
     /// "In the last minute I saw a chair, a laptop and a person."
