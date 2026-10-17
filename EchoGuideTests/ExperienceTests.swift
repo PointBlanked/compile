@@ -1025,6 +1025,29 @@ struct StubListener: GoalListening {
         #expect(a?.text == "A car, coming toward you, ahead.")
     }
 
+    @Test func cameraMotionIsNotObjectMotion() {
+        var n = SceneNarrator()
+        // Panning: chair, table and a person all shift together. Nothing is announced as moving.
+        func scene(_ shift: Float) -> [Detection] {
+            [det("chair", x: 0.2 + shift, y: 0.5, conf: 0.9), det("dining table", x: 0.5 + shift, y: 0.6, size: 0.3, conf: 0.9), det("person", x: 0.8 + shift, y: 0.4, size: 0.3, conf: 0.9)]
+        }
+        _ = n.observe(frame(scene(0), t: 0))
+        _ = n.observe(frame(scene(0.1), t: 0.3))
+        let a = n.observe(frame(scene(0.4), t: 0.9))
+        #expect(a?.kind != .motion)
+        // A chair alone can never be "moving fast".
+        var m = SceneNarrator()
+        var chair = det("chair", x: 0.1, y: 0.5, conf: 0.9)
+        _ = m.observe(frame([chair], t: 0)); chair = det("chair", x: 0.2, y: 0.5, conf: 0.9)
+        _ = m.observe(frame([chair], t: 0.3)); chair = det("chair", x: 0.7, y: 0.5, conf: 0.9)
+        #expect(m.observe(frame([chair], t: 0.9))?.kind != .motion)
+        // Walking toward a table makes it grow: not "coming toward you".
+        var w = SceneNarrator()
+        _ = w.observe(frame([det("dining table", x: 0.5, y: 0.6, size: 0.2, conf: 0.9)], t: 0))
+        _ = w.observe(frame([det("dining table", x: 0.5, y: 0.6, size: 0.25, conf: 0.9)], t: 0.3))
+        #expect(w.observe(frame([det("dining table", x: 0.5, y: 0.6, size: 0.45, conf: 0.9)], t: 0.9))?.kind != .motion)
+    }
+
     @Test func importantSignBeatsObjects() {
         var n = SceneNarrator()
         let dets = [det("chair", x: 0.3, y: 0.5, conf: 0.9), det("text", x: 0.8, y: 0.3, conf: 0.9, kind: .text, text: "EXIT")]

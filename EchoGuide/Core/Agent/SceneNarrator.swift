@@ -79,6 +79,13 @@ public enum SceneVocabulary {
     /// Never volunteered: the user's own hand, and background clutter.
     public static let silent: Set<String> = ["fingertip", "text", "hand"]
 
+    /// Things that move on their own. Only these can be "moving fast" or
+    /// "coming toward you"; a chair that shifts in the frame is the camera moving.
+    public static let mobile: Set<String> = [
+        "person", "child", "dog", "cat", "bicycle", "scooter", "motorcycle", "car", "bus", "truck", "train",
+        "stroller", "wheelchair", "shopping cart", "bird", "horse", "skateboard", "ball", "sports ball",
+    ]
+
     public static func salience(of label: String) -> Int { salience[label] ?? 2 }
 
     public static func place(_ x: Float) -> String {
@@ -220,18 +227,30 @@ public struct SceneNarrator: Sendable {
         }
     }
 
-    /// The settled track moving or growing fastest beyond the thresholds, if any.
+    /// The settled mobile track moving or growing fastest beyond the thresholds,
+    /// after subtracting the motion everything else shares (the camera moving).
     private func fastestMover(_ now: TimeInterval) -> (label: String, box: ImageRect, approaching: Bool)? {
-        var best: (speed: Float, label: String, box: ImageRect, approaching: Bool)?
-        for t in tracks where t.frames >= config.settleFrames && t.lastSeen == now {
+        let live = tracks.filter { $0.frames >= config.settleFrames && $0.lastSeen == now && $0.lastSeen > $0.pastAt }
+        guard !live.isEmpty else { return nil }
+        // Camera egomotion: the median displacement and growth of all tracks.
+        func velocity(_ t: Track) -> (dx: Float, dy: Float, growth: Float) {
             let dt = Float(max(0.2, t.lastSeen - t.pastAt))
-            guard t.lastSeen > t.pastAt else { continue }
-            let speed = t.box.mid.distance(to: t.pastBox.mid) / dt
-            let growth = t.pastBox.area > 0 ? t.box.area / t.pastBox.area : 1
+            return ((t.box.midX - t.pastBox.midX) / dt, (t.box.midY - t.pastBox.midY) / dt, t.pastBox.area > 0 ? t.box.area / t.pastBox.area : 1)
+        }
+        let vs = live.map(velocity)
+        func median(_ xs: [Float]) -> Float { let s = xs.sorted(); return s[s.count / 2] }
+        let ego = (dx: median(vs.map(\.dx)), dy: median(vs.map(\.dy)), growth: median(vs.map(\.growth)))
+        let sharedMotion = live.count >= 2 // with one track there is nothing to compare against
+
+        var best: (score: Float, label: String, box: ImageRect, approaching: Bool)?
+        for (t, v) in zip(live, vs) where SceneVocabulary.mobile.contains(t.label) {
+            let dx = sharedMotion ? v.dx - ego.dx : v.dx, dy = sharedMotion ? v.dy - ego.dy : v.dy
+            let speed = (dx * dx + dy * dy).squareRoot()
+            let growth = sharedMotion && ego.growth > 0 ? v.growth / ego.growth : v.growth
             let approaching = growth >= config.approachGrowth && t.box.area > 0.04
             guard speed >= config.fastSpeed || approaching else { continue }
             let score = speed + (approaching ? 1 : 0)
-            if best == nil || score > best!.speed { best = (score, t.label, t.box, approaching) }
+            if best == nil || score > best!.score { best = (score, t.label, t.box, approaching) }
         }
         return best.map { ($0.label, $0.box, $0.approaching) }
     }
