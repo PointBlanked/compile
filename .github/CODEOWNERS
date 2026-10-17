@@ -1,0 +1,18 @@
+# Each path has one owner. PRs touching a path need that owner's review.
+/EchoGuide/Core/Camera/      @james
+/EchoGuide/Core/Vision/      @james
+/EchoGuide/Core/Fence/       @james
+/EchoGuide/Core/Haptics/     @lily
+/EchoGuide/Core/Depth/       @lily
+/EchoGuide/Core/Audio/       @lily
+/EchoGuide/Core/Automation/  @bryan
+/EchoGuide/Core/Cognitive/   @bryan
+/EchoGuide/UI/               @bryan
+/EchoGuide/Core/Plugins/     @maxwell
+/EchoGuide/Core/Router/      @maxwell
+/EchoGuideTests/             @maxwell
+/.github/                    @maxwell
+/Package.swift               @maxwell
+/plugins/                    @maxwell
+# Shared contracts: everyone signs off.
+/EchoGuide/Core/Contracts/   @james @lily @bryan @maxwell

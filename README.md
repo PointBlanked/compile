@@ -1,0 +1,86 @@
+# AutoVision Audio Engine (EchoGuide)
+
+Hands-free spatial vision for people with visual impairment or dementia. The camera watches. When something changes, the engine works out the **one** next step and guides the hand there with haptic pulses and directional audio. It calls a tool only when the user holds their finger on the target. The phone screen is optional.
+
+```
+camera ─► FrameDeltaEngine ─► LocalVisionEngine ─► DigitalFence ─┐
+ (ARKit or AVCapture)  skip ~99% static     YOLO INT8 + hand + OCR       │
+                                                                          ▼
+                     CloudReasoningRouter ◄── AutomationEngine ◄── CognitiveTaskIsolation
+                     (only < 85% conf)          │ state machine       one step only
+                     PluginRegistry (MCP) ◄─────┤
+                                                ├─► SpatialHapticEngine (CoreHaptics)
+                                                └─► SpatialAudioEngine (AVAudioEngine 3D)
+```
+
+## Team and ownership
+
+Each person owns one SwiftPM target. Code crosses targets only through `EchoGuideContracts`, so two people never edit the same file. Ownership is enforced in `.github/CODEOWNERS`.
+
+| Owner | Role | Target | Paths | Files |
+|---|---|---|---|---|
+| James | ML & edge vision | `EchoGuideVision` | `EchoGuide/Core/Camera/`, `Vision/`, `Fence/` | `FrameDeltaEngine`, `CameraFeed`, `LocalVisionEngine`, `DigitalFenceEngine` |
+| Lily | Haptics, LiDAR, audio | `EchoGuideSpatial` | `EchoGuide/Core/Haptics/`, `Depth/`, `Audio/` | `SpatialHapticEngine`, `LiDARDepthEngine`, `SpatialAudioEngine` |
+| Bryan | Accessibility & cognitive UX | `EchoGuideAutomation` | `EchoGuide/Core/Automation/`, `Cognitive/`, `EchoGuide/UI/` | `AutomationEngine`, `CognitiveTaskIsolation`, `GuidanceView` |
+| Maxwell | Infra, router, plugins | `EchoGuideInfra` | `EchoGuide/Core/Plugins/`, `Router/`, `.github/`, `EchoGuideTests/`, `Package.swift`, `plugins/` | `PluginRegistry`, `CloudReasoningRouter`, CI, tests |
+| All four | Shared contracts | `EchoGuideContracts` | `EchoGuide/Core/Contracts/` | `Contracts.swift` (needs four approvals) |
+
+### Branches
+
+`feature/james-vision`, `feature/james-fence`, `feature/lily-haptics`, `feature/bryan-automation`, `feature/maxwell-plugins`. Each branch opens a PR into `main`. CI must pass and the owner of every path the PR touches must approve.
+
+## Digital fence (James)
+
+There are two layers. Each one only reports a `FenceEvent`, and `AutomationEngine` decides how the user hears or feels it.
+
+- **Spatial fence:** hazard zones the camera can see, such as the hob or a knife. A zone follows a detected label or covers a fixed part of the frame. When the fingertip comes near a zone, the user gets "Careful" and a warning pulse. When it enters the zone, they get "Stop" and the warning preempts all other guidance. If LiDAR is available, its depth reading rules out cases where the hand only overlaps the zone on screen but is not near it.
+- **Location fence:** safe areas for dementia wandering. A position must stay outside the area for 45 s before it counts as leaving, and fixes with poor accuracy are ignored. The event is reported once, and a `notify_caregiver` MCP tool is called if one is registered.
+
+## Targets
+
+| Metric | Target | Where it is measured |
+|---|---|---|
+| Frame-delta analysis | < 1 ms p95 (CI debug build) | `FrameDeltaTests.benchmarkUnderOneMillisecond` |
+| Local inference (object + hand) | < 12 ms on A17-class | `LocalVisionEngine.p95Ms`, on device |
+| Local end-to-end (frame to haptic) | < 15 ms | on device |
+| Audio / haptic cue | < 300 ms | on device |
+| Static frames skipped | ~99% in a still scene | `FrameDeltaStats.skipRatio` |
+| Edge compute share | > 95% of resolutions local | `ReasoningOutcome.source` |
+| Airplane Mode | 100% working, local fallback | `RouterTests.airplaneModeFallsBackLocally` |
+
+Read these honestly:
+
+- **OCR does not fit inside 12 ms.** `VNRecognizeTextRequest` at `.fast` takes roughly 10 to 35 ms, so it runs on every third inferred frame (`ocrEveryNthFrame`). Only object detection and the hand fit inside the 12 ms budget.
+- **The cloud path cannot meet 15 ms.** A cloud round trip is hundreds of milliseconds. The < 15 ms target covers only the local path, and the router gives the cloud a hard 2.5 s timeout.
+- **"100% Airplane Mode" and "cloud below 85%" conflict, by design.** When the device is offline, low-confidence steps get the best local answer. The response is tagged `localFallback` so telemetry shows how often the cloud was missed.
+
+## Build
+
+```bash
+swift build && swift test        # macOS host: pure logic, 36 tests
+```
+
+The iOS-only paths (ARKit, the camera, the haptic actuator) are behind `#if canImport(...) && os(iOS)`. The `ios-build` CI job compiles them with `xcodebuild` for the iOS Simulator. Real latency numbers need a device.
+
+### What the app target has to supply
+
+This package is the engine. An Xcode iOS app target links the `EchoGuide` library and does the following:
+
+1. Bundles a YOLO Core ML model and passes it to `LocalVisionEngine(modelURL:)`. Export it with `yolo export model=yolo11n.pt format=coreml int8=True nms=True`. Models are git-ignored.
+2. Sets up the camera feed. With LiDAR, it runs `LiDARDepthEngine` and feeds its `onFrame` into `FrameDeltaEngine`. ARKit owns the camera, so `CameraFeed` cannot run at the same time. Without LiDAR, it uses `CameraFeed`.
+3. Runs each triggered frame through `LocalVisionEngine.process`, then `SpatialFence.evaluate`, then `AutomationEngine.ingest(_:fence:)`.
+4. Adds `Info.plist` keys: `NSCameraUsageDescription` and `NSLocationAlwaysAndWhenInUseUsageDescription`, plus the `location` background mode for the location fence.
+5. Points `GeminiProvider` / `OpenAIProvider` at a proxy you run. No API keys ship in the app.
+
+## Plugins (MCP)
+
+`PluginRegistry` serves MCP `initialize`, `tools/list` and `tools/call` over JSON-RPC 2.0. `MCPHTTPClient` connects to remote MCP servers over Streamable HTTP. An example FastMCP server is in `plugins/smart_home_server.py`.
+
+Remote tools are registered as `physical` unless told otherwise. A physical tool runs only after the user holds their finger on the target (0.8 s dwell).
+
+## Not built yet
+
+- The WebSocket voice loop (Deepgram STT / ElevenLabs TTS). On-device `AVSpeechSynthesizer` is used for now, so the app works offline.
+- The OpenAI Realtime API (multi-turn). The router uses one-shot Chat Completions.
+- Barcode detection (`VNDetectBarcodesRequest`). The contract and plugin matching already support it.
+- The Xcode app target and the bundled model.

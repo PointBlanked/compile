@@ -1,0 +1,41 @@
+name: swift-ci
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-test:
+    name: Build + unit tests (macOS host)
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: swift --version
+      - name: Build
+        run: swift build -c debug
+      - name: Test (includes frame-delta benchmark)
+        run: swift test --parallel
+      - name: Release build (optimizer catches different issues)
+        run: swift build -c release
+
+  ios-build:
+    name: Compile iOS paths (ARKit, CoreHaptics, camera)
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build for iOS Simulator
+        run: |
+          xcodebuild build \
+            -scheme EchoGuide \
+            -destination 'generic/platform=iOS Simulator' \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO | tail -n 40
+          exit ${PIPESTATUS[0]}
