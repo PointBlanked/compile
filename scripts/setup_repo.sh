@@ -229,7 +229,11 @@ jobs:
       - name: Benchmarks (real engine code, this runner)
         run: |
           swift run -c release EchoGuideBench
-          cat benchmarks/results/*.md >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "> **CI runners are virtual Macs without Neural Engine or GPU acceleration for Vision**, so the vision rows here run roughly 15x slower than on real Apple silicon. This job is a regression check (correctness, skip rate, decision cost), not a speed claim. Speed claims come from real hardware: see benchmarks/results in the repo and the in-app speed test."
+            echo
+            cat benchmarks/results/*.md
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
@@ -296,6 +300,10 @@ DerivedData/
 *.mlpackage/
 __pycache__/
 .venv/
+# local YOLO export scratch
+yolo/
+*.pt
+yolo-export/
 EOF_AVAE
 
 cat > 'EchoGuide/Core/Agent/AgentCore.swift' <<'EOF_AVAE'
@@ -1538,12 +1546,17 @@ public actor AutomationEngine {
     private let tools: ToolInvoking?
 
     private var lastSpokenLabel: String?
+    /// Where the last announced target was, so a different OCR reading of the
+    /// same button at the same place is not announced again.
+    private var lastSpokenBox: ImageRect?
+    private var lastSpokenPlainLabel: String?
     private var lastSpokenAt: TimeInterval = -.infinity
     private var lastReminderAt: TimeInterval = -.infinity
     private var lastPingAt: TimeInterval = -.infinity
     private var lastSeenAt: TimeInterval = -.infinity
     private var onTargetSince: TimeInterval?
     private var completedUntil: [String: TimeInterval] = [:]
+    private var completedBoxes: [String: CognitiveTaskIsolation.ExcludedRegion] = [:]
     private var lastFenceWarning: [String: TimeInterval] = [:]
     private var routedLabels: Set<String> = []
     private var continuations: [UUID: AsyncStream<AutomationState>.Continuation] = [:]
@@ -1605,8 +1618,9 @@ public actor AutomationEngine {
         isolation.goal = goal
         isolation.reset()
         completedUntil = [:]
+        completedBoxes = [:]
         routedLabels = []
-        lastSpokenLabel = nil
+        lastSpokenLabel = nil; lastSpokenBox = nil; lastSpokenPlainLabel = nil
         onTargetSince = nil
     }
 
@@ -1628,7 +1642,7 @@ public actor AutomationEngine {
     private func forgetTarget() {
         isolation.reset()
         onTargetSince = nil
-        lastSpokenLabel = nil
+        lastSpokenLabel = nil; lastSpokenBox = nil; lastSpokenPlainLabel = nil
         lastSeenAt = -.infinity
     }
 
@@ -1643,8 +1657,11 @@ public actor AutomationEngine {
 
         // Recently finished targets are off the menu; prune expired ones.
         completedUntil = completedUntil.filter { $0.value > now }
+        completedBoxes = completedBoxes.filter { completedUntil[$0.key] != nil }
         let excluded = Set(completedUntil.keys)
         if excluded != isolation.excludedLabels { isolation.excludedLabels = excluded }
+        let regions = Array(completedBoxes.values)
+        if regions != isolation.excludedRegions { isolation.excludedRegions = regions }
 
         let step = isolation.isolate(frame)
         if step != nil, isolation.isCurrentVisible { lastSeenAt = now }
@@ -1657,7 +1674,7 @@ public actor AutomationEngine {
                 // keeps its frame count (frames are sparse in a still scene).
                 if step != nil { isolation.reset() }
                 onTargetSince = nil
-                lastSpokenLabel = nil
+                lastSpokenLabel = nil; lastSpokenBox = nil; lastSpokenPlainLabel = nil
                 await haptics.stop()
                 transition(.scanning)
             }
@@ -1723,27 +1740,51 @@ public actor AutomationEngine {
     /// True when a `.none` side-effect tool claimed the target and was run.
     private func fireReadOnlyTool(for step: ActionStep, at now: TimeInterval) async -> Bool {
         guard let target = step.target, let tools, let match = await tools.match(target), match.sideEffect == .none else { return false }
-        completedUntil[key(step)] = now + config.completedCooldown
+        markCompleted(step, at: now)
         onTargetSince = nil
         await haptics.stop()
         do {
             let said = try await tools.invoke(match)
             lastSpokenLabel = key(step)
+            lastSpokenPlainLabel = step.targetLabel
+            lastSpokenBox = target.box
             lastSpokenAt = now
             await audio.speak(said, azimuth: 0)
             transition(.completed(said))
         } catch {
-            completedUntil[key(step)] = nil
+            unmarkCompleted(step)
             await audio.speak("I could not read that.", azimuth: 0)
             transition(.completed(step.targetLabel))
         }
         return true
     }
 
+    /// Same thing as last announced: same key, or same label at the same place
+    /// (OCR read the characters differently this frame).
+    private func isSameAsLastSpoken(_ step: ActionStep) -> Bool {
+        if key(step) == lastSpokenLabel { return true }
+        guard step.target?.kind == .text, step.targetLabel == lastSpokenPlainLabel,
+              let box = step.target?.box, let last = lastSpokenBox else { return false }
+        return box.iou(last) >= 0.3
+    }
+
+    /// Remember a finished target by key and by place for the cooldown.
+    private func markCompleted(_ step: ActionStep, at now: TimeInterval) {
+        completedUntil[key(step)] = now + config.completedCooldown
+        if let t = step.target, t.kind == .text { completedBoxes[key(step)] = .init(label: t.label, box: t.box) }
+    }
+
+    private func unmarkCompleted(_ step: ActionStep) {
+        completedUntil[key(step)] = nil
+        completedBoxes[key(step)] = nil
+    }
+
     private func announceIfNeeded(_ step: ActionStep, at now: TimeInterval) async {
-        let isNew = key(step) != lastSpokenLabel
+        let isNew = !isSameAsLastSpoken(step)
         guard isNew || now - lastSpokenAt >= config.repeatInstructionAfter else { return }
         lastSpokenLabel = key(step)
+        lastSpokenPlainLabel = step.targetLabel
+        lastSpokenBox = step.target?.box
         lastSpokenAt = now
 
         var sentence = step.instruction
@@ -1765,7 +1806,7 @@ public actor AutomationEngine {
 
     private func complete(_ step: ActionStep, at now: TimeInterval) async {
         onTargetSince = nil
-        completedUntil[key(step)] = now + config.completedCooldown
+        markCompleted(step, at: now)
 
         await haptics.stop()
 
@@ -1780,7 +1821,7 @@ public actor AutomationEngine {
             transition(.completed(said))
         } catch {
             // Not excluded: the user should be able to settle on it and try again.
-            completedUntil[key(step)] = nil
+            unmarkCompleted(step)
             await audio.speak("That did not work.", azimuth: 0)
             transition(.completed(step.targetLabel))
         }
@@ -2230,8 +2271,31 @@ public struct CognitiveTaskIsolation: Sendable {
         }
     }
 
+    /// A finished target also stays off the menu by *place*: OCR may read the
+    /// same button as START, STAR T or 5TART from frame to frame, and none of
+    /// those should guide the finger straight back to it.
+    public struct ExcludedRegion: Sendable, Equatable {
+        public var label: String
+        public var box: ImageRect
+        public init(label: String, box: ImageRect) {
+            self.label = label
+            self.box = box
+        }
+    }
+
+    public var excludedRegions: [ExcludedRegion] = [] {
+        didSet {
+            if let cur = current, isExcluded(cur) { current = nil }
+            if let c = candidate, isExcluded(c) { candidate = nil; candidateFrames = 0 }
+        }
+    }
+
     private func isExcluded(_ d: Detection) -> Bool {
-        excludedLabels.contains(d.stepKey) || excludedLabels.contains(d.label)
+        if excludedLabels.contains(d.stepKey) || excludedLabels.contains(d.label) { return true }
+        // Only OCR is noisy enough to need place-based exclusion. A barcode at
+        // the same spot with a different payload is a different product.
+        guard d.kind == .text else { return false }
+        return excludedRegions.contains { $0.label == d.label && $0.box.iou(d.box) >= config.sameTargetIoU }
     }
 
     private var current: Detection?
@@ -4192,6 +4256,10 @@ public struct LocalVisionConfig: Sendable {
     public var minimumConfidence: Float = 0.35
     /// Run OCR on every Nth inferred frame (1 = always, 0 = never).
     public var ocrEveryNthFrame = 3
+    /// Vision's accurate recogniser with language correction: roughly ten
+    /// times slower than fast, far better on small print. Read mode turns it
+    /// on; Explore and Find keep the fast level inside the frame budget.
+    public var accurateText = false
     public var detectFingertip = true
     /// Barcodes ride the OCR cadence: both are "read the label" work.
     public var detectBarcodes = true
@@ -4255,6 +4323,9 @@ public actor LocalVisionEngine {
     /// Read mode wants text on every frame; Explore and Find keep the cheaper cadence.
     public func setTextEveryNthFrame(_ n: Int) { config.ocrEveryNthFrame = max(0, n) }
 
+    /// Read mode wants the accurate recogniser; the others want speed.
+    public func setTextQuality(accurate: Bool) { config.accurateText = accurate }
+
     public func process(_ frame: CameraFrame, orientation: CGImagePropertyOrientation = .right) -> VisionFrameResult {
         let timer = FrameTimer()
         frameCount += 1
@@ -4267,8 +4338,8 @@ public actor LocalVisionEngine {
         if config.detectFingertip { requests.append(hand) }
 
         let text = VNRecognizeTextRequest()
-        text.recognitionLevel = .fast
-        text.usesLanguageCorrection = false
+        text.recognitionLevel = config.accurateText ? .accurate : .fast
+        text.usesLanguageCorrection = config.accurateText
         let runOCR = config.ocrEveryNthFrame > 0 && frameCount % UInt64(config.ocrEveryNthFrame) == 0
         if runOCR { requests.append(text) }
 
@@ -5024,7 +5095,14 @@ EOF_AVAE
 cat > 'EchoGuideApp/Resources/echoguide.sample.json' <<'EOF_AVAE'
 {
   "goal": null,
-  "plugins": { "productLookup": true }
+  "kokoroURL": "https://echoguide-voice.style.dev",
+  "plugins": { "productLookup": true },
+  "fence": {
+    "zones": [
+      { "name": "hob", "anchor": { "label": "oven" } },
+      { "name": "knife", "anchor": { "label": "knife" }, "warningMargin": 0.05 }
+    ]
+  }
 }
 EOF_AVAE
 
@@ -5323,12 +5401,15 @@ final class AppRuntime {
         case .read:
             pipeline?.setIdleRefresh(0.5)
             await vision?.setTextEveryNthFrame(1)
+            await vision?.setTextQuality(accurate: true)
         case .explore:
             pipeline?.setIdleRefresh(1.0)
             await vision?.setTextEveryNthFrame(3)
+            await vision?.setTextQuality(accurate: false)
         case .find:
             pipeline?.setIdleRefresh(3.0)
             await vision?.setTextEveryNthFrame(2)
+            await vision?.setTextQuality(accurate: false)
         }
         await agent?.setMode(m)
         pipeline?.forceNextFrame()
@@ -6201,6 +6282,8 @@ struct Row {
 }
 
 var rows: [Row] = []
+var localEndToEndP50: Double?
+var localInferredPerMinute: Double?
 
 func stats(_ samples: [Double]) -> (p50: Double, p95: Double, max: Double) {
     let s = samples.sorted()
@@ -6318,6 +6401,7 @@ do {
         _ = px.withUnsafeBufferPointer { e.analyze(luma: $0, width: 640, height: 480, bytesPerRow: 640, timestamp: Double(i) / 30) }
     }
     let s = e.stats
+    localInferredPerMinute = Double(s.framesInferred)
     let pct = s.skipRatio * 100
     rows.append(Row(name: "Frames that never reach the models", value: String(format: "%.1f%%", pct),
                     detail: "60 s at 30 fps of a mostly still scene with 4 motion events: \(s.framesInferred) of \(s.framesSeen) frames inferred"))
@@ -6426,6 +6510,7 @@ do {
         if let s = spoken.value, i >= 2 { e2e.append(s) }
     }
     if !e2e.isEmpty {
+        localEndToEndP50 = stats(e2e).p50
         record("Camera frame → spoken sentence (Read mode)", e2e,
                detail: "Full path on real Vision: motion gate, hand + OCR + barcode, reading order, speech handed off")
     }
@@ -6438,6 +6523,97 @@ struct OrientedUp: FrameInferring {
     let engine: LocalVisionEngine
     init(_ e: LocalVisionEngine) { engine = e }
     func infer(_ frame: CameraFrame) async -> VisionFrameResult { await engine.process(frame, orientation: .up) }
+}
+
+// MARK: - 5. Baseline: a cloud vision agent on the same task
+//
+// The standard way to build this today: send the camera frame to a multimodal
+// model and wait. Same image, same question, Gemini Flash with thinking off
+// (its fastest setting), sequential calls, timed from request to answer.
+// Runs only when GEMINI_API_KEY is set; the key is read from the environment.
+
+struct CloudRun {
+    var ms: [Double] = []
+    var promptTokens: [Int] = []
+    var outputTokens: [Int] = []
+    var answers: [String] = []
+}
+
+func cloudBaseline(key: String, model: String, jpeg: Data, calls: Int) async -> CloudRun {
+    var run = CloudRun()
+    let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent")!
+    let body: [String: Any] = [
+        "contents": [["role": "user", "parts": [
+            ["text": "You guide a blind person's finger to a button. Where is the START button relative to the centre of this image? Answer in under eight words."],
+            ["inline_data": ["mime_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
+        ]]],
+        "generationConfig": ["maxOutputTokens": 60, "temperature": 0.2, "thinkingConfig": ["thinkingBudget": 0]],
+    ]
+    let payload = try! JSONSerialization.data(withJSONObject: body)
+    for i in 0..<(calls + 1) {
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 30
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(key, forHTTPHeaderField: "x-goog-api-key")
+        req.httpBody = payload
+        let t = FrameTimer()
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse else { print("  call \(i) failed"); continue }
+        let elapsed = t.elapsedMs
+        guard http.statusCode == 200, let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            print("  call \(i): HTTP \(http.statusCode) \(String(decoding: data.prefix(200), as: UTF8.self))")
+            continue
+        }
+        if i == 0 { continue } // connection warm-up, not counted
+        run.ms.append(elapsed)
+        if let usage = json["usageMetadata"] as? [String: Any] {
+            run.promptTokens.append(usage["promptTokenCount"] as? Int ?? 0)
+            run.outputTokens.append((usage["candidatesTokenCount"] as? Int ?? 0) + (usage["thoughtsTokenCount"] as? Int ?? 0))
+        }
+        let text = ((json["candidates"] as? [[String: Any]])?.first?["content"] as? [String: Any])
+            .flatMap { ($0["parts"] as? [[String: Any]])?.compactMap { $0["text"] as? String }.joined() } ?? ""
+        run.answers.append(text.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+    return run
+}
+
+if let key = ProcessInfo.processInfo.environment["GEMINI_API_KEY"], !key.isEmpty {
+    let model = ProcessInfo.processInfo.environment["GEMINI_MODEL"] ?? "gemini-2.5-flash"
+    print("\nCloud baseline: \(model), 20 calls…")
+    var image = CIImage(cvPixelBuffer: panel)
+    let scale = 768 / max(image.extent.width, image.extent.height)
+    image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+    let jpeg = CIContext().jpegRepresentation(of: image, colorSpace: CGColorSpaceCreateDeviceRGB(), options: [:]) ?? Data()
+    let run = await cloudBaseline(key: key, model: model, jpeg: jpeg, calls: 20)
+    if !run.ms.isEmpty {
+        let c = stats(run.ms)
+        record("Cloud vision agent, frame → answer (\(model))", run.ms,
+               detail: "Same image and task sent to \(model), thinking off (its fastest setting), sequential calls from this machine")
+        if let local = localEndToEndP50, local > 0 {
+            let x = c.p50 / local
+            rows.append(Row(name: "**Speed-up vs cloud vision agent**", value: String(format: "**%.0f× faster**", x),
+                            detail: String(format: "Median %.0f ms cloud vs %.1f ms EchoGuide, frame to cue", c.p50, local)))
+            print(String(format: "• Speed-up: %.0f× (cloud p50 %.0f ms vs local %.1f ms)", x, c.p50, local))
+            rows.append(Row(name: "Feedback updates per second", value: String(format: "%.0f vs %.1f", 1000 / local, 1000 / c.p50),
+                            detail: "How often each can update a moving finger's guidance (EchoGuide vs cloud agent)"))
+        }
+        // Cost per hour for a cloud agent looking once a second, from the tokens these calls actually used.
+        let avgIn = Double(run.promptTokens.reduce(0, +)) / Double(max(1, run.promptTokens.count))
+        let avgOut = Double(run.outputTokens.reduce(0, +)) / Double(max(1, run.outputTokens.count))
+        let perCall = avgIn * 0.30 / 1e6 + avgOut * 2.50 / 1e6 // ai.google.dev/gemini-api/docs/pricing, standard tier
+        let perHour = perCall * 3600
+        rows.append(Row(name: "Cloud cost of watching continuously", value: String(format: "$%.2f / hour vs $0", perHour),
+                        detail: String(format: "Cloud agent at 1 frame/s: 3,600 calls/h × %.0f in + %.0f out tokens at Gemini 2.5 Flash list price. EchoGuide Explore makes 0 cloud calls", avgIn, avgOut)))
+        if let perMin = localInferredPerMinute {
+            rows.append(Row(name: "Model invocations per hour", value: String(format: "%.0f on-device vs 3,600 cloud", perMin * 60),
+                            detail: "EchoGuide's motion gate (measured above) vs a cloud agent sampling once a second"))
+        }
+        print(String(format: "• Cloud cost: $%.2f/hour at 1 fps (%.0f in / %.0f out tokens per call)", perHour, avgIn, avgOut))
+        if let a = run.answers.first { print("  sample cloud answer: \(a)") }
+    }
+} else {
+    print("\n(Cloud baseline skipped: set GEMINI_API_KEY to measure it.)")
 }
 
 // MARK: - Report
@@ -7659,6 +7835,38 @@ struct StubListener: GoalListening {
         #expect(await a.spoken.last?.hasPrefix("STOP.") == true)
     }
 
+    @Test func misreadTextAtTheSamePlaceIsNotReannounced() async {
+        // Fast OCR reads the same button as START, STAR T, 5TART across frames.
+        let (e, _, a) = engine()
+        await e.start()
+        let f = { (reading: String, t: TimeInterval) in
+            frame([det("text", x: 0.7, y: 0.5, kind: .text, text: reading), tip(x: 0.4, y: 0.5)], t: t)
+        }
+        await e.ingest(f("START", 0))
+        #expect(await a.spoken.count == 1)
+        await e.ingest(f("STAR T", 0.1))
+        await e.ingest(f("5TART", 0.2))
+        await e.ingest(f("START", 0.3))
+        #expect(await a.spoken.count == 1)
+        // A different word somewhere else is new.
+        await e.ingest(frame([det("text", x: 0.7, y: 0.5, kind: .text, text: "START"), det("text", x: 0.2, y: 0.2, size: 0.3, kind: .text, text: "STOP"), tip(x: 0.2, y: 0.2)], t: 0.4))
+        #expect(await a.spoken.count == 2)
+    }
+
+    @Test func misreadVariantOfFinishedButtonStaysExcluded() async {
+        let (e, _, _) = engine()
+        await e.start()
+        let start = { (reading: String) in det("text", x: 0.5, y: 0.5, kind: .text, text: reading) }
+        let stop = det("text", x: 0.2, y: 0.2, size: 0.08, kind: .text, text: "STOP")
+        await e.ingest(frame([start("START"), stop, tip(x: 0.5, y: 0.5)], t: 0))
+        await e.ingest(frame([start("START"), stop, tip(x: 0.5, y: 0.5)], t: 1))
+        #expect(await e.state == .completed("text"))
+        // Next frame OCR misreads the finished button: still excluded, by place.
+        await e.ingest(frame([start("5TART"), stop, tip(x: 0.5, y: 0.5)], t: 1.1))
+        guard case .guiding(let step) = await e.state else { Issue.record("expected guiding to STOP"); return }
+        #expect(step.target?.text == "STOP")
+    }
+
     @Test func readOnlyToolFiresOnSightWithoutDwell() async {
         let registry = PluginRegistry()
         let looked = Counter()
@@ -8131,7 +8339,7 @@ Produced by `swift run -c release EchoGuideBench`. This runs the shipping engine
 | Agent decision (detections in → what to say) | **6.6 µs** |
 | Button labels read / barcode decoded (synthetic panel) | 100% / 100% |
 
-**Phone numbers** come from the in-app speed test (Settings → Measure on-device speed) and are added here once measured on an A17-class iPhone. Recognition rates above use rendered labels in perfect light, so treat them as an upper bound, not field accuracy. Field results go through [`benchmarks/PROTOCOL.md`](benchmarks/PROTOCOL.md).
+CI reruns this suite on every push as a regression check. CI runners are virtual Macs without Neural Engine or GPU acceleration, so their vision timings are about 15x slower and are not speed claims. **Phone numbers** come from the in-app speed test (Settings → Measure on-device speed) and are added here once measured on an A17-class iPhone. Recognition rates above use rendered labels in perfect light, so treat them as an upper bound, not field accuracy. Field results go through [`benchmarks/PROTOCOL.md`](benchmarks/PROTOCOL.md).
 
 ## Architecture
 

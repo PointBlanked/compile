@@ -24,6 +24,8 @@ struct Row {
 }
 
 var rows: [Row] = []
+var localEndToEndP50: Double?
+var localInferredPerMinute: Double?
 
 func stats(_ samples: [Double]) -> (p50: Double, p95: Double, max: Double) {
     let s = samples.sorted()
@@ -141,6 +143,7 @@ do {
         _ = px.withUnsafeBufferPointer { e.analyze(luma: $0, width: 640, height: 480, bytesPerRow: 640, timestamp: Double(i) / 30) }
     }
     let s = e.stats
+    localInferredPerMinute = Double(s.framesInferred)
     let pct = s.skipRatio * 100
     rows.append(Row(name: "Frames that never reach the models", value: String(format: "%.1f%%", pct),
                     detail: "60 s at 30 fps of a mostly still scene with 4 motion events: \(s.framesInferred) of \(s.framesSeen) frames inferred"))
@@ -249,6 +252,7 @@ do {
         if let s = spoken.value, i >= 2 { e2e.append(s) }
     }
     if !e2e.isEmpty {
+        localEndToEndP50 = stats(e2e).p50
         record("Camera frame → spoken sentence (Read mode)", e2e,
                detail: "Full path on real Vision: motion gate, hand + OCR + barcode, reading order, speech handed off")
     }
@@ -261,6 +265,97 @@ struct OrientedUp: FrameInferring {
     let engine: LocalVisionEngine
     init(_ e: LocalVisionEngine) { engine = e }
     func infer(_ frame: CameraFrame) async -> VisionFrameResult { await engine.process(frame, orientation: .up) }
+}
+
+// MARK: - 5. Baseline: a cloud vision agent on the same task
+//
+// The standard way to build this today: send the camera frame to a multimodal
+// model and wait. Same image, same question, Gemini Flash with thinking off
+// (its fastest setting), sequential calls, timed from request to answer.
+// Runs only when GEMINI_API_KEY is set; the key is read from the environment.
+
+struct CloudRun {
+    var ms: [Double] = []
+    var promptTokens: [Int] = []
+    var outputTokens: [Int] = []
+    var answers: [String] = []
+}
+
+func cloudBaseline(key: String, model: String, jpeg: Data, calls: Int) async -> CloudRun {
+    var run = CloudRun()
+    let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent")!
+    let body: [String: Any] = [
+        "contents": [["role": "user", "parts": [
+            ["text": "You guide a blind person's finger to a button. Where is the START button relative to the centre of this image? Answer in under eight words."],
+            ["inline_data": ["mime_type": "image/jpeg", "data": jpeg.base64EncodedString()]],
+        ]]],
+        "generationConfig": ["maxOutputTokens": 60, "temperature": 0.2, "thinkingConfig": ["thinkingBudget": 0]],
+    ]
+    let payload = try! JSONSerialization.data(withJSONObject: body)
+    for i in 0..<(calls + 1) {
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 30
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(key, forHTTPHeaderField: "x-goog-api-key")
+        req.httpBody = payload
+        let t = FrameTimer()
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse else { print("  call \(i) failed"); continue }
+        let elapsed = t.elapsedMs
+        guard http.statusCode == 200, let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            print("  call \(i): HTTP \(http.statusCode) \(String(decoding: data.prefix(200), as: UTF8.self))")
+            continue
+        }
+        if i == 0 { continue } // connection warm-up, not counted
+        run.ms.append(elapsed)
+        if let usage = json["usageMetadata"] as? [String: Any] {
+            run.promptTokens.append(usage["promptTokenCount"] as? Int ?? 0)
+            run.outputTokens.append((usage["candidatesTokenCount"] as? Int ?? 0) + (usage["thoughtsTokenCount"] as? Int ?? 0))
+        }
+        let text = ((json["candidates"] as? [[String: Any]])?.first?["content"] as? [String: Any])
+            .flatMap { ($0["parts"] as? [[String: Any]])?.compactMap { $0["text"] as? String }.joined() } ?? ""
+        run.answers.append(text.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+    return run
+}
+
+if let key = ProcessInfo.processInfo.environment["GEMINI_API_KEY"], !key.isEmpty {
+    let model = ProcessInfo.processInfo.environment["GEMINI_MODEL"] ?? "gemini-2.5-flash"
+    print("\nCloud baseline: \(model), 20 calls…")
+    var image = CIImage(cvPixelBuffer: panel)
+    let scale = 768 / max(image.extent.width, image.extent.height)
+    image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+    let jpeg = CIContext().jpegRepresentation(of: image, colorSpace: CGColorSpaceCreateDeviceRGB(), options: [:]) ?? Data()
+    let run = await cloudBaseline(key: key, model: model, jpeg: jpeg, calls: 20)
+    if !run.ms.isEmpty {
+        let c = stats(run.ms)
+        record("Cloud vision agent, frame → answer (\(model))", run.ms,
+               detail: "Same image and task sent to \(model), thinking off (its fastest setting), sequential calls from this machine")
+        if let local = localEndToEndP50, local > 0 {
+            let x = c.p50 / local
+            rows.append(Row(name: "**Speed-up vs cloud vision agent**", value: String(format: "**%.0f× faster**", x),
+                            detail: String(format: "Median %.0f ms cloud vs %.1f ms EchoGuide, frame to cue", c.p50, local)))
+            print(String(format: "• Speed-up: %.0f× (cloud p50 %.0f ms vs local %.1f ms)", x, c.p50, local))
+            rows.append(Row(name: "Feedback updates per second", value: String(format: "%.0f vs %.1f", 1000 / local, 1000 / c.p50),
+                            detail: "How often each can update a moving finger's guidance (EchoGuide vs cloud agent)"))
+        }
+        // Cost per hour for a cloud agent looking once a second, from the tokens these calls actually used.
+        let avgIn = Double(run.promptTokens.reduce(0, +)) / Double(max(1, run.promptTokens.count))
+        let avgOut = Double(run.outputTokens.reduce(0, +)) / Double(max(1, run.outputTokens.count))
+        let perCall = avgIn * 0.30 / 1e6 + avgOut * 2.50 / 1e6 // ai.google.dev/gemini-api/docs/pricing, standard tier
+        let perHour = perCall * 3600
+        rows.append(Row(name: "Cloud cost of watching continuously", value: String(format: "$%.2f / hour vs $0", perHour),
+                        detail: String(format: "Cloud agent at 1 frame/s: 3,600 calls/h × %.0f in + %.0f out tokens at Gemini 2.5 Flash list price. EchoGuide Explore makes 0 cloud calls", avgIn, avgOut)))
+        if let perMin = localInferredPerMinute {
+            rows.append(Row(name: "Model invocations per hour", value: String(format: "%.0f on-device vs 3,600 cloud", perMin * 60),
+                            detail: "EchoGuide's motion gate (measured above) vs a cloud agent sampling once a second"))
+        }
+        print(String(format: "• Cloud cost: $%.2f/hour at 1 fps (%.0f in / %.0f out tokens per call)", perHour, avgIn, avgOut))
+        if let a = run.answers.first { print("  sample cloud answer: \(a)") }
+    }
+} else {
+    print("\n(Cloud baseline skipped: set GEMINI_API_KEY to measure it.)")
 }
 
 // MARK: - Report
