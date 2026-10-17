@@ -89,7 +89,9 @@ enum Keychain {
 /// Finds the YOLO model. Ships as `Resources/Models/<name>.mlpackage` (copied
 /// as a folder, not compiled by Xcode), compiled on first launch and cached.
 enum ModelStore {
-    static let names = ["yolo11n", "yolov8n"]
+    /// Largest first: the medium model is far more accurate and still fits the
+    /// Neural Engine budget; nano is the fallback for old phones.
+    static let names = ["yolo11m", "yolo11s", "yolo11n", "yolov8n"]
 
     static func locate() -> URL? {
         let fm = FileManager.default

@@ -13,8 +13,20 @@ import EchoGuideContracts
 /// `VoiceGoalListener` (Audio) satisfies this with a one-line extension in
 /// the app target: `extension VoiceGoalListener: GoalListening {}`.
 public protocol GoalListening: Sendable {
+    /// What was said, or nil when nothing was heard.
     func listen() async throws -> String?
 }
+
+/// What a heard phrase turned out to be.
+public enum HeardIntent: Sendable, Equatable {
+    /// Words to find (already stripped of filler).
+    case goal(String)
+    /// A question the app answered and spoke; the text is shown as feedback.
+    case answered(String)
+    case nothing
+}
+
+public typealias HeardInterpreter = @Sendable (String) async -> HeardIntent
 
 @MainActor
 @Observable
@@ -31,6 +43,9 @@ public final class GuidanceModel {
     public private(set) var listenResult: String?
     private var engine: AutomationEngine?
     private var listener: GoalListening?
+    /// Turns a transcript into a goal or an answered question. Default: the
+    /// phrase is the goal as spoken.
+    public var interpret: HeardInterpreter = { .goal($0) }
     private var task: Task<Void, Never>?
     private var cautionTask: Task<Void, Never>?
 
@@ -97,14 +112,24 @@ public final class GuidanceModel {
         guard let listener, !isListening else { return }
         isListening = true
         listenResult = nil
+        let interpret = self.interpret
         Task { [weak self] in
             let heard = try? await listener.listen()
             guard let self else { return }
+            guard let heard, !heard.isEmpty else {
+                self.isListening = false
+                self.listenResult = "Did not catch that"
+                return
+            }
+            let intent = await interpret(heard)
             self.isListening = false
-            if let heard, !heard.isEmpty {
-                self.setGoal(heard)
-                self.listenResult = "Heard: \(heard)"
-            } else {
+            switch intent {
+            case .goal(let goal) where !goal.isEmpty:
+                self.setGoal(goal)
+                self.listenResult = "Heard: \(goal)"
+            case .answered(let answer):
+                self.listenResult = answer
+            default:
                 self.listenResult = "Did not catch that"
             }
         }

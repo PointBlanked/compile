@@ -139,6 +139,15 @@ final class AppRuntime {
         let agent = AgentCore(audio: audio, haptics: haptics, depth: lidar, router: router,
                               jpegProvider: { latestForScene.jpeg(maxSide: 512) })
         self.agent = agent
+        // What the mic heard: a question about the recent past is answered
+        // from the agent's memory; anything else becomes the Find goal.
+        guidance.interpret = { heard in
+            if ObservationMemory.isRecallQuestion(heard) {
+                return .answered(await agent.recall(heard))
+            }
+            if let goal = GoalPhraseParser.goal(from: heard) { return .goal(goal) }
+            return .nothing
+        }
 
         // Pipeline: frame -> detections -> fence -> agent (and automation in Find).
         let fence = (config.fence ?? FenceConfig()).spatialFence

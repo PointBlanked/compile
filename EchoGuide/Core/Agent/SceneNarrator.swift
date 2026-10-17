@@ -144,7 +144,7 @@ public struct SceneNarrator: Sendable {
         if let sign = frame.detections
             .filter({ $0.kind == .text && $0.confidence >= config.minimumConfidence })
             .compactMap({ d -> (Detection, String)? in
-                guard let t = d.text.map(TextReader.clean), t.count >= 3 else { return nil }
+                guard let t = d.text.map(TextReader.clean), t.count >= 3, TextVerifier.plausible(t) else { return nil }
                 return (d, t)
             })
             .max(by: { $0.0.box.area < $1.0.box.area }),

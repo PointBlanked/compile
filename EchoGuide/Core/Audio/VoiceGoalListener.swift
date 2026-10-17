@@ -47,7 +47,10 @@ public final class VoiceGoalListener: @unchecked Sendable {
         }
     }
 
-    /// Returns the parsed goal, or nil when nothing usable was said.
+    /// Returns what was said, trimmed, or nil when nothing was heard. The app
+    /// decides whether it is a goal ("find the start button") or a question
+    /// ("where did you see my backpack"); `GoalPhraseParser.goal(from:)` turns
+    /// a goal phrase into the words to match.
     public func listen() async throws -> String? {
         guard let recognizer, recognizer.isAvailable else { throw ListenError.unavailable }
         guard SFSpeechRecognizer.authorizationStatus() == .authorized else { throw ListenError.notAuthorized }
@@ -98,7 +101,8 @@ public final class VoiceGoalListener: @unchecked Sendable {
                 finish()
             }
         }
-        return GoalPhraseParser.goal(from: transcript)
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 #endif

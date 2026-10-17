@@ -100,6 +100,9 @@ public actor LocalVisionEngine {
         let text = VNRecognizeTextRequest()
         text.recognitionLevel = config.accurateText ? .accurate : .fast
         text.usesLanguageCorrection = config.accurateText
+        text.recognitionLanguages = ["en-US"]
+        // Text smaller than ~1.5% of the frame height is noise at reading distance.
+        text.minimumTextHeight = 0.015
         let runOCR = config.ocrEveryNthFrame > 0 && frameCount % UInt64(config.ocrEveryNthFrame) == 0
         if runOCR { requests.append(text) }
 

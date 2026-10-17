@@ -36,13 +36,12 @@ $FS vm exec "$SLUG" --linux-user root -- sh -c "docker run -d --name vlm --resta
 
 echo "waiting for the model to download and load (first time: a few minutes)"
 for i in $(seq 1 150); do
-  CODE=$($FS vm exec "$SLUG" --linux-user root -- python3 -c "import urllib.request
-try: print(urllib.request.urlopen('http://localhost:$PORT/health',timeout=5).status)
-except Exception as e: print(getattr(e,'code',0))" | tr -d '\r\n')
+  # Single-line probe: the CLI mangles multi-line arguments.
+  CODE=$($FS vm exec "$SLUG" --linux-user root -- python3 -c "import urllib.request as u; print(u.urlopen('http://localhost:$PORT/health',timeout=5).status)" 2>/dev/null | tr -d '\r\n')
   [ "$CODE" = "200" ] && break
   sleep 4
 done
-echo "vision server answers locally with HTTP $CODE"
+echo "vision server answers locally with HTTP ${CODE:-000}"
 
 if ! $FS --output json tls list --vm "$SLUG" 2>/dev/null | grep -q "\"$DOMAIN\""; then
   $FS tls create --domain "$DOMAIN" --from public --to "vm=$SLUG,port=$PORT" >/dev/null

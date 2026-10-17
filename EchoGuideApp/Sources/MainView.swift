@@ -28,7 +28,7 @@ struct MainView: View {
         ZStack {
             // The camera is always up: a helper or a judge sees what the
             // phone sees, with the AI's perception drawn on top.
-            CameraPreview(arSession: runtime.lidar?.session, captureSession: runtime.camera?.session)
+            CameraPreview(arSession: runtime.lidar?.session, captureSession: runtime.camera?.session, usesARKit: runtime.hasLiDAR)
                 .ignoresSafeArea()
                 .accessibilityHidden(true)
             PerceptionOverlay(frame: runtime.hud, target: target, imageAspect: runtime.imageAspect)

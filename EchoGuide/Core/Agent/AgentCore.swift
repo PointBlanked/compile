@@ -63,6 +63,10 @@ public actor AgentCore {
     private var reader = TextReader()
     private var scene = SceneIntelligence()
     private var sceneInFlight = false
+    private var memory = ObservationMemory()
+    private let verifier = TextVerifier()
+    private var readInFlight = false
+    private var pendingLines: [String] = []
     /// Supplies the current camera frame as JPEG when the scene is worth describing.
     private let jpegProvider: (@Sendable () -> Data?)?
     private var lastFrame: VisionFrameResult?
@@ -121,6 +125,7 @@ public actor AgentCore {
     public func ingest(_ frame: VisionFrameResult, fence: FenceEvent?) async -> Bool {
         lastFrame = frame
         telemetry.framesSeen += 1
+        memory.record(frame)
         if mode == .find { return true }
 
         if let fence, await handle(fence, at: frame.timestamp) { return false }
@@ -155,9 +160,19 @@ public actor AgentCore {
             await say(a.text, source: .narrator, azimuth: a.azimuth, urgent: a.urgent)
         case .read:
             guard clock() >= busyUntil else { return false }
-            let fresh = reader.newLines(in: frame)
+            // OCR -> local gate -> model correction, off the frame path.
+            let fresh = TextVerifier.gate(reader.newLines(in: frame))
             guard !fresh.isEmpty else { return false }
-            await say(fresh.prefix(3).joined(separator: ". "), source: .reader)
+            if router == nil {
+                // No model to hand off to: the gate is the whole check, instant.
+                await say(fresh.prefix(3).joined(separator: ". "), source: .reader)
+                return false
+            }
+            pendingLines += fresh
+            if !readInFlight {
+                readInFlight = true
+                Task { await self.flushReading() }
+            }
         case .find:
             break
         }
@@ -180,6 +195,7 @@ public actor AgentCore {
         ))
         guard outcome.source == .cloud, !outcome.answer.isEmpty, mode == .explore else { return }
         telemetry.sceneDescriptions += 1
+        memory.noteScene(outcome.answer, at: frame.timestamp)
         // Wait for whatever is being said, then speak.
         let wait = busyUntil - clock()
         if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(min(wait, 4) * 1_000_000_000)) }
@@ -227,12 +243,37 @@ public actor AgentCore {
         return text
     }
 
+    /// Verifies the pending OCR lines with the model, then speaks them.
+    private func flushReading() async {
+        defer { readInFlight = false }
+        while !pendingLines.isEmpty, mode == .read {
+            let batch = Array(pendingLines.prefix(3))
+            pendingLines.removeFirst(batch.count)
+            let cleaned = await verifier.verify(batch, router: router)
+            guard !cleaned.isEmpty, mode == .read else { continue }
+            await say(cleaned.joined(separator: ". "), source: .reader)
+        }
+        pendingLines = []
+    }
+
+    /// A question about the recent past, answered from memory and spoken:
+    /// "where did you see my backpack" -> "I saw a backpack about 40 seconds ago, on your left."
+    @discardableResult
+    public func recall(_ question: String) async -> String {
+        let now = lastFrame?.timestamp ?? clock()
+        let text = memory.answer(question, now: now)
+        await say(text, source: .describe, urgent: true)
+        return text
+    }
+
+    public var recentObservations: [SceneObservation] { memory.observations }
+
     /// The Read button: everything readable right now, ignoring what was read before.
     @discardableResult
     public func readNow() async -> String {
         guard let frame = lastFrame else { return "" }
-        let lines = TextReader.lines(in: frame)
-        let text = lines.isEmpty ? "I cannot see any text. Hold the phone about a foot away and keep still." : lines.joined(separator: ". ")
+        let lines = await verifier.verify(TextReader.lines(in: frame), router: router)
+        let text = lines.isEmpty ? "I cannot see any text. Hold the phone about a foot away and keep still." : lines.prefix(6).joined(separator: ". ")
         await say(text, source: .reader, urgent: true)
         return text
     }

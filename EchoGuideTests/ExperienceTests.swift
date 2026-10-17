@@ -885,3 +885,81 @@ struct StubListener: GoalListening {
         #expect(await e.goal == "start")
     }
 }
+
+// MARK: - Visual memory and text verification
+
+@Suite struct MemoryAndVerifierTests {
+    @Test func memoryRecallsWhereAndWhen() {
+        var m = ObservationMemory()
+        let first = m.record(frame([det("backpack", x: 0.2, y: 0.5, conf: 0.9), det("chair", x: 0.8, y: 0.5, conf: 0.8)], t: 10))
+        let repeat_ = m.record(frame([det("backpack", x: 0.2, y: 0.5, conf: 0.9), det("chair", x: 0.8, y: 0.5, conf: 0.8)], t: 11)) // unchanged, too soon
+        let changed = m.record(frame([det("chair", x: 0.8, y: 0.5, conf: 0.8)], t: 20))                                             // set changed
+        #expect(first)
+        #expect(!repeat_)
+        #expect(changed)
+        #expect(m.answer("where did you see my bag", now: 52) == "I saw a backpack about 40 seconds ago, on your left.")
+        #expect(m.answer("have you seen a chair", now: 22) == "I saw a chair just now, on your right.")
+        #expect(m.answer("where's my phone", now: 30) == "I have not seen a cell phone recently.")
+        #expect(m.answer("what did you see", now: 30) == "In the last minute I saw a chair and a backpack.")
+        #expect(ObservationMemory.isRecallQuestion("Where did you see my keys?"))
+        #expect(ObservationMemory.isRecallQuestion("have you seen a cup"))
+        #expect(!ObservationMemory.isRecallQuestion("find the start button"))
+        #expect(ObservationMemory.ago(130) == "about 2 minutes ago")
+    }
+
+    @Test func memoryIgnoresNoiseAndKeepsText() {
+        var m = ObservationMemory()
+        let noise = m.record(frame([det("chair", x: 0.5, y: 0.5, conf: 0.3), tip(x: 0.1, y: 0.1), det("hand", x: 0.5, y: 0.5, conf: 0.9)], t: 0))
+        let text = m.record(frame([det("text", x: 0.5, y: 0.5, conf: 0.9, kind: .text, text: "EXIT")], t: 1))
+        #expect(!noise)
+        #expect(text)
+        #expect(m.answer("where did you see exit", now: 3) == "I read \"exit\" just now.")
+    }
+
+    @Test func localGateDropsNonsense() {
+        #expect(TextVerifier.plausible("START"))
+        #expect(TextVerifier.plausible("EXIT"))
+        #expect(TextVerifier.plausible("TV"))
+        #expect(TextVerifier.plausible("230"))
+        #expect(TextVerifier.plausible("Push to open"))
+        #expect(!TextVerifier.plausible("l|l1 ;;"))
+        #expect(!TextVerifier.plausible("qzxvwkjp"))
+        #expect(!TextVerifier.plausible("~"))
+        #expect(!TextVerifier.plausible("##@@!!"))
+        #expect(TextVerifier.gate(["START", "l|l1", "STOP"]) == ["START", "STOP"])
+    }
+
+    @Test func modelHandoffCorrectsAndCaches() async {
+        struct FixingRouter: ReasoningRouting {
+            let calls: Counter
+            func resolve(_ q: ReasoningQuery) async -> ReasoningOutcome {
+                await calls.inc()
+                #expect(q.jpeg == nil)
+                return ReasoningOutcome(answer: "START\nSTOP", source: .cloud, latencyMs: 400)
+            }
+        }
+        let calls = Counter()
+        let v = TextVerifier()
+        let out = await v.verify(["STAR T", "5TOP", "l|l1"], router: FixingRouter(calls: calls))
+        #expect(out == ["START", "STOP"])
+        #expect(await calls.value == 1)
+        _ = await v.verify(["STAR T", "5TOP", "l|l1"], router: FixingRouter(calls: calls))
+        #expect(await calls.value == 1) // cached
+        #expect(await v.verify(["@@@"], router: FixingRouter(calls: calls)).isEmpty)
+        #expect(await calls.value == 1) // nothing worth asking
+    }
+
+    @Test func modelNoneAndOfflineFallBackCorrectly() async {
+        struct NoneRouter: ReasoningRouting {
+            func resolve(_ q: ReasoningQuery) async -> ReasoningOutcome { ReasoningOutcome(answer: "NONE", source: .cloud, latencyMs: 1) }
+        }
+        struct OfflineRouter: ReasoningRouting {
+            func resolve(_ q: ReasoningQuery) async -> ReasoningOutcome { ReasoningOutcome(answer: "I am not sure what this is.", source: .localFallback, latencyMs: 1) }
+        }
+        #expect(await TextVerifier().verify(["STARTT"], router: NoneRouter()).isEmpty)
+        #expect(await TextVerifier().verify(["START"], router: OfflineRouter()) == ["START"])
+        #expect(await TextVerifier().verify(["START"], router: nil) == ["START"])
+        // A rambling model is ignored in favour of the gated input.
+        #expect(TextVerifier.parse("Sure! Here are the corrected lines:\nSTART\nSTOP\nDEFROST\nPOWER", fallback: ["START"]) == ["START"])
+    }
+}
