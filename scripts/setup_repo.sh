@@ -9,7 +9,7 @@ REMOTE_URL="${REMOTE_URL:-https://github.com/PointBlanked/compile.git}"
 mkdir -p "$TARGET"
 cd "$TARGET"
 
-mkdir -p .github .github/workflows EchoGuide/Core/Agent EchoGuide/Core/Audio EchoGuide/Core/Automation EchoGuide/Core/Camera EchoGuide/Core/Cognitive EchoGuide/Core/Contracts EchoGuide/Core/Depth EchoGuide/Core/Fence EchoGuide/Core/Haptics EchoGuide/Core/Plugins EchoGuide/Core/Router EchoGuide/Core/Vision EchoGuide/UI EchoGuideApp EchoGuideApp/Assets.xcassets EchoGuideApp/Assets.xcassets/AppIcon.appiconset EchoGuideApp/EchoGuideApp.xcodeproj EchoGuideApp/EchoGuideApp.xcodeproj/xcshareddata/xcschemes EchoGuideApp/Resources EchoGuideApp/Resources/Models EchoGuideApp/Sources EchoGuideTests benchmarks plugins proxy scripts
+mkdir -p .github .github/workflows EchoGuide/Core/Agent EchoGuide/Core/Audio EchoGuide/Core/Automation EchoGuide/Core/Camera EchoGuide/Core/Cognitive EchoGuide/Core/Contracts EchoGuide/Core/Depth EchoGuide/Core/Fence EchoGuide/Core/Haptics EchoGuide/Core/Plugins EchoGuide/Core/Router EchoGuide/Core/Vision EchoGuide/UI EchoGuideApp EchoGuideApp/Assets.xcassets EchoGuideApp/Assets.xcassets/AppIcon.appiconset EchoGuideApp/EchoGuideApp.xcodeproj EchoGuideApp/EchoGuideApp.xcodeproj/xcshareddata/xcschemes EchoGuideApp/Resources EchoGuideApp/Resources/Models EchoGuideApp/Sources EchoGuideBench EchoGuideTests benchmarks benchmarks/results docs infra/freestyle plugins proxy scripts
 
 cat > '.github/CODEOWNERS' <<'EOF_AVAE'
 # Two owners. PRs touching a path need that owner's review.
@@ -226,6 +226,14 @@ jobs:
         run: swift test --parallel
       - name: Release build (optimizer catches different issues)
         run: swift build -c release
+      - name: Benchmarks (real engine code, this runner)
+        run: |
+          swift run -c release EchoGuideBench
+          cat benchmarks/results/*.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmarks/results/
 
   ios-build:
     name: Compile iOS paths (ARKit, CoreHaptics, camera)
@@ -1209,7 +1217,7 @@ public struct KokoroSpeechProvider: SpeechSynthesizing {
     public var timeout: TimeInterval
     private let transport: Transport
 
-    public init(baseURL: URL, voice: String = "af_heart", speed: Double = 1.0, timeout: TimeInterval = 1.5,
+    public init(baseURL: URL, voice: String = "af_heart", speed: Double = 1.0, timeout: TimeInterval = 2.5,
                 transport: Transport? = nil) {
         self.baseURL = baseURL
         self.voice = voice
@@ -1240,7 +1248,9 @@ public struct KokoroSpeechProvider: SpeechSynthesizing {
             throw SpeechProviderError.badStatus(http.statusCode)
         }
         guard data.count > 44 else { throw SpeechProviderError.emptyAudio } // a WAV header alone is 44 bytes
-        return data
+        // Kokoro-FastAPI streams its WAV, so the header says "unknown length"
+        // (0xFFFFFFFF). AVAudioPlayer wants the real sizes.
+        return WAVEncoder.withCorrectSizes(data)
     }
 }
 
@@ -1312,6 +1322,38 @@ public enum WAVEncoder {
             withUnsafeBytes(of: v.littleEndian) { pcm.append(contentsOf: $0) }
         }
         return pcm16Mono(pcm: pcm, sampleRate: sampleRate)
+    }
+
+    /// Rewrites the RIFF and `data` chunk sizes of a complete WAV file whose
+    /// header was written before its length was known (streaming servers put
+    /// 0xFFFFFFFF or 0 there). Anything that is not a RIFF/WAVE file is
+    /// returned untouched.
+    public static func withCorrectSizes(_ wav: Data) -> Data {
+        guard wav.count >= 12,
+              wav[wav.startIndex..<wav.startIndex + 4].elementsEqual("RIFF".utf8),
+              wav[wav.startIndex + 8..<wav.startIndex + 12].elementsEqual("WAVE".utf8) else { return wav }
+        var d = Data(wav) // rebase indices at 0
+        func u32(at i: Int) -> UInt32 {
+            UInt32(d[i]) | UInt32(d[i + 1]) << 8 | UInt32(d[i + 2]) << 16 | UInt32(d[i + 3]) << 24
+        }
+        func put(_ v: UInt32, at i: Int) {
+            d[i] = UInt8(v & 0xFF); d[i + 1] = UInt8(v >> 8 & 0xFF); d[i + 2] = UInt8(v >> 16 & 0xFF); d[i + 3] = UInt8(v >> 24)
+        }
+        // Walk the chunks to find "data"; its payload runs to the end of the file.
+        var i = 12
+        while i + 8 <= d.count {
+            let id = String(decoding: d[i..<i + 4], as: UTF8.self)
+            let size = Int(u32(at: i + 4))
+            if id == "data" {
+                let actual = d.count - (i + 8)
+                if size != actual { put(UInt32(actual), at: i + 4) }
+                break
+            }
+            i += 8 + size + (size & 1)
+        }
+        let riff = d.count - 8
+        if Int(u32(at: 4)) != riff { put(UInt32(riff), at: 4) }
+        return d
     }
 
     /// Wraps little-endian mono PCM16 bytes in a WAV header.
@@ -6132,6 +6174,306 @@ struct ManualResultView: View {
 }
 EOF_AVAE
 
+cat > 'EchoGuideBench/main.swift' <<'EOF_AVAE'
+// Owner: Maxwell. Reproducible benchmarks of the real engine code, not mocks
+// of it. Runs anywhere Swift and Apple's Vision framework run:
+//
+//   swift run -c release EchoGuideBench            # prints a table, writes benchmarks/results/<host>.md
+//
+// Every number here is measured by this file on the machine it runs on. The
+// phone numbers come from the in-app speed test (Settings > Measure speed).
+
+import CoreGraphics
+import CoreImage
+import CoreText
+import CoreVideo
+import Foundation
+import EchoGuideContracts
+import EchoGuideInfra
+import EchoGuideVision
+
+// MARK: - Harness
+
+struct Row {
+    var name: String
+    var value: String
+    var detail: String
+}
+
+var rows: [Row] = []
+
+func stats(_ samples: [Double]) -> (p50: Double, p95: Double, max: Double) {
+    let s = samples.sorted()
+    func at(_ p: Double) -> Double { s[min(s.count - 1, Int((p * Double(s.count - 1)).rounded()))] }
+    return (at(0.5), at(0.95), s.last ?? 0)
+}
+
+func ms(_ v: Double) -> String { v < 1 ? String(format: "%.3f ms", v) : String(format: "%.1f ms", v) }
+
+func record(_ name: String, _ samples: [Double], unit: String = "ms", detail: String) {
+    let s = stats(samples)
+    let value = unit == "µs"
+        ? String(format: "p50 %.1f µs · p95 %.1f µs", s.p50 * 1000, s.p95 * 1000)
+        : "p50 \(ms(s.p50)) · p95 \(ms(s.p95))"
+    rows.append(Row(name: name, value: value, detail: detail + " (n=\(samples.count))"))
+    print("• \(name): \(value)")
+}
+
+func luma(_ w: Int, _ h: Int, fill: UInt8 = 100, square: (Int, Int, Int)? = nil) -> [UInt8] {
+    var px = [UInt8](repeating: fill, count: w * h)
+    if let (sx, sy, size) = square {
+        for y in sy..<min(h, sy + size) { for x in sx..<min(w, sx + size) { px[y * w + x] = 230 } }
+    }
+    return px
+}
+
+func pixelBuffer420(_ w: Int, _ h: Int, fill: UInt8 = 100, square: Bool = false) -> CVPixelBuffer {
+    var pb: CVPixelBuffer?
+    CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, nil, &pb)
+    let b = pb!
+    CVPixelBufferLockBaseAddress(b, [])
+    let bpr = CVPixelBufferGetBytesPerRowOfPlane(b, 0)
+    let base = CVPixelBufferGetBaseAddressOfPlane(b, 0)!.assumingMemoryBound(to: UInt8.self)
+    for y in 0..<h { for x in 0..<w { base[y * bpr + x] = square && x > w / 4 && x < w / 2 && y > h / 4 && y < h / 2 ? 230 : fill } }
+    CVPixelBufferUnlockBaseAddress(b, [])
+    return b
+}
+
+/// A photographed-panel stand-in: white card, black words at real sizes, plus a barcode.
+func panelImage(words: [String], barcode: String?, width: Int = 1280, height: Int = 960) -> CVPixelBuffer {
+    var pb: CVPixelBuffer?
+    let attrs: [String: Any] = [kCVPixelBufferCGImageCompatibilityKey as String: true, kCVPixelBufferCGBitmapContextCompatibilityKey as String: true]
+    CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pb)
+    let b = pb!
+    CVPixelBufferLockBaseAddress(b, [])
+    let ctx = CGContext(data: CVPixelBufferGetBaseAddress(b), width: width, height: height, bitsPerComponent: 8,
+                        bytesPerRow: CVPixelBufferGetBytesPerRow(b), space: CGColorSpaceCreateDeviceRGB(),
+                        bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)!
+    ctx.setFillColor(CGColor(red: 0.95, green: 0.95, blue: 0.93, alpha: 1))
+    ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    for (i, word) in words.enumerated() {
+        let font = CTFontCreateWithName("Helvetica-Bold" as CFString, 64, nil)
+        let str = NSAttributedString(string: word, attributes: [.init(kCTFontAttributeName as String): font,
+                                                                 .init(kCTForegroundColorAttributeName as String): CGColor(gray: 0.05, alpha: 1)])
+        let line = CTLineCreateWithAttributedString(str)
+        ctx.textPosition = CGPoint(x: 80 + (i % 2) * 560, y: height - 160 - (i / 2) * 140)
+        CTLineDraw(line, ctx)
+    }
+    if let barcode, let filter = CIFilter(name: "CICode128BarcodeGenerator") {
+        filter.setValue(Data(barcode.utf8), forKey: "inputMessage")
+        if let out = filter.outputImage?.transformed(by: CGAffineTransform(scaleX: 3, y: 3)),
+           let cg = CIContext().createCGImage(out, from: out.extent) {
+            ctx.interpolationQuality = .none
+            ctx.draw(cg, in: CGRect(x: 80, y: 60, width: out.extent.width, height: out.extent.height * 0.5))
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(b, [])
+    return b
+}
+
+struct NullAudio: SpatialAudioCueing {
+    func speak(_ text: String, azimuth: Float) async {}
+    func ping(azimuth: Float, elevation: Float) async {}
+}
+
+struct NullHaptics: HapticCueing {
+    func guide(offset dx: Float, _ dy: Float, distanceMetres: Float?) async {}
+    func confirm() async {}
+    func warn() async {}
+    func stop() async {}
+}
+
+final class Box<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v: T
+    init(_ v: T) { self.v = v }
+    var value: T { lock.withLock { v } }
+    func set(_ n: T) { lock.withLock { v = n } }
+}
+
+// MARK: - 1. Motion gate
+
+setvbuf(stdout, nil, _IOLBF, 0)
+print("EchoGuide benchmarks\n")
+do {
+    let e = FrameDeltaEngine()
+    let a = luma(1920, 1440), b = luma(1920, 1440, square: (400, 300, 500))
+    var samples: [Double] = []
+    for i in 0..<3000 {
+        let px = i % 2 == 0 ? a : b
+        _ = px.withUnsafeBufferPointer { e.analyze(luma: $0, width: 1920, height: 1440, bytesPerRow: 1920, timestamp: Double(i) / 60) }
+        samples.append(e.lastAnalysisMs)
+    }
+    record("Motion gate, per frame (1920×1440)", samples, unit: "µs", detail: "FrameDeltaEngine decides whether a frame is worth running the models on")
+}
+
+do {
+    // 60 s at 30 fps: a still room with four short events (someone walks in, a hand reaches out).
+    let e = FrameDeltaEngine()
+    let still = luma(640, 480)
+    let events: [ClosedRange<Int>] = [300...330, 700...760, 1200...1215, 1500...1560]
+    for i in 0..<1800 {
+        let moving = events.contains { $0.contains(i) }
+        let px = moving ? luma(640, 480, square: (100 + (i % 30) * 10, 120, 160)) : still
+        _ = px.withUnsafeBufferPointer { e.analyze(luma: $0, width: 640, height: 480, bytesPerRow: 640, timestamp: Double(i) / 30) }
+    }
+    let s = e.stats
+    let pct = s.skipRatio * 100
+    rows.append(Row(name: "Frames that never reach the models", value: String(format: "%.1f%%", pct),
+                    detail: "60 s at 30 fps of a mostly still scene with 4 motion events: \(s.framesInferred) of \(s.framesSeen) frames inferred"))
+    print("• Frames skipped: \(String(format: "%.1f%%", pct)) (\(s.framesInferred)/\(s.framesSeen) inferred)")
+}
+
+// MARK: - 2. Apple Vision through LocalVisionEngine (the shipping engine, no object model)
+
+let expectedWords = ["START", "STOP", "DEFROST", "POWER", "TIMER", "CLEAR"]
+let barcodeValue = "5000157024671"
+let panel = panelImage(words: expectedWords, barcode: barcodeValue)
+/// The same panel in the camera's own format (bi-planar 420), which is what the motion gate reads.
+let panel420: CVPixelBuffer = {
+    var pb: CVPixelBuffer?
+    CVPixelBufferCreate(nil, CVPixelBufferGetWidth(panel), CVPixelBufferGetHeight(panel),
+                        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary, &pb)
+    CIContext().render(CIImage(cvPixelBuffer: panel), to: pb!)
+    return pb!
+}()
+var visionMs: [Double] = []
+var textHits = 0, barcodeHits = 0, textRuns = 0
+do {
+    var config = LocalVisionConfig()
+    config.ocrEveryNthFrame = 1
+    let engine = try LocalVisionEngine(modelURL: nil, config: config)
+    for i in 0..<40 {
+        let r = await engine.process(CameraFrame(pixelBuffer: panel, timestamp: Double(i), index: UInt64(i)), orientation: .up)
+        if i >= 3 { visionMs.append(r.inferenceMs) } // first frames include model warm-up
+        let found = Set(r.detections.filter { $0.kind == .text }.compactMap { $0.text?.uppercased() })
+        textHits += expectedWords.filter { w in found.contains { $0.contains(w) } }.count
+        textRuns += 1
+        if r.detections.contains(where: { $0.kind == .barcode && $0.text == barcodeValue }) { barcodeHits += 1 }
+    }
+    record("Hand + text + barcode in one pass", visionMs, detail: "LocalVisionEngine with Apple Vision (hand pose, fast OCR, barcodes) on a 1280×960 panel")
+    let textAcc = Double(textHits) / Double(textRuns * expectedWords.count) * 100
+    rows.append(Row(name: "Button labels read correctly", value: String(format: "%.0f%%", textAcc),
+                    detail: "\(expectedWords.joined(separator: ", ")) on a synthetic panel, \(textRuns) frames"))
+    rows.append(Row(name: "Barcode decoded correctly", value: String(format: "%.0f%%", Double(barcodeHits) / Double(textRuns) * 100),
+                    detail: "Code 128 \(barcodeValue), \(textRuns) frames"))
+    print("• Labels read: \(String(format: "%.0f%%", textAcc)), barcode: \(barcodeHits)/\(textRuns)")
+} catch {
+    print("Vision engine unavailable: \(error)")
+}
+
+// MARK: - 3. Decision layer
+
+do {
+    var n = SceneNarrator()
+    let scene = (0..<12).map { i in
+        Detection(label: ["person", "chair", "car", "cup", "dog", "bench"][i % 6], confidence: 0.8,
+                  box: ImageRect(x: Float(i % 4) * 0.22, y: Float(i / 4) * 0.3, width: 0.18, height: 0.25))
+    }
+    var samples: [Double] = []
+    for i in 0..<5000 {
+        let t = FrameTimer()
+        _ = n.observe(VisionFrameResult(frameIndex: UInt64(i), timestamp: Double(i) / 30, detections: scene, inferenceMs: 0),
+                      aheadMetres: 2.0)
+        samples.append(t.elapsedMs)
+    }
+    record("Proactive narrator decision (12 objects)", samples, unit: "µs", detail: "Track, rank by salience, check novelty and pacing, phrase with place and distance")
+}
+
+do {
+    let agent = AgentCore(audio: NullAudio(), haptics: NullHaptics())
+    let scene = [Detection(label: "person", confidence: 0.9, box: ImageRect(x: 0.4, y: 0.3, width: 0.2, height: 0.4))]
+    var samples: [Double] = []
+    for i in 0..<5000 {
+        let t = FrameTimer()
+        await agent.ingest(VisionFrameResult(frameIndex: UInt64(i), timestamp: Double(i) / 30, detections: scene, inferenceMs: 0), fence: nil)
+        samples.append(t.elapsedMs)
+    }
+    record("Agent step (detections in → what to say)", samples, unit: "µs", detail: "AgentCore.ingest in Explore, including actor hop")
+}
+
+// MARK: - 4. End to end on real Vision: frame submitted → sentence chosen
+
+do {
+    var config = LocalVisionConfig()
+    config.ocrEveryNthFrame = 1
+    let engine = try LocalVisionEngine(modelURL: nil, config: config)
+    let spoken = Box<Double?>(nil)
+    struct TimingAudio: SpatialAudioCueing {
+        let onSpeak: @Sendable () -> Void
+        func speak(_ text: String, azimuth: Float) async { onSpeak() }
+        func ping(azimuth: Float, elevation: Float) async {}
+    }
+    let start = Box<FrameTimer>(FrameTimer())
+    let agent = AgentCore(audio: TimingAudio { if spoken.value == nil { spoken.set(start.value.elapsedMs) } }, haptics: NullHaptics())
+    await agent.setMode(.read, announce: false)
+    let done = Box(false)
+    let pipeline = PerceptionPipeline(vision: OrientedUp(engine)) { result, _ in
+        await agent.ingest(result, fence: nil)
+        done.set(true)
+    }
+    var e2e: [Double] = []
+    for i in 0..<15 {
+        await agent.setMode(.read, announce: false) // forget what was read, so every trial speaks
+        spoken.set(nil)
+        done.set(false)
+        start.set(FrameTimer())
+        pipeline.forceNextFrame()
+        let decision = pipeline.submit(CameraFrame(pixelBuffer: panel420, timestamp: 1000 + Double(i) * 10, index: UInt64(i)))
+        guard decision.shouldInfer else { continue }
+        let deadline = Date().addingTimeInterval(5)
+        while !done.value && Date() < deadline { try? await Task.sleep(nanoseconds: 200_000) }
+        if let s = spoken.value, i >= 2 { e2e.append(s) }
+    }
+    if !e2e.isEmpty {
+        record("Camera frame → spoken sentence (Read mode)", e2e,
+               detail: "Full path on real Vision: motion gate, hand + OCR + barcode, reading order, speech handed off")
+    }
+} catch {
+    print("Vision engine unavailable: \(error)")
+}
+
+/// Runs the shipping engine with an upright synthetic image (camera frames use .right).
+struct OrientedUp: FrameInferring {
+    let engine: LocalVisionEngine
+    init(_ e: LocalVisionEngine) { engine = e }
+    func infer(_ frame: CameraFrame) async -> VisionFrameResult { await engine.process(frame, orientation: .up) }
+}
+
+// MARK: - Report
+
+func sysctl(_ name: String) -> String {
+    var size = 0
+    sysctlbyname(name, nil, &size, nil, 0)
+    var buf = [CChar](repeating: 0, count: size)
+    sysctlbyname(name, &buf, &size, nil, 0)
+    return String(cString: buf)
+}
+
+let chip = sysctl("machdep.cpu.brand_string")
+let model = sysctl("hw.model")
+let os = ProcessInfo.processInfo.operatingSystemVersionString
+let date = ISO8601DateFormatter().string(from: Date())
+
+var md = """
+# Benchmark results: \(chip) (\(model))
+
+Measured by `swift run -c release EchoGuideBench` on \(date), macOS \(os). Every number below is produced by the shipping engine code in this repo; nothing is simulated except the input images. Phone numbers come from the in-app speed test.
+
+| Measure | Result | What it is |
+|---|---|---|
+
+"""
+for r in rows { md += "| \(r.name) | \(r.value) | \(r.detail) |\n" }
+md += "\nInput images are synthetic (rendered panel text and a Code 128 barcode), so recognition rates here are an upper bound for clean, well-lit labels, not a field accuracy figure.\n"
+
+let out = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    .appendingPathComponent("benchmarks/results/\(model.isEmpty ? "host" : model).md")
+try? FileManager.default.createDirectory(at: out.deletingLastPathComponent(), withIntermediateDirectories: true)
+try? md.write(to: out, atomically: true, encoding: .utf8)
+print("\nWrote \(out.path)")
+EOF_AVAE
+
 cat > 'EchoGuideTests/AgentTests.swift' <<'EOF_AVAE'
 // Owner: Maxwell. The visual agent: proactive narration, reading, describe,
 // mode routing, and the benchmark recorder.
@@ -7379,6 +7721,21 @@ struct StubListener: GoalListening {
         #expect(det("text", x: 0, y: 0, kind: .text, text: "STOP").stepKey != det("text", x: 0, y: 0, kind: .text, text: "START").stepKey)
     }
 
+    @Test func streamingWAVHeaderIsCorrected() {
+        // Kokoro-FastAPI writes 0xFFFFFFFF sizes because it streams; the
+        // provider must hand AVAudioPlayer the real lengths.
+        var wav = WAVEncoder.pcm16Mono([0, 0.5, -0.5, 1], sampleRate: 24_000)
+        let good = wav
+        for i in [4, 5, 6, 7, 40, 41, 42, 43] { wav[i] = 0xFF }
+        #expect(wav != good)
+        #expect(WAVEncoder.withCorrectSizes(wav) == good)
+        #expect(WAVEncoder.withCorrectSizes(good) == good)
+        #expect(WAVEncoder.withCorrectSizes(Data([1, 2, 3])) == Data([1, 2, 3]))
+        // Sliced input (non-zero startIndex) works too.
+        let sliced = (Data([9, 9]) + wav)[2...]
+        #expect(WAVEncoder.withCorrectSizes(sliced) == good)
+    }
+
     @Test func wavFromRawPCMMatchesFloatPath() {
         let floats: [Float] = [0, 0.5, -0.5, 1]
         var pcm = Data()
@@ -7700,6 +8057,12 @@ let package = Package(
             exclude: ["Contracts", "Camera", "Vision", "Fence", "Haptics", "Depth", "Audio", "Automation", "Cognitive"],
             sources: ["Plugins", "Router", "Agent"]
         ),
+        // Maxwell: reproducible benchmarks of the real engine code. `swift run -c release EchoGuideBench`
+        .executableTarget(
+            name: "EchoGuideBench",
+            dependencies: ["EchoGuideContracts", "EchoGuideVision", "EchoGuideInfra"],
+            path: "EchoGuideBench"
+        ),
         .testTarget(
             name: "EchoGuideTests",
             dependencies: [
@@ -7716,139 +8079,123 @@ let package = Package(
 EOF_AVAE
 
 cat > 'README.md' <<'EOF_AVAE'
-# AutoVision Audio Engine (EchoGuide)
+# EchoGuide
 
-Hands-free spatial vision for blind and low-vision people. The camera watches. When something changes, the engine works out the **one** next step and guides the hand there with haptic pulses and directional audio. It calls a tool only when the user holds their finger on the target. The phone screen is optional.
+**A real-time, multimodal visual agent for blind and low-vision people.** It watches through the phone camera continuously, reasons about what matters, and acts on its own: it names what comes into view, warns before you walk into something, reads what's in front of you, and guides your finger onto the exact button you need, then presses it. It runs on the phone, works in Airplane Mode, and needs no screen.
 
-* NOT A MEDICAL DEVICE OR FDA APPROVED CURRENTLY JUST FOR TESTING
+[![swift-ci](https://github.com/PointBlanked/compile/actions/workflows/swift-ci.yml/badge.svg)](https://github.com/PointBlanked/compile/actions/workflows/swift-ci.yml)
+![tests](https://img.shields.io/badge/tests-112%20passing-brightgreen)
+![platform](https://img.shields.io/badge/iOS-17%2B-black)
+![on-device](https://img.shields.io/badge/runs-on--device%20%C2%B7%20offline-yellow)
 
-```
-camera ─► FrameDeltaEngine ─► LocalVisionEngine ─► DigitalFence ─┐
- (ARKit or AVCapture)  skip ~99% static     YOLO INT8 + hand + OCR       │
-                                                                          ▼
-                     CloudReasoningRouter ◄── AutomationEngine ◄── CognitiveTaskIsolation
-                     (only < 85% conf)          │ state machine       one step only
-                     PluginRegistry (MCP) ◄─────┤
-                                                ├─► SpatialHapticEngine (CoreHaptics)
-                                                └─► SpatialAudioEngine (AVAudioEngine 3D)
-```
+> Not a medical device and not FDA approved. Currently for testing only.
+
+## The problem
+
+At least [2.2 billion people have a vision impairment](https://www.who.int/news/item/08-10-2019-who-launches-first-world-report-on-vision) (WHO, 2019). AI vision apps for them have improved, but they share one shape: **you point the camera and ask, and it answers.** That leaves three everyday problems unsolved:
+
+1. **The last 10 cm.** Knowing a microwave "has a Start button" doesn't help if you can't find it. Flat touch panels have no tactile edges.
+2. **Things you didn't know to ask about.** The chair in the corridor, the sign on the door. A question-answer app stays silent until you ask.
+3. **No signal, no help.** Cloud-first assistants stop working in a basement, on the underground, or in Airplane Mode.
 
 ## What it does
 
-A real-time, multimodal visual agent for blind and low-vision people. It perceives continuously, reasons about context, and speaks up on its own when something matters.
-
-| Mode | What the user hears or feels | Runs on |
+| Mode | What you hear or feel | Runs on |
 |---|---|---|
-| **Explore** (default) | Speaks up on its own: "A chair, on your left, about 2 meters." "Obstacle ahead, very close" (with a buzz). "Sign: EXIT." It names each thing once and is paced so it never chatters. | Phone |
-| **Find** | Say or type a goal ("start button"). Haptic pulses get faster as the finger closes in, two taps mean on target, and holding there presses it through a plugin. | Phone |
-| **Read** | Reads text in reading order, each line once, as you move the camera. **Read everything** reads it all again. | Phone |
-| **Describe** | One tap (or a VoiceOver two-finger double tap): a few sentences about everything in view. Uses a multimodal cloud model with the photo when allowed, otherwise an on-device summary. | Cloud or phone |
+| **Explore** (default) | Speaks up on its own: *"A chair, on your left, about 2 meters."* *"Obstacle ahead, very close"* plus a buzz. *"Sign: EXIT."* It names each thing once, important things first, and never chatters. | Phone |
+| **Find** | Say or type a goal (*"start button"*). Haptic pulses speed up as your finger closes in, a double tap means you're on it, and holding still presses it through a smart-home plugin. | Phone |
+| **Read** | Reads text in reading order, each line once, as you move the camera. | Phone |
+| **Describe** | One tap: a few sentences about everything in view. Uses a multimodal model with the photo when you allow it, otherwise an on-device summary. | Cloud or phone |
 
-Hazard warnings ("Careful. Hob is close." / "Stop. Hob.") work in every mode.
+Hazard warnings (*"Careful. Hob is close."* / *"Stop. Hob."*) work in every mode. First launch is a spoken seven-step setup with a hands-on haptic demo, and only the camera is required.
 
-**First launch** is a seven-step spoken setup: welcome, camera, the modes, a hands-on haptic demo, optional voice, photo consent, and how to hold the phone. Only the camera is required; everything else is skippable and can be changed later in Settings.
+## What's new here
 
-**Benchmarks:** Settings has the speed test (camera to cue, on this phone) and the eight-task head-to-head battery. Results from other apps are logged by hand next to EchoGuide's own and exported as one CSV. The method is in [`benchmarks/PROTOCOL.md`](benchmarks/PROTOCOL.md).
+1. **Closed-loop haptic guidance onto a target, with dwell-to-act.** A fully local loop (7.9 ms from frame to cue on an M4; phone numbers pending) tracks the fingertip ([`LocalVisionEngine`](EchoGuide/Core/Vision/LocalVisionEngine.swift)) against one isolated target ([`CognitiveTaskIsolation`](EchoGuide/Core/Cognitive/CognitiveTaskIsolation.swift)). Pulse rate encodes distance, sharpness encodes up or down, and spatial audio encodes left or right ([`SpatialHapticEngine`](EchoGuide/Core/Haptics/SpatialHapticEngine.swift)). Holding on target is the confirmation gesture for physical actions ([`AutomationEngine`](EchoGuide/Core/Automation/AutomationEngine.swift)). Describing a scene is common; leading a hand onto a flat control and pressing it is not.
+2. **Proactive narration as a policy, not a prompt.** [`SceneNarrator`](EchoGuide/Core/Agent/SceneNarrator.swift) decides *when to speak*: things must be settled across frames, each is named once per cooldown, they're ranked by salience (an obstacle in the path, then vehicles, then people, then furniture), there's a minimum gap between sentences, and every sentence carries place and LiDAR distance. Only an obstacle may interrupt. The decision costs about a microsecond per frame.
+3. **A motion-gated, back-pressured perception pipeline.** [`FrameDeltaEngine`](EchoGuide/Core/Camera/FrameDeltaEngine.swift) samples 768 points per frame with auto-exposure compensation, so most frames never reach a model. [`PerceptionPipeline`](EchoGuide/Core/Camera/PerceptionPipeline.swift) keeps at most one inference in flight and drops rather than queues, so latency can't pile up. Dropped motion forces the next frame through, so it is never lost.
+4. **Local-first multimodal routing that degrades gracefully.** [`CloudReasoningRouter`](EchoGuide/Core/Router/CloudReasoningRouter.swift) answers locally above 85% confidence. Below that, it uses a cloud model under a hard deadline, a failure cutoff that stops retrying a failing provider, a cost cap and photo consent. Otherwise it falls back to an on-device scene summary ([`SceneSummary`](EchoGuide/Core/Agent/AgentCore.swift)). Offline never means silent.
+5. **Seeing turns into doing, through MCP.** [`PluginRegistry`](EchoGuide/Core/Plugins/PluginRegistry.swift) maps recognised things (a label, the word "START", a barcode) to Model Context Protocol tools: Home Assistant appliance control and barcode product lookup ([`BuiltInPlugins`](EchoGuide/Core/Plugins/BuiltInPlugins.swift)). It also serves and consumes MCP over JSON-RPC, so any FastMCP server becomes a new capability, configured per home with no code change.
+6. **Measurement built in.** A reproducible benchmark suite ([`EchoGuideBench`](EchoGuideBench/main.swift)), an in-app speed test, and an in-app trial recorder with a fixed task battery and CSV export ([`TrialRecorder`](EchoGuide/Core/Agent/TrialRecorder.swift), [`benchmarks/PROTOCOL.md`](benchmarks/PROTOCOL.md)).
 
-## Team and ownership
+## Measured
 
-Two owners. Engines meet only through `EchoGuideContracts`, so the two never edit the same file. Ownership is enforced in `.github/CODEOWNERS`.
+Produced by `swift run -c release EchoGuideBench`. This runs the shipping engine code, including Apple's Vision framework, with nothing mocked except the input images. Full report: [`benchmarks/results/Mac16,13.md`](benchmarks/results/Mac16,13.md).
 
-| Owner | Area | Paths | Files |
-|---|---|---|---|
-| Maxwell | Perception + infrastructure: what the phone senses, and the plumbing | `EchoGuide/Core/Camera/`, `Vision/`, `Depth/`, `Plugins/`, `Router/`, `Agent/`, `EchoGuideApp/`, `benchmarks/`, `proxy/`, `.github/`, `EchoGuideTests/`, `Package.swift`, `plugins/` | `FrameDeltaEngine`, `PerceptionPipeline`, `CameraFeed`, `LocalVisionEngine`, `LiDARDepthEngine`, `PluginRegistry`, built-in plugins, `CloudReasoningRouter`, `VoiceLoop`, `AgentCore` (Explore/Read/Describe), `SceneNarrator`, `TextReader`, `TrialRecorder`, the iOS app, the key proxy, CI/CD, tests |
-| Bryan | Experience + safety: everything the user feels, hears and sees | `EchoGuide/Core/Fence/`, `Haptics/`, `Audio/`, `Automation/`, `Cognitive/`, `EchoGuide/UI/` | `DigitalFenceEngine`, `SpatialHapticEngine`, `SpatialAudioEngine`, `AutomationEngine`, `CognitiveTaskIsolation`, `GuidanceView` |
-| Both | Shared contracts | `EchoGuide/Core/Contracts/` | `Contracts.swift` (needs both approvals) |
+| Measure (Apple M4) | Result |
+|---|---|
+| Camera frame → spoken sentence, full path on real Vision | **7.9 ms** p50 · 8.6 ms p95 |
+| Hand pose + text + barcode, one pass | **8.8 ms** p50 · 11.3 ms p95 |
+| Frames that never reach a model (60 s, mostly still scene) | **98.4%** |
+| Motion gate per 1920×1440 frame | **3 µs** |
+| Agent decision (detections in → what to say) | **6.6 µs** |
+| Button labels read / barcode decoded (synthetic panel) | 100% / 100% |
 
-The split follows the pipeline: Maxwell owns everything up to "a detection with a confidence and a depth"; Bryan owns everything from "what one step does the user take, and how do they feel it".
+**Phone numbers** come from the in-app speed test (Settings → Measure on-device speed) and are added here once measured on an A17-class iPhone. Recognition rates above use rendered labels in perfect light, so treat them as an upper bound, not field accuracy. Field results go through [`benchmarks/PROTOCOL.md`](benchmarks/PROTOCOL.md).
 
-### Branches
+## Architecture
 
-`feature/maxwell-vision`, `feature/maxwell-plugins`, `feature/bryan-automation`, `feature/bryan-haptics`, `feature/bryan-fence`. Each branch opens a PR into `main`. CI must pass and the owner of every path the PR touches must approve.
-
-## Digital fence (Bryan)
-
-The fence only reports a `FenceEvent`; `AutomationEngine` decides how the user hears or feels it. It covers hazard zones the camera can see, such as the hob or a knife. A zone follows a detected label or covers a fixed part of the frame. When the fingertip comes near a zone, the user gets "Careful" and a warning pulse. When it enters the zone, they get "Stop", the warning preempts all other guidance, and any dwell in progress is cancelled so a physical tool cannot fire straight after a hazard. If LiDAR is available, `SpatialFence.evaluate(_:depth:)` samples the hand and the centre of every zone through `DepthProviding`, so a hob at 1.2 m and a knife at 0.4 m each get their own distance; a hand that only overlaps a zone on screen is an approach, not a breach.
-
-## Automation (Bryan)
-
-`AutomationEngine` runs `scanning -> guiding -> onTarget -> completed -> scanning`. Details that matter for the demo:
-
-- A target that drops out of the frame keeps its last haptic cue for `lostTargetTimeout` (1.2 s), then haptics stop and the engine goes back to scanning. It never announces, confirms or completes against a remembered box.
-- A finished target is excluded for `completedCooldown` (8 s), so "done" moves on to the next step instead of guiding the finger back to the same button.
-- On target, the guidance pulse train stops and a double tap plays once; hovering does not buzz.
-- `GuidanceView` shows the step huge and yellow on black, a second line for a sighted helper ("Hold still", "Follow the pulses"), a goal field, and one big Pause/Resume button.
-
-## Targets
-
-| Metric | Target | Where it is measured |
-|---|---|---|
-| Frame-delta analysis | < 1 ms p50, < 3 ms p95 (CI debug build) | `FrameDeltaTests.benchmarkUnderBudget` |
-| Local inference (object + hand) | < 12 ms on A17-class | `LocalVisionEngine.p95Ms`, on device |
-| Local end-to-end (frame to haptic) | < 15 ms | on device |
-| Audio / haptic cue | < 300 ms | on device |
-| Static frames skipped | ~99% in a still scene | `FrameDeltaStats.skipRatio` |
-| Edge compute share | > 95% of resolutions local | `ReasoningOutcome.source` |
-| Airplane Mode | 100% working, local fallback | `RouterTests.airplaneModeFallsBackLocally` |
-
-Read these honestly:
-
-- **OCR does not fit inside 12 ms.** `VNRecognizeTextRequest` at `.fast` takes roughly 10 to 35 ms, so it runs on every third inferred frame (`ocrEveryNthFrame`). Only object detection and the hand fit inside the 12 ms budget.
-- **The cloud path cannot meet 15 ms.** A cloud round trip is hundreds of milliseconds. The < 15 ms target covers only the local path, and the router gives the cloud a hard 2.5 s timeout.
-- **"100% Airplane Mode" and "cloud below 85%" conflict, by design.** When the device is offline, low-confidence steps get the best local answer. The response is tagged `localFallback` so telemetry shows how often the cloud was missed.
-
-## Build
-
-```bash
-swift build && swift test        # macOS host: pure logic, 105 tests (plus `cd proxy && node --test`: 6)
+```mermaid
+flowchart LR
+    CAM["Camera<br/>ARKit + LiDAR<br/>or AVCapture"] --> GATE["Motion gate<br/>FrameDeltaEngine<br/>~98% of frames skipped"]
+    GATE --> VIS["On-device vision<br/>YOLO INT8 · hand pose<br/>OCR · barcodes"]
+    VIS --> FENCE["Hazard fence<br/>per-zone depth"]
+    FENCE --> AGENT["AgentCore<br/>Explore · Read · Describe"]
+    FENCE --> AUTO["AutomationEngine<br/>Find: guide → dwell → act"]
+    AGENT --> OUT["Speech + 3D audio<br/>Haptics"]
+    AUTO --> OUT
+    AGENT -. "below 85% confidence,<br/>with consent" .-> ROUTER["CloudReasoningRouter<br/>Gemini / GPT-4o via proxy"]
+    AUTO --> MCP["MCP tools<br/>Home Assistant · product lookup"]
+    DEPTH["LiDAR depth<br/>60 FPS"] --> FENCE
+    DEPTH --> AGENT
 ```
 
-The iOS-only paths (ARKit, the camera, the haptic actuator) are behind `#if canImport(...) && os(iOS)`. The `ios-build` CI job compiles them with `xcodebuild` for the iOS Simulator. Real latency numbers need a device.
+Deep dive, covering the threading and back-pressure model, the latency budget, coordinate conventions, each state machine, and the safety rules: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-### The iOS app (`EchoGuideApp/`)
+## Try it
 
-Open `EchoGuideApp/EchoGuideApp.xcodeproj` in Xcode 16+, set your team, and run it on an iPhone. `AppRuntime.swift` is the only place every engine is built and connected:
+| Path | Steps |
+|---|---|
+| **TestFlight** | Run the `ios-release` workflow (Actions tab). It exports and bundles the object model, archives with cloud signing, and uploads. Secrets are listed at the top of [`ios-release.yml`](.github/workflows/ios-release.yml). |
+| **Xcode** | Open `EchoGuideApp/EchoGuideApp.xcodeproj`, pick your team, and run on an iPhone (LiDAR models get depth). |
+| **Engine only** | `swift test` (112 tests) and `swift run -c release EchoGuideBench` on any Mac. |
+| **Backend** | `cd proxy && node --test`. Deploy with [`infra/freestyle`](infra/freestyle/README.md) or any Node host. |
 
-- With LiDAR, ARKit owns the camera and `LiDARDepthEngine` feeds the pipeline. Without LiDAR, `CameraFeed` does.
-- `PerceptionPipeline` → `SpatialFence` → `AutomationEngine` → haptics, audio, plugins and router.
-- The optional voice loop starts here too.
+## Repository map
 
-Per-home setup goes in `Application Support/echoguide.json` (plugins, starting goal); the bundled `echoguide.sample.json` is the fallback. Secrets (the proxy `device_token`, Home Assistant token) are read from the Keychain, service `EchoGuide`.
+| Path | What | Owner |
+|---|---|---|
+| `EchoGuide/Core/Contracts` | Shared types and protocols; the only coupling between engines | Both |
+| `EchoGuide/Core/Camera`, `Vision`, `Depth` | Camera feed, motion gate, pipeline, on-device vision, LiDAR | Maxwell |
+| `EchoGuide/Core/Agent` | Visual agent: Explore, Read, Describe, narrator, trial recorder | Maxwell |
+| `EchoGuide/Core/Router`, `Plugins` | Cloud routing, voice loop, MCP registry, built-in tools | Maxwell |
+| `EchoGuide/Core/Automation`, `Cognitive` | Find mode state machine, one-target isolation | Bryan |
+| `EchoGuide/Core/Haptics`, `Audio`, `Fence` | Haptic guidance, spatial audio and speech, hazard fence | Bryan |
+| `EchoGuide/UI` | Find-mode guidance view | Bryan |
+| `EchoGuideApp` | The iOS app: onboarding, live screen, settings, benchmark lab | Maxwell |
+| `EchoGuideBench`, `benchmarks` | Benchmark suite, results, head-to-head protocol | Maxwell |
+| `proxy`, `infra` | Key-holding proxy (zero-dependency Node), demo deploy | Maxwell, Bryan |
 
-**Model:** run the `export-model` workflow (Actions tab), download the `.mlpackage`, and drop it in `EchoGuideApp/Resources/Models/`. It is compiled on first launch. Without it, the app runs hands, text and barcodes only.
+Engines import only `EchoGuideContracts`, never each other, and the app composes them in one file ([`AppRuntime.swift`](EchoGuideApp/Sources/AppRuntime.swift)). That's why two people could build this in parallel without merge conflicts. Ownership is enforced by [`CODEOWNERS`](.github/CODEOWNERS).
 
-> **License:** Ultralytics YOLO (v8 and 11) is **AGPL-3.0**. Shipping it in a closed-source app requires an Ultralytics Enterprise license, or a switch to a permissively licensed detector. Decide this before any public release.
+## Engineering
 
-**On-device benchmark:** enable the `-benchmark` launch argument in the scheme, point the phone at a scene with some movement for 20 s, and read the result on screen. The full JSON is in Documents (visible in the Files app). This is how the < 15 ms local target is checked for real.
+- **112 Swift tests + 6 proxy tests**, run on every push. CI also compiles the iOS-only code (ARKit, CoreHaptics, camera) and the full app for the iOS Simulator.
+- **No third-party Swift dependencies.** Apple frameworks only: Vision, Core ML, ARKit, CoreHaptics, AVFoundation, Speech.
+- **Zero-dependency Node proxy:**
+  - device tokens are stored only as SHA-256 hashes
+  - per-device rate limits, a model allow-list and output caps
+  - 30-second speech tokens, so long-lived keys never reach the phone
 
-**TestFlight:** the `ios-release` workflow (manual) archives with cloud signing and uploads. It needs four repo secrets, listed at the top of `.github/workflows/ios-release.yml`.
+## Privacy and safety
 
-## Cloud proxy (`proxy/`)
+- Video stays on the phone. A photo is sent only when you tap Describe, and only with consent given in onboarding or Settings. API keys live only in the proxy.
+- Any physical action needs a deliberate 0.8 s hold on target, and a hazard breach cancels a hold in progress.
+- The object model is Ultralytics YOLO11n, licensed **AGPL-3.0**. That's fine for testing; a public release needs an Ultralytics license or a permissively licensed detector.
 
-The only place the Gemini, OpenAI, Deepgram and ElevenLabs keys live. It is zero-dependency Node 20+ (`node server.mjs`, tests with `node --test`).
+## Status
 
-- Devices send `Authorization: Bearer <device token>`. The proxy stores only SHA-256 hashes of allowed tokens (`DEVICE_TOKEN_SHA256S`).
-- Per-device rate limit (default 30 per minute), model allow-list, output capped at 120 tokens, 2 MB body cap, 10 s upstream timeout.
-- `/v1/voice/stt-token` mints a 30-second Deepgram token, so the phone opens the speech WebSocket directly and the long-lived key never leaves the server. `/v1/voice/tts` streams ElevenLabs audio back as it arrives.
-- Deploy it anywhere that runs Node (Fly, Render, Railway, a small VM) and set `EG_PROXY_BASE_URL` for the app build.
-
-## Voice (optional)
-
-Off by default; the product works without it. With voice on (the `voiceEnabled` setting plus a proxy), Deepgram live speech-to-text understands "find the start button" (narrows guidance to that target), "stop", and any other sentence as a question for the router. ElevenLabs streaming TTS is available through the proxy; on-device speech remains the default so everything works offline.
-
-## Plugins (MCP)
-
-Built-in tools: **Home Assistant** (presses the control for the user through one hub that already integrates thousands of appliances), and **product lookup** (barcode to product name and allergens via Open Food Facts; QR codes never leave the device). A per-home `PluginManifest` JSON sets all of this up without a code change, and secrets come from the Keychain, never from the manifest.
-
-`PluginRegistry` serves MCP `initialize`, `tools/list` and `tools/call` over JSON-RPC 2.0. `MCPHTTPClient` connects to remote MCP servers over Streamable HTTP. An example FastMCP server is in `plugins/smart_home_server.py`.
-
-Remote tools are registered as `physical` unless told otherwise. A physical tool runs only after the user holds their finger on the target (0.8 s dwell).
-
-## Not built yet
-
-- The OpenAI Realtime API (multi-turn). The router uses one-shot Chat Completions.
-- A setup flow that writes `echoguide.json` and the Keychain secrets (today: by hand).
-- Real measurements: run the on-device benchmark on an A17-class iPhone and put the numbers in the targets table.
+Built and tested end to end in CI. **Not yet run on a phone at scale**: on-device numbers and field trials are next. Not built yet: a carer-side setup flow (per-home config is a JSON file today) and multi-turn conversation through the OpenAI Realtime API.
 EOF_AVAE
 
 cat > 'benchmarks/PROTOCOL.md' <<'EOF_AVAE'
@@ -7913,6 +8260,25 @@ The comparisons this battery is designed to show, if they hold up:
 Also run the on-device speed test (Settings → Measure on-device speed) on the phone used, and report its p50 and p95 next to the task results.
 EOF_AVAE
 
+cat > 'benchmarks/results/Mac16,13.md' <<'EOF_AVAE'
+# Benchmark results: Apple M4 (Mac16,13)
+
+Measured by `swift run -c release EchoGuideBench` on 2026-10-17T21:26:17Z, macOS Version 15.5 (Build 24F74). Every number below is produced by the shipping engine code in this repo; nothing is simulated except the input images. Phone numbers come from the in-app speed test.
+
+| Measure | Result | What it is |
+|---|---|---|
+| Motion gate, per frame (1920×1440) | p50 3.0 µs · p95 3.5 µs | FrameDeltaEngine decides whether a frame is worth running the models on (n=3000) |
+| Frames that never reach the models | 98.4% | 60 s at 30 fps of a mostly still scene with 4 motion events: 28 of 1800 frames inferred |
+| Hand + text + barcode in one pass | p50 8.8 ms · p95 11.3 ms | LocalVisionEngine with Apple Vision (hand pose, fast OCR, barcodes) on a 1280×960 panel (n=37) |
+| Button labels read correctly | 100% | START, STOP, DEFROST, POWER, TIMER, CLEAR on a synthetic panel, 40 frames |
+| Barcode decoded correctly | 100% | Code 128 5000157024671, 40 frames |
+| Proactive narrator decision (12 objects) | p50 0.3 µs · p95 1.2 µs | Track, rank by salience, check novelty and pacing, phrase with place and distance (n=5000) |
+| Agent step (detections in → what to say) | p50 6.6 µs · p95 7.8 µs | AgentCore.ingest in Explore, including actor hop (n=5000) |
+| Camera frame → spoken sentence (Read mode) | p50 7.9 ms · p95 8.6 ms | Full path on real Vision: motion gate, hand + OCR + barcode, reading order, speech handed off (n=13) |
+
+Input images are synthetic (rendered panel text and a Code 128 barcode), so recognition rates here are an upper bound for clean, well-lit labels, not a field accuracy figure.
+EOF_AVAE
+
 cat > 'benchmarks/scoresheet.csv' <<'EOF_AVAE'
 product,task,mode,started_at,duration_s,success,first_cue_ms,spoken_lines,user_prompts,cloud_calls,offline,notes
 "EchoGuide","Find and press the Start button on a microwave or labelled panel",find,,,,,,,,,""
@@ -7955,6 +8321,329 @@ product,task,mode,started_at,duration_s,success,first_cue_ms,spoken_lines,user_p
 "Microsoft Seeing AI","Say what is on the table without asking a question",explore,,,,,,,,,""
 "Microsoft Seeing AI","Describe the room in one request",describe,,,,,,,,,""
 "Microsoft Seeing AI","Same as task 1 in Airplane Mode",find,,,,,,,,,""
+EOF_AVAE
+
+cat > 'docs/ARCHITECTURE.md' <<'EOF_AVAE'
+# Architecture
+
+EchoGuide is a set of independent engines that only share the types in [`Contracts.swift`](../EchoGuide/Core/Contracts/Contracts.swift), composed in one place, [`AppRuntime.swift`](../EchoGuideApp/Sources/AppRuntime.swift). This document covers how data flows through them, how latency is kept bounded, and the rules that keep the product safe and quiet.
+
+## 1. Data flow
+
+```mermaid
+sequenceDiagram
+    participant C as Camera (ARKit/AVCapture queue)
+    participant G as FrameDeltaEngine
+    participant P as PerceptionPipeline
+    participant V as LocalVisionEngine (actor)
+    participant F as SpatialFence
+    participant A as AgentCore (actor)
+    participant M as AutomationEngine (actor)
+    participant O as Audio / Haptics
+
+    C->>P: submit(frame) 30–60 fps
+    P->>G: analyze luma (~3 µs)
+    alt nothing changed
+        G-->>P: skip (most frames)
+    else motion, forced, or idle refresh
+        P->>V: infer (one in flight; extra frames dropped)
+        V-->>P: detections (objects, fingertip, text, barcodes)
+        P->>F: evaluate (per-zone LiDAR depth)
+        P->>A: ingest(result, fence)
+        alt Explore / Read
+            A->>O: one sentence or a warning, paced
+        else Find
+            A-->>P: hand to automation
+            P->>M: ingest(result, fence)
+            M->>O: haptic pulse / direction / confirm
+        end
+    end
+```
+
+## 2. Latency and back-pressure
+
+| Stage | Budget | Mechanism |
+|---|---|---|
+| Motion gate | < 0.1 ms | A 32×24 grid of luma samples; a global mean shift is removed so auto-exposure isn't counted as motion ([`FrameDeltaEngine`](../EchoGuide/Core/Camera/FrameDeltaEngine.swift)) |
+| Vision | < 12 ms | One Vision request handler per frame. Object model on the Neural Engine (`.cpuAndNeuralEngine`); OCR and barcodes on a per-mode schedule (every frame in Read, every 3rd in Explore) |
+| Decision | < 0.05 ms | Narrator and automation are plain state machines; no model in the decision loop |
+| Cue | < 300 ms | Haptics are immediate; speech starts with a directional ping |
+| Cloud | 2.5 s (6 s for Describe) | A hard deadline, after which the local answer is spoken |
+
+**One inference in flight.** `PerceptionPipeline` sets a busy flag under a lock on the camera queue. A frame that arrives while the model is busy is dropped, never queued, so a slow frame can't push every later cue back. If the dropped frame had motion in it, the next frame is forced through, so the motion is not lost.
+
+**Per-mode schedule.** Read re-checks a still page every 0.5 s and runs OCR on every frame. Explore re-checks a still scene every 1 s, so something that moved in slowly is still seen. Find relies on motion, because the hand is moving.
+
+Measured numbers are in [`benchmarks/results`](../benchmarks/results); reproduce them with `swift run -c release EchoGuideBench`.
+
+## 3. Coordinates
+
+Everything downstream of vision uses one convention: **upright portrait image space, origin top-left, x to the user's right, y down, both 0–1.**
+- Vision returns boxes with a bottom-left origin; `VisionGeometry` converts them once.
+- The LiDAR depth map is in landscape sensor space; `DepthSampler.sensorPoint(fromUpright:)` maps back to it.
+- Depth reads use a confidence-filtered 3×3 median, so one noisy pixel never moves a cue.
+
+## 4. The agent ([`AgentCore`](../EchoGuide/Core/Agent/AgentCore.swift))
+
+| Mode | Owner of speech | Policy |
+|---|---|---|
+| Explore | `SceneNarrator` | Settled across 2+ frames; one name per label per 20 s; text per 45 s; 2.5 s between sentences; an obstacle closer than 1.2 m straight ahead interrupts and buzzes |
+| Read | `TextReader` | Rows grouped by vertical overlap, then sorted left to right; OCR noise stripped; a line is not repeated for 60 s |
+| Describe | Router, then `SceneSummary` | Multimodal model with the photo (consent required), at most 40 words, most important first, positions included; otherwise an on-device grouped summary ("Ahead: …. On your left: …. Text: …") |
+| Find | `AutomationEngine` | See section 5 |
+
+Speech pacing is shared. The agent estimates how long each sentence takes (about 2.5 words a second), so routine lines wait their turn, while urgent ones (obstacles, hazards) always go first.
+
+## 5. Find: guidance and action ([`AutomationEngine`](../EchoGuide/Core/Automation/AutomationEngine.swift), Bryan)
+
+`scanning → guiding → onTarget → completed → scanning`
+
+- [`CognitiveTaskIsolation`](../EchoGuide/Core/Cognitive/CognitiveTaskIsolation.swift) reduces all detections to **one** target:
+  - scored by goal match, closeness to the fingertip, size and confidence
+  - sticky: a rival must score 1.35× higher to replace the current target
+  - settled: it must appear on several frames first
+  - phrased with one direction at a time ("Move left a little")
+- **Haptics:** pulse rate rises from 1.6 to 12 Hz as the finger closes in, sharpness encodes up or down, and a spatial-audio ping carries left or right, since a phone has a single actuator. Inside the alignment tolerance, a double tap plays and the pulses stop.
+- **Dwell to act:** holding on target for 0.8 s is the confirmation. Only then is a plugin tool called. Physical tools (the microwave, a lock) are never called without it.
+- **Lost target:** the last cue is kept for 1.2 s, then haptics stop. The engine never confirms against a remembered box.
+- **Completed targets** are excluded for 8 s, so "done" moves on instead of guiding back to the same button.
+
+## 6. Hazard fence ([`DigitalFenceEngine`](../EchoGuide/Core/Fence/DigitalFenceEngine.swift), Bryan)
+
+- Zones follow a detected label ("oven", "knife") or cover a fixed region of the frame, and can be configured per home in JSON (`FenceConfig`).
+- The fingertip inside a zone's margin gives *Careful*; inside the zone gives *Stop*, which preempts all guidance and cancels any dwell in progress.
+- With LiDAR, the hand and each zone are depth-sampled separately. A hand that overlaps a zone on screen but is 80 cm in front of it counts as an approach, not a breach.
+
+## 7. Cloud routing ([`CloudReasoningRouter`](../EchoGuide/Core/Router/CloudReasoningRouter.swift))
+
+```
+local confidence ≥ 0.85            → local answer, no network
+offline / no provider / cap hit    → local fallback (tagged)
+breaker open (3 failures, 60 s)    → local fallback
+otherwise                          → provider under a hard deadline; empty or late → local
+```
+
+- Providers (Gemini `generateContent`, OpenAI Chat Completions) talk only to the proxy.
+- The prompt's length scales with the request: 8 words for a step, 40 for a scene.
+
+## 8. Tools (MCP, [`PluginRegistry`](../EchoGuide/Core/Plugins/PluginRegistry.swift))
+
+- Each tool declares what it claims (labels, words in recognised text, barcode prefixes) and its side effect (`none`, `reversible` or `physical`).
+- The registry serves MCP `initialize`, `tools/list` and `tools/call` over JSON-RPC 2.0, and imports tools from remote MCP servers over Streamable HTTP. Remote tools default to `physical`, the most cautious setting.
+- Built-in tools are never shadowed by a remote tool with the same name.
+- A per-home `PluginManifest` names secrets without containing them; the app resolves them from the Keychain.
+
+## 9. Proxy ([`proxy/server.mjs`](../proxy/server.mjs))
+
+- Device bearer tokens are compared in constant time against SHA-256 hashes.
+- Each device gets a token-bucket rate limit, and the proxy enforces a model allow-list, output-token caps, a 2 MB body cap and a 10 s upstream timeout.
+- Speech-to-text gets a 30-second Deepgram token, so the phone opens the WebSocket directly.
+- Text-to-speech is streamed back chunk by chunk.
+
+## 10. Testing
+
+- 112 Swift tests cover every engine's pure logic: motion gating, the pipeline's back-pressure, geometry, the narrator's pacing and salience, reading order, every automation transition, fence depth rules, router fallbacks and the circuit breaker, MCP JSON-RPC, the plugins against stubbed HTTP, and the trial recorder's CSV.
+- CI also compiles the iOS-only code and the full app for the iOS Simulator.
+- Hardware behaviour (camera, Neural Engine, LiDAR, actuator) is measured on device with the in-app speed test.
+EOF_AVAE
+
+cat > 'infra/freestyle/.env.proxy.example' <<'EOF_AVAE'
+# Copy to .env.proxy (git-ignored). Values go only to the proxy VM.
+# sha256 of each device token the phones will present:  printf '%s' "$TOKEN" | shasum -a 256
+DEVICE_TOKEN_SHA256S=
+GEMINI_API_KEY=
+OPENAI_API_KEY=
+DEEPGRAM_API_KEY=
+ELEVENLABS_API_KEY=
+ALLOWED_MODELS=gemini-2.5-flash,gpt-4o
+RATE_PER_MINUTE=30
+EOF_AVAE
+
+cat > 'infra/freestyle/.gitignore' <<'EOF_AVAE'
+.env.proxy
+EOF_AVAE
+
+cat > 'infra/freestyle/README.md' <<'EOF_AVAE'
+# Freestyle deploy (demo backend)
+
+Two VMs, each published on a free `style.dev` domain. Freestyle is a workbench,
+not production hosting: fine for the hackathon, move the proxy to a real host
+before any public release.
+
+| Script | VM | Image | Port | Gives the app |
+|---|---|---|---|---|
+| `deploy-proxy.sh` | `echoguide-proxy` | `freestyle/ubuntu-sm` | 8787 | `EGProxyBaseURL` for the router and Maxwell's voice loop |
+| `deploy-kokoro.sh` | `echoguide-voice` | `freestyle/ubuntu`, resized to 8 vCPU / 16 GiB | 8880 | `KokoroSpeechProvider(baseURL:)` |
+
+```bash
+npx -y freestyle@latest login            # once, interactive
+cp infra/freestyle/.env.proxy.example infra/freestyle/.env.proxy   # fill in keys
+infra/freestyle/deploy-proxy.sh
+infra/freestyle/deploy-kokoro.sh
+```
+
+Both scripts are idempotent: re-run to update. Snapshot each VM once it works
+(`freestyle snapshot create <slug> --slug <slug>-ok`); a VM from the snapshot
+boots in about a second with the Kokoro model already loaded.
+
+## Measured (2026-10-17, from a laptop over the public domain)
+
+| Phrase | 4 vCPU | 8 vCPU |
+|---|---|---|
+| "Start. Move right." | 1.47 s | 0.77 s |
+| "Stop. Hob." | 0.83 s | 0.74 s |
+| "Oat milk. Contains oats." | 1.00 s | 0.66 s |
+| "Hold still." | | 0.48 s |
+
+Output is 24 kHz 16-bit mono WAV with a streaming header; `KokoroSpeechProvider`
+rewrites the RIFF sizes before playback. The provider timeout is 2.5 s; cached
+and prewarmed phrases skip the round trip.
+
+Live now: `https://echoguide-voice.style.dev` (snapshot `echoguide-voice-ok`).
+
+Cost: the voice VM is 8 vCPU / 16 GiB, about $0.53 per hour awake against the
+team's credits. Pause it between sessions (`freestyle vm pause echoguide-voice`):
+a paused VM bills storage only, and a VM from the snapshot boots with the model
+already loaded.
+EOF_AVAE
+
+cat > 'infra/freestyle/deploy-kokoro.sh' <<'EOF_AVAE'
+#!/usr/bin/env bash
+# Runs the open-weight Kokoro voice (Kokoro-FastAPI, CPU image) on a Freestyle
+# VM and publishes it at https://<SLUG>.style.dev. The app's
+# KokoroSpeechProvider(baseURL:) takes that URL unchanged.
+#
+#   infra/freestyle/deploy-kokoro.sh
+#   SLUG=echoguide-voice-bryan infra/freestyle/deploy-kokoro.sh
+set -euo pipefail
+
+SLUG="${SLUG:-echoguide-voice}"
+DOMAIN="${DOMAIN:-$SLUG.style.dev}"
+PORT=8880
+IMAGE="${IMAGE:-ghcr.io/remsky/kokoro-fastapi-cpu:latest}"
+FS="npx -y freestyle@latest"
+
+# Default Ubuntu image: 4 vCPU / 8 GiB, Docker running from boot.
+if ! $FS --output json vm get "$SLUG" >/dev/null 2>&1; then
+  echo "creating VM $SLUG"
+  $FS vm create --slug "$SLUG" --snapshot-id freestyle/ubuntu --no-ssh \
+    --display-name "EchoGuide Kokoro voice" --metadata app=echoguide --metadata role=voice >/dev/null
+fi
+$FS vm start "$SLUG" >/dev/null 2>&1 || true
+# Kokoro's CPU inference is multi-threaded: 8 vCPU halves phrase latency
+# (0.5-0.8 s instead of 0.8-1.5 s). Grow-only, so a no-op after the first run.
+$FS vm resize "$SLUG" --cpu 8 --memory 16384 >/dev/null 2>&1 || true
+
+echo "pulling $IMAGE (a few GB, first time only)"
+$FS vm exec "$SLUG" --linux-user root --timeout-ms 900000 -- docker pull "$IMAGE"
+$FS vm exec "$SLUG" --linux-user root -- sh -c "docker rm -f kokoro >/dev/null 2>&1 || true"
+$FS vm exec "$SLUG" --linux-user root -- docker run -d --name kokoro --restart unless-stopped \
+  -p "$PORT:$PORT" "$IMAGE"
+
+echo "waiting for the model to load"
+for i in $(seq 1 90); do
+  CODE=$($FS vm exec "$SLUG" --linux-user root -- python3 -c "import urllib.request,sys
+try: print(urllib.request.urlopen('http://localhost:$PORT/v1/audio/voices',timeout=5).status)
+except Exception as e: print(getattr(e,'code',0))" | tr -d '\r\n')
+  [ "$CODE" = "200" ] && break
+  sleep 2
+done
+echo "kokoro answers locally with HTTP $CODE"
+
+if ! $FS --output json tls list --vm "$SLUG" 2>/dev/null | grep -q "\"$DOMAIN\""; then
+  $FS tls create --domain "$DOMAIN" --from public --to "vm=$SLUG,port=$PORT" >/dev/null
+fi
+
+echo
+echo "voice:  https://$DOMAIN"
+echo "try:    curl -s https://$DOMAIN/v1/audio/speech -H 'Content-Type: application/json' \\"
+echo "          -d '{\"model\":\"kokoro\",\"input\":\"Start. Move right.\",\"voice\":\"af_heart\",\"response_format\":\"wav\"}' -o out.wav && afplay out.wav"
+echo "app:    SpatialAudioEngine(speech: KokoroSpeechProvider(baseURL: URL(string: \"https://$DOMAIN\")!))"
+echo "Snapshot it once it works, so the loaded model comes back instantly:"
+echo "        npx -y freestyle@latest snapshot create $SLUG --slug $SLUG-ok"
+EOF_AVAE
+
+cat > 'infra/freestyle/deploy-proxy.sh' <<'EOF_AVAE'
+#!/usr/bin/env bash
+# Deploys proxy/server.mjs to a Freestyle VM and publishes it at
+# https://<SLUG>.style.dev. Re-running updates the code and restarts the service.
+#
+#   infra/freestyle/deploy-proxy.sh            # uses infra/freestyle/.env.proxy
+#   SLUG=echoguide-proxy-bryan infra/freestyle/deploy-proxy.sh
+#
+# .env.proxy holds the proxy's environment (see proxy/server.mjs header):
+#   DEVICE_TOKEN_SHA256S=<sha256 of each device token, comma separated>
+#   GEMINI_API_KEY=... DEEPGRAM_API_KEY=... ELEVENLABS_API_KEY=...
+# It is git-ignored and never leaves this folder except onto the VM.
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+
+SLUG="${SLUG:-echoguide-proxy}"
+DOMAIN="${DOMAIN:-$SLUG.style.dev}"
+PORT=8787
+ENV_FILE="${ENV_FILE:-infra/freestyle/.env.proxy}"
+FS="npx -y freestyle@latest"
+
+[ -f "$ENV_FILE" ] || { echo "missing $ENV_FILE (copy infra/freestyle/.env.proxy.example)"; exit 1; }
+grep -q '^DEVICE_TOKEN_SHA256S=.\+' "$ENV_FILE" || { echo "$ENV_FILE needs DEVICE_TOKEN_SHA256S"; exit 1; }
+
+# 1. VM: a zero-dependency Node proxy needs the small Ubuntu image.
+if ! $FS --output json vm get "$SLUG" >/dev/null 2>&1; then
+  echo "creating VM $SLUG"
+  $FS vm create --slug "$SLUG" --snapshot-id freestyle/ubuntu-sm --no-ssh \
+    --display-name "EchoGuide key proxy" --metadata app=echoguide --metadata role=proxy >/dev/null
+fi
+$FS vm start "$SLUG" >/dev/null 2>&1 || true
+
+# 2. Code and environment.
+$FS vm exec "$SLUG" --linux-user root -- mkdir -p /srv/echoguide-proxy
+$FS vm fs write "$SLUG" /srv/echoguide-proxy/server.mjs proxy/server.mjs
+$FS vm fs write "$SLUG" /srv/echoguide-proxy/package.json proxy/package.json
+$FS vm fs write "$SLUG" /srv/echoguide-proxy/.env "$ENV_FILE"
+$FS vm exec "$SLUG" --linux-user root -- chmod 600 /srv/echoguide-proxy/.env
+
+# 3. systemd unit. Node is under nvm on the Ubuntu image; use the absolute path.
+NODE=$($FS vm exec "$SLUG" --linux-user root -- sh -c 'ls /usr/local/nvm/versions/node/*/bin/node 2>/dev/null | head -1 || command -v node' | tr -d '\r\n')
+[ -n "$NODE" ] || { echo "node not found on VM"; exit 1; }
+UNIT=$(mktemp)
+cat > "$UNIT" <<UNIT
+[Unit]
+Description=EchoGuide key proxy
+After=network.target
+
+[Service]
+ExecStart=$NODE /srv/echoguide-proxy/server.mjs
+WorkingDirectory=/srv/echoguide-proxy
+EnvironmentFile=/srv/echoguide-proxy/.env
+Environment=PORT=$PORT
+Environment=HOME=/root
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+$FS vm fs write "$SLUG" /etc/systemd/system/echoguide-proxy.service "$UNIT"
+rm -f "$UNIT"
+$FS vm exec "$SLUG" --linux-user root -- sh -c 'systemctl daemon-reload && systemctl enable --now echoguide-proxy && systemctl restart echoguide-proxy'
+
+# 4. Wait for it, then publish.
+for i in $(seq 1 30); do
+  CODE=$($FS vm exec "$SLUG" --linux-user root -- python3 -c "import urllib.request,sys
+try: print(urllib.request.urlopen('http://localhost:$PORT/healthz',timeout=5).status)
+except Exception as e: print(getattr(e,'code',0))" | tr -d '\r\n')
+  case "$CODE" in 2*|4*) break;; esac
+  sleep 1
+done
+echo "proxy answers locally with HTTP $CODE"
+
+if ! $FS --output json tls list --vm "$SLUG" 2>/dev/null | grep -q "\"$DOMAIN\""; then
+  $FS tls create --domain "$DOMAIN" --from public --to "vm=$SLUG,port=$PORT" >/dev/null
+fi
+echo
+echo "proxy:  https://$DOMAIN"
+echo "Set EGProxyBaseURL in EchoGuideApp/Info.plist to that URL (Maxwell's file)."
+echo "Snapshot it once it works:  npx -y freestyle@latest snapshot create $SLUG --slug $SLUG-ok"
 EOF_AVAE
 
 cat > 'plugins/smart_home_server.py' <<'EOF_AVAE'
@@ -8282,7 +8971,7 @@ print(f"wrote project with {len(srcs)} sources")
 EOF_AVAE
 
 cat > 'scripts/regen_setup.py' <<'EOF_AVAE'
-# Owner: Maxwell. Regenerates setup_repo.sh from the tracked files. Run from the repo root: python3 scripts/regen_setup.py
+# Owner: Maxwell. Regenerates scripts/setup_repo.sh from the tracked files. Run from the repo root: python3 scripts/regen_setup.py
 import subprocess, os, base64
 HEAD = '''#!/usr/bin/env bash
 # Recreates the AutoVision Audio Engine repo from scratch, commits, and pushes.
@@ -8305,7 +8994,7 @@ echo "Pushed to $REMOTE_URL"
 '''
 D = 'EOF_' + 'AVAE'  # built at runtime so this file can embed itself
 files = sorted(f for f in subprocess.check_output(['git', 'ls-files', '--others', '--cached', '--exclude-standard']).decode().split()
-               if f != 'setup_repo.sh')
+               if f != 'scripts/setup_repo.sh')
 out = [HEAD, 'mkdir -p ' + ' '.join(sorted({os.path.dirname(f) for f in files if os.path.dirname(f)})), '']
 for f in files:
     data = open(f, 'rb').read()
@@ -8314,7 +9003,7 @@ for f in files:
         out += [f"base64 --decode > '{f}' <<'{D}'", base64.b64encode(data).decode(), D, '']
     else:
         out += [f"cat > '{f}' <<'{D}'", data.decode().rstrip('\n'), D, '']
-open('setup_repo.sh', 'w').write('\n'.join(out) + '\n' + TAIL)
+open('scripts/setup_repo.sh', 'w').write('\n'.join(out) + '\n' + TAIL)
 EOF_AVAE
 
 git init -q -b main

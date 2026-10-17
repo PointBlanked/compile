@@ -62,6 +62,12 @@ let package = Package(
             exclude: ["Contracts", "Camera", "Vision", "Fence", "Haptics", "Depth", "Audio", "Automation", "Cognitive"],
             sources: ["Plugins", "Router", "Agent"]
         ),
+        // Maxwell: reproducible benchmarks of the real engine code. `swift run -c release EchoGuideBench`
+        .executableTarget(
+            name: "EchoGuideBench",
+            dependencies: ["EchoGuideContracts", "EchoGuideVision", "EchoGuideInfra"],
+            path: "EchoGuideBench"
+        ),
         .testTarget(
             name: "EchoGuideTests",
             dependencies: [

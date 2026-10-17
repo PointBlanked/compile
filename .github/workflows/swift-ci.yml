@@ -24,6 +24,14 @@ jobs:
         run: swift test --parallel
       - name: Release build (optimizer catches different issues)
         run: swift build -c release
+      - name: Benchmarks (real engine code, this runner)
+        run: |
+          swift run -c release EchoGuideBench
+          cat benchmarks/results/*.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmarks/results/
 
   ios-build:
     name: Compile iOS paths (ARKit, CoreHaptics, camera)

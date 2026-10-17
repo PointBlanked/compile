@@ -1,4 +1,4 @@
-# Owner: Maxwell. Regenerates setup_repo.sh from the tracked files. Run from the repo root: python3 scripts/regen_setup.py
+# Owner: Maxwell. Regenerates scripts/setup_repo.sh from the tracked files. Run from the repo root: python3 scripts/regen_setup.py
 import subprocess, os, base64
 HEAD = '''#!/usr/bin/env bash
 # Recreates the AutoVision Audio Engine repo from scratch, commits, and pushes.
@@ -21,7 +21,7 @@ echo "Pushed to $REMOTE_URL"
 '''
 D = 'EOF_' + 'AVAE'  # built at runtime so this file can embed itself
 files = sorted(f for f in subprocess.check_output(['git', 'ls-files', '--others', '--cached', '--exclude-standard']).decode().split()
-               if f != 'setup_repo.sh')
+               if f != 'scripts/setup_repo.sh')
 out = [HEAD, 'mkdir -p ' + ' '.join(sorted({os.path.dirname(f) for f in files if os.path.dirname(f)})), '']
 for f in files:
     data = open(f, 'rb').read()
@@ -30,4 +30,4 @@ for f in files:
         out += [f"base64 --decode > '{f}' <<'{D}'", base64.b64encode(data).decode(), D, '']
     else:
         out += [f"cat > '{f}' <<'{D}'", data.decode().rstrip('\n'), D, '']
-open('setup_repo.sh', 'w').write('\n'.join(out) + '\n' + TAIL)
+open('scripts/setup_repo.sh', 'w').write('\n'.join(out) + '\n' + TAIL)
