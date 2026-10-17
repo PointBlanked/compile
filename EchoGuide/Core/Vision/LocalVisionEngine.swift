@@ -16,6 +16,10 @@ public struct LocalVisionConfig: Sendable {
     public var minimumConfidence: Float = 0.35
     /// Run OCR on every Nth inferred frame (1 = always, 0 = never).
     public var ocrEveryNthFrame = 3
+    /// Vision's accurate recogniser with language correction: roughly ten
+    /// times slower than fast, far better on small print. Read mode turns it
+    /// on; Explore and Find keep the fast level inside the frame budget.
+    public var accurateText = false
     public var detectFingertip = true
     /// Barcodes ride the OCR cadence: both are "read the label" work.
     public var detectBarcodes = true
@@ -79,6 +83,9 @@ public actor LocalVisionEngine {
     /// Read mode wants text on every frame; Explore and Find keep the cheaper cadence.
     public func setTextEveryNthFrame(_ n: Int) { config.ocrEveryNthFrame = max(0, n) }
 
+    /// Read mode wants the accurate recogniser; the others want speed.
+    public func setTextQuality(accurate: Bool) { config.accurateText = accurate }
+
     public func process(_ frame: CameraFrame, orientation: CGImagePropertyOrientation = .right) -> VisionFrameResult {
         let timer = FrameTimer()
         frameCount += 1
@@ -91,8 +98,8 @@ public actor LocalVisionEngine {
         if config.detectFingertip { requests.append(hand) }
 
         let text = VNRecognizeTextRequest()
-        text.recognitionLevel = .fast
-        text.usesLanguageCorrection = false
+        text.recognitionLevel = config.accurateText ? .accurate : .fast
+        text.usesLanguageCorrection = config.accurateText
         let runOCR = config.ocrEveryNthFrame > 0 && frameCount % UInt64(config.ocrEveryNthFrame) == 0
         if runOCR { requests.append(text) }
 

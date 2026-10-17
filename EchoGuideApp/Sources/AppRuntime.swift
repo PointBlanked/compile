@@ -180,12 +180,15 @@ final class AppRuntime {
         case .read:
             pipeline?.setIdleRefresh(0.5)
             await vision?.setTextEveryNthFrame(1)
+            await vision?.setTextQuality(accurate: true)
         case .explore:
             pipeline?.setIdleRefresh(1.0)
             await vision?.setTextEveryNthFrame(3)
+            await vision?.setTextQuality(accurate: false)
         case .find:
             pipeline?.setIdleRefresh(3.0)
             await vision?.setTextEveryNthFrame(2)
+            await vision?.setTextQuality(accurate: false)
         }
         await agent?.setMode(m)
         pipeline?.forceNextFrame()

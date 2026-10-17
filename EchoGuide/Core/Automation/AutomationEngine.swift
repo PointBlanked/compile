@@ -56,12 +56,17 @@ public actor AutomationEngine {
     private let tools: ToolInvoking?
 
     private var lastSpokenLabel: String?
+    /// Where the last announced target was, so a different OCR reading of the
+    /// same button at the same place is not announced again.
+    private var lastSpokenBox: ImageRect?
+    private var lastSpokenPlainLabel: String?
     private var lastSpokenAt: TimeInterval = -.infinity
     private var lastReminderAt: TimeInterval = -.infinity
     private var lastPingAt: TimeInterval = -.infinity
     private var lastSeenAt: TimeInterval = -.infinity
     private var onTargetSince: TimeInterval?
     private var completedUntil: [String: TimeInterval] = [:]
+    private var completedBoxes: [String: CognitiveTaskIsolation.ExcludedRegion] = [:]
     private var lastFenceWarning: [String: TimeInterval] = [:]
     private var routedLabels: Set<String> = []
     private var continuations: [UUID: AsyncStream<AutomationState>.Continuation] = [:]
@@ -123,8 +128,9 @@ public actor AutomationEngine {
         isolation.goal = goal
         isolation.reset()
         completedUntil = [:]
+        completedBoxes = [:]
         routedLabels = []
-        lastSpokenLabel = nil
+        lastSpokenLabel = nil; lastSpokenBox = nil; lastSpokenPlainLabel = nil
         onTargetSince = nil
     }
 
@@ -146,7 +152,7 @@ public actor AutomationEngine {
     private func forgetTarget() {
         isolation.reset()
         onTargetSince = nil
-        lastSpokenLabel = nil
+        lastSpokenLabel = nil; lastSpokenBox = nil; lastSpokenPlainLabel = nil
         lastSeenAt = -.infinity
     }
 
@@ -161,8 +167,11 @@ public actor AutomationEngine {
 
         // Recently finished targets are off the menu; prune expired ones.
         completedUntil = completedUntil.filter { $0.value > now }
+        completedBoxes = completedBoxes.filter { completedUntil[$0.key] != nil }
         let excluded = Set(completedUntil.keys)
         if excluded != isolation.excludedLabels { isolation.excludedLabels = excluded }
+        let regions = Array(completedBoxes.values)
+        if regions != isolation.excludedRegions { isolation.excludedRegions = regions }
 
         let step = isolation.isolate(frame)
         if step != nil, isolation.isCurrentVisible { lastSeenAt = now }
@@ -175,7 +184,7 @@ public actor AutomationEngine {
                 // keeps its frame count (frames are sparse in a still scene).
                 if step != nil { isolation.reset() }
                 onTargetSince = nil
-                lastSpokenLabel = nil
+                lastSpokenLabel = nil; lastSpokenBox = nil; lastSpokenPlainLabel = nil
                 await haptics.stop()
                 transition(.scanning)
             }
@@ -241,27 +250,51 @@ public actor AutomationEngine {
     /// True when a `.none` side-effect tool claimed the target and was run.
     private func fireReadOnlyTool(for step: ActionStep, at now: TimeInterval) async -> Bool {
         guard let target = step.target, let tools, let match = await tools.match(target), match.sideEffect == .none else { return false }
-        completedUntil[key(step)] = now + config.completedCooldown
+        markCompleted(step, at: now)
         onTargetSince = nil
         await haptics.stop()
         do {
             let said = try await tools.invoke(match)
             lastSpokenLabel = key(step)
+            lastSpokenPlainLabel = step.targetLabel
+            lastSpokenBox = target.box
             lastSpokenAt = now
             await audio.speak(said, azimuth: 0)
             transition(.completed(said))
         } catch {
-            completedUntil[key(step)] = nil
+            unmarkCompleted(step)
             await audio.speak("I could not read that.", azimuth: 0)
             transition(.completed(step.targetLabel))
         }
         return true
     }
 
+    /// Same thing as last announced: same key, or same label at the same place
+    /// (OCR read the characters differently this frame).
+    private func isSameAsLastSpoken(_ step: ActionStep) -> Bool {
+        if key(step) == lastSpokenLabel { return true }
+        guard step.target?.kind == .text, step.targetLabel == lastSpokenPlainLabel,
+              let box = step.target?.box, let last = lastSpokenBox else { return false }
+        return box.iou(last) >= 0.3
+    }
+
+    /// Remember a finished target by key and by place for the cooldown.
+    private func markCompleted(_ step: ActionStep, at now: TimeInterval) {
+        completedUntil[key(step)] = now + config.completedCooldown
+        if let t = step.target, t.kind == .text { completedBoxes[key(step)] = .init(label: t.label, box: t.box) }
+    }
+
+    private func unmarkCompleted(_ step: ActionStep) {
+        completedUntil[key(step)] = nil
+        completedBoxes[key(step)] = nil
+    }
+
     private func announceIfNeeded(_ step: ActionStep, at now: TimeInterval) async {
-        let isNew = key(step) != lastSpokenLabel
+        let isNew = !isSameAsLastSpoken(step)
         guard isNew || now - lastSpokenAt >= config.repeatInstructionAfter else { return }
         lastSpokenLabel = key(step)
+        lastSpokenPlainLabel = step.targetLabel
+        lastSpokenBox = step.target?.box
         lastSpokenAt = now
 
         var sentence = step.instruction
@@ -283,7 +316,7 @@ public actor AutomationEngine {
 
     private func complete(_ step: ActionStep, at now: TimeInterval) async {
         onTargetSince = nil
-        completedUntil[key(step)] = now + config.completedCooldown
+        markCompleted(step, at: now)
 
         await haptics.stop()
 
@@ -298,7 +331,7 @@ public actor AutomationEngine {
             transition(.completed(said))
         } catch {
             // Not excluded: the user should be able to settle on it and try again.
-            completedUntil[key(step)] = nil
+            unmarkCompleted(step)
             await audio.speak("That did not work.", azimuth: 0)
             transition(.completed(step.targetLabel))
         }

@@ -53,8 +53,31 @@ public struct CognitiveTaskIsolation: Sendable {
         }
     }
 
+    /// A finished target also stays off the menu by *place*: OCR may read the
+    /// same button as START, STAR T or 5TART from frame to frame, and none of
+    /// those should guide the finger straight back to it.
+    public struct ExcludedRegion: Sendable, Equatable {
+        public var label: String
+        public var box: ImageRect
+        public init(label: String, box: ImageRect) {
+            self.label = label
+            self.box = box
+        }
+    }
+
+    public var excludedRegions: [ExcludedRegion] = [] {
+        didSet {
+            if let cur = current, isExcluded(cur) { current = nil }
+            if let c = candidate, isExcluded(c) { candidate = nil; candidateFrames = 0 }
+        }
+    }
+
     private func isExcluded(_ d: Detection) -> Bool {
-        excludedLabels.contains(d.stepKey) || excludedLabels.contains(d.label)
+        if excludedLabels.contains(d.stepKey) || excludedLabels.contains(d.label) { return true }
+        // Only OCR is noisy enough to need place-based exclusion. A barcode at
+        // the same spot with a different payload is a different product.
+        guard d.kind == .text else { return false }
+        return excludedRegions.contains { $0.label == d.label && $0.box.iou(d.box) >= config.sameTargetIoU }
     }
 
     private var current: Detection?

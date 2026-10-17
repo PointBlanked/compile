@@ -565,6 +565,38 @@ struct StubListener: GoalListening {
         #expect(await a.spoken.last?.hasPrefix("STOP.") == true)
     }
 
+    @Test func misreadTextAtTheSamePlaceIsNotReannounced() async {
+        // Fast OCR reads the same button as START, STAR T, 5TART across frames.
+        let (e, _, a) = engine()
+        await e.start()
+        let f = { (reading: String, t: TimeInterval) in
+            frame([det("text", x: 0.7, y: 0.5, kind: .text, text: reading), tip(x: 0.4, y: 0.5)], t: t)
+        }
+        await e.ingest(f("START", 0))
+        #expect(await a.spoken.count == 1)
+        await e.ingest(f("STAR T", 0.1))
+        await e.ingest(f("5TART", 0.2))
+        await e.ingest(f("START", 0.3))
+        #expect(await a.spoken.count == 1)
+        // A different word somewhere else is new.
+        await e.ingest(frame([det("text", x: 0.7, y: 0.5, kind: .text, text: "START"), det("text", x: 0.2, y: 0.2, size: 0.3, kind: .text, text: "STOP"), tip(x: 0.2, y: 0.2)], t: 0.4))
+        #expect(await a.spoken.count == 2)
+    }
+
+    @Test func misreadVariantOfFinishedButtonStaysExcluded() async {
+        let (e, _, _) = engine()
+        await e.start()
+        let start = { (reading: String) in det("text", x: 0.5, y: 0.5, kind: .text, text: reading) }
+        let stop = det("text", x: 0.2, y: 0.2, size: 0.08, kind: .text, text: "STOP")
+        await e.ingest(frame([start("START"), stop, tip(x: 0.5, y: 0.5)], t: 0))
+        await e.ingest(frame([start("START"), stop, tip(x: 0.5, y: 0.5)], t: 1))
+        #expect(await e.state == .completed("text"))
+        // Next frame OCR misreads the finished button: still excluded, by place.
+        await e.ingest(frame([start("5TART"), stop, tip(x: 0.5, y: 0.5)], t: 1.1))
+        guard case .guiding(let step) = await e.state else { Issue.record("expected guiding to STOP"); return }
+        #expect(step.target?.text == "STOP")
+    }
+
     @Test func readOnlyToolFiresOnSightWithoutDwell() async {
         let registry = PluginRegistry()
         let looked = Counter()

@@ -7,3 +7,6 @@ DerivedData/
 *.mlpackage/
 __pycache__/
 .venv/
+# local YOLO export scratch
+yolo/
+*.pt
