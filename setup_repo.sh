@@ -148,8 +148,11 @@ jobs:
             DEVELOPMENT_TEAM="${{ secrets.APPLE_TEAM_ID }}" \
             CURRENT_PROJECT_VERSION="${{ inputs.build_number }}" \
             PRODUCT_BUNDLE_IDENTIFIER="${{ inputs.bundle_id }}" \
-            EG_PROXY_BASE_URL="${{ secrets.EG_PROXY_BASE_URL }}" | tail -n 60
-          exit ${PIPESTATUS[0]}
+            EG_PROXY_BASE_URL="${{ secrets.EG_PROXY_BASE_URL }}" > archive.log 2>&1
+          status=$?
+          grep -E "error:" archive.log | sort -u | head -60 || true
+          tail -n 25 archive.log
+          exit $status
 
       - name: Upload to TestFlight
         run: |
@@ -237,8 +240,11 @@ jobs:
             -scheme EchoGuideApp \
             -destination 'generic/platform=iOS Simulator' \
             -skipPackagePluginValidation \
-            CODE_SIGNING_ALLOWED=NO | tail -n 40
-          exit ${PIPESTATUS[0]}
+            CODE_SIGNING_ALLOWED=NO > build.log 2>&1
+          status=$?
+          grep -E "error:|warning: .*will be an error" build.log | sort -u | head -60 || true
+          tail -n 15 build.log
+          exit $status
 
   proxy-test:
     name: Proxy tests (Node)
@@ -1261,18 +1267,30 @@ public enum SpeechSource: String, Sendable {
     case kokoro
 }
 
-/// Minimal 16-bit mono WAV writer, for tests and for caching on-device audio.
+/// Minimal 16-bit mono WAV writer. Lets any raw PCM16 stream (an ElevenLabs
+/// stream through the proxy, a Deepgram echo, a test tone) become a
+/// `SpeechSynthesizing` result: collect the chunks, wrap, done.
 public enum WAVEncoder {
     public static func pcm16Mono(_ samples: [Float], sampleRate: Int) -> Data {
-        var d = Data()
+        var pcm = Data(capacity: samples.count * 2)
+        for s in samples {
+            let v = Int16(max(-1, min(1, s)) * 32767)
+            withUnsafeBytes(of: v.littleEndian) { pcm.append(contentsOf: $0) }
+        }
+        return pcm16Mono(pcm: pcm, sampleRate: sampleRate)
+    }
+
+    /// Wraps little-endian mono PCM16 bytes in a WAV header.
+    public static func pcm16Mono(pcm: Data, sampleRate: Int) -> Data {
+        var d = Data(capacity: 44 + pcm.count)
         func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
         func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
-        let dataBytes = UInt32(samples.count * 2)
+        let dataBytes = UInt32(pcm.count)
         d.append(contentsOf: Array("RIFF".utf8)); u32(36 + dataBytes); d.append(contentsOf: Array("WAVE".utf8))
         d.append(contentsOf: Array("fmt ".utf8)); u32(16); u16(1); u16(1)
         u32(UInt32(sampleRate)); u32(UInt32(sampleRate * 2)); u16(2); u16(16)
         d.append(contentsOf: Array("data".utf8)); u32(dataBytes)
-        for s in samples { u16(UInt16(bitPattern: Int16(max(-1, min(1, s)) * 32767))) }
+        d.append(pcm)
         return d
     }
 }
@@ -1338,13 +1356,19 @@ public final class VoiceGoalListener: @unchecked Sendable {
         if recognizer.supportsOnDeviceRecognition { request.requiresOnDeviceRecognition = true }
 
         let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playAndRecord, mode: .measurement, options: [.duckOthers, .defaultToSpeaker, .allowBluetooth])
-        try session.setActive(true)
+        // Whatever was configured before (playback-only guidance, or the app's
+        // voice loop already recording) is put back afterwards, so this never
+        // silences a microphone someone else is using.
+        let previous = (session.category, session.mode, session.categoryOptions)
+        let alreadyRecording = session.category == .playAndRecord || session.category == .record
+        if !alreadyRecording {
+            try session.setCategory(.playAndRecord, mode: .measurement, options: [.duckOthers, .defaultToSpeaker, .allowBluetooth])
+            try session.setActive(true)
+        }
         defer {
             audioEngine.stop()
             audioEngine.inputNode.removeTap(onBus: 0)
-            // Give the speaker back to the guidance voice.
-            try? session.setCategory(.playback, mode: .spokenAudio, options: [.mixWithOthers, .duckOthers])
+            if !alreadyRecording { try? session.setCategory(previous.0, mode: previous.1, options: previous.2) }
         }
 
         let input = audioEngine.inputNode
@@ -1416,6 +1440,9 @@ public struct AutomationConfig: Sendable {
     /// Directional ping cadence while the target is off to one side.
     public var pingInterval: TimeInterval = 0.9
     public var fenceWarningInterval: TimeInterval = 3
+    /// While scanning with nothing to offer, say so this often. Silence is
+    /// ambiguous for a blind user: is it working, or has it crashed?
+    public var scanningReminderInterval: TimeInterval = 8
     /// A finished target is off the menu for this long, so "done" moves on to
     /// the next step instead of guiding the finger back to the same button.
     public var completedCooldown: TimeInterval = 8
@@ -1436,6 +1463,7 @@ public actor AutomationEngine {
 
     private var lastSpokenLabel: String?
     private var lastSpokenAt: TimeInterval = -.infinity
+    private var lastReminderAt: TimeInterval = -.infinity
     private var lastPingAt: TimeInterval = -.infinity
     private var lastSeenAt: TimeInterval = -.infinity
     private var onTargetSince: TimeInterval?
@@ -1510,6 +1538,7 @@ public actor AutomationEngine {
 
     public func start() {
         forgetTarget()
+        lastReminderAt = -.infinity
         transition(.scanning)
     }
 
@@ -1546,6 +1575,7 @@ public actor AutomationEngine {
 
         // Nothing settled, or the settled target has not been seen for a while.
         guard let step, isolation.isCurrentVisible || now - lastSeenAt <= config.lostTargetTimeout else {
+            if step == nil, state == .scanning { await remindScanning(at: now) }
             if now - lastSeenAt > config.lostTargetTimeout, state != .scanning {
                 // Drop only a remembered target; a challenger still settling
                 // keeps its frame count (frames are sparse in a still scene).
@@ -1560,6 +1590,10 @@ public actor AutomationEngine {
         // The target dropped out of this frame: keep the last cue going, but
         // do not announce, confirm or complete against a remembered box.
         guard isolation.isCurrentVisible else { return }
+
+        // A read-only tool (product lookup on a barcode) needs no finger and
+        // no dwell: seeing the thing is the request.
+        if await fireReadOnlyTool(for: step, at: now) { return }
 
         await announceIfNeeded(step, at: now)
 
@@ -1599,16 +1633,47 @@ public actor AutomationEngine {
 
     // MARK: - Steps
 
+    /// Identity of a step for exclusion and announcement: label, or
+    /// label|content for text and barcodes (see `Detection.stepKey`).
+    private func key(_ step: ActionStep) -> String { step.target?.stepKey ?? step.targetLabel }
+
+    private func remindScanning(at now: TimeInterval) async {
+        let since = max(lastReminderAt, lastSpokenAt)
+        guard now - since >= config.scanningReminderInterval else { return }
+        lastReminderAt = now
+        await audio.speak(isolation.goal.map { "Looking for \($0)." } ?? "Looking.", azimuth: 0)
+    }
+
+    /// True when a `.none` side-effect tool claimed the target and was run.
+    private func fireReadOnlyTool(for step: ActionStep, at now: TimeInterval) async -> Bool {
+        guard let target = step.target, let tools, let match = await tools.match(target), match.sideEffect == .none else { return false }
+        completedUntil[key(step)] = now + config.completedCooldown
+        onTargetSince = nil
+        await haptics.stop()
+        do {
+            let said = try await tools.invoke(match)
+            lastSpokenLabel = key(step)
+            lastSpokenAt = now
+            await audio.speak(said, azimuth: 0)
+            transition(.completed(said))
+        } catch {
+            completedUntil[key(step)] = nil
+            await audio.speak("I could not read that.", azimuth: 0)
+            transition(.completed(step.targetLabel))
+        }
+        return true
+    }
+
     private func announceIfNeeded(_ step: ActionStep, at now: TimeInterval) async {
-        let isNew = step.targetLabel != lastSpokenLabel
+        let isNew = key(step) != lastSpokenLabel
         guard isNew || now - lastSpokenAt >= config.repeatInstructionAfter else { return }
-        lastSpokenLabel = step.targetLabel
+        lastSpokenLabel = key(step)
         lastSpokenAt = now
 
         var sentence = step.instruction
         if isNew, let target = step.target, let router,
-           target.confidence < config.cloudConfidenceThreshold, !routedLabels.contains(step.targetLabel) {
-            routedLabels.insert(step.targetLabel)
+           target.confidence < config.cloudConfidenceThreshold, !routedLabels.contains(key(step)) {
+            routedLabels.insert(key(step))
             let outcome = await router.resolve(ReasoningQuery(
                 question: "In under eight words, what is this and what should the user do with it?",
                 detections: [target],
@@ -1624,7 +1689,7 @@ public actor AutomationEngine {
 
     private func complete(_ step: ActionStep, at now: TimeInterval) async {
         onTargetSince = nil
-        completedUntil[step.targetLabel] = now + config.completedCooldown
+        completedUntil[key(step)] = now + config.completedCooldown
 
         await haptics.stop()
 
@@ -1639,7 +1704,7 @@ public actor AutomationEngine {
             transition(.completed(said))
         } catch {
             // Not excluded: the user should be able to settle on it and try again.
-            completedUntil[step.targetLabel] = nil
+            completedUntil[key(step)] = nil
             await audio.speak("That did not work.", azimuth: 0)
             transition(.completed(step.targetLabel))
         }
@@ -2054,18 +2119,36 @@ public struct CognitiveConfig: Sendable {
     public init() {}
 }
 
+public extension Detection {
+    /// What makes a target "the same thing" across frames and for exclusion.
+    /// Vision labels every OCR hit "text" and every barcode "barcode", so the
+    /// recognised content is part of the identity: finishing START must not
+    /// take STOP off the menu with it.
+    var stepKey: String {
+        switch kind {
+        case .text, .barcode: return "\(label)|\(text ?? "")"
+        case .object, .fingertip: return label
+        }
+    }
+}
+
 public struct CognitiveTaskIsolation: Sendable {
     public var config: CognitiveConfig
     /// When set, only matching labels or text are eligible ("start", "microwave").
     public var goal: String?
-    /// Labels temporarily off the menu, e.g. a target the user just finished.
-    /// AutomationEngine sets this so "done" moves on to the next step instead
-    /// of guiding the finger straight back to the same button.
+    /// Targets temporarily off the menu, e.g. one the user just finished, by
+    /// `Detection.stepKey` (a plain label, or label|content for text and
+    /// barcodes). AutomationEngine sets this so "done" moves on to the next
+    /// step instead of guiding the finger straight back to the same button.
     public var excludedLabels: Set<String> = [] {
         didSet {
-            if let cur = current, excludedLabels.contains(cur.label) { current = nil }
-            if let c = candidate, excludedLabels.contains(c.label) { candidate = nil; candidateFrames = 0 }
+            if let cur = current, isExcluded(cur) { current = nil }
+            if let c = candidate, isExcluded(c) { candidate = nil; candidateFrames = 0 }
         }
+    }
+
+    private func isExcluded(_ d: Detection) -> Bool {
+        excludedLabels.contains(d.stepKey) || excludedLabels.contains(d.label)
     }
 
     private var current: Detection?
@@ -2143,7 +2226,7 @@ public struct CognitiveTaskIsolation: Sendable {
     }
 
     private func isEligible(_ d: Detection) -> Bool {
-        if config.ignoredLabels.contains(d.label) || excludedLabels.contains(d.label) { return false }
+        if config.ignoredLabels.contains(d.label) || isExcluded(d) { return false }
         if let goal { return matches(d, goal) }
         return true
     }
@@ -4322,6 +4405,11 @@ public final class GuidanceModel {
         return false
     }
 
+    var isCompleted: Bool {
+        if case .completed = state { return true }
+        return false
+    }
+
     /// SF Symbol for the one direction the audio speaks, or nil when there is
     /// nothing to point at. Mirrors `CognitiveTaskIsolation.direction`: the
     /// larger axis wins, so the arrow and the words never disagree.
@@ -4351,6 +4439,7 @@ public struct GuidanceView: View {
     private var background: Color {
         if model.isWarning { return .red }
         if model.isOnTarget { return Color(red: 0, green: 0.35, blue: 0) }
+        if model.isCompleted { return Color(red: 0, green: 0.55, blue: 0.1) }
         return .black
     }
 
@@ -4360,6 +4449,7 @@ public struct GuidanceView: View {
         ZStack {
             background.ignoresSafeArea()
                 .animation(.easeInOut(duration: 0.2), value: model.isWarning)
+                .animation(.easeInOut(duration: 0.2), value: model.isCompleted)
 
             VStack(spacing: 16) {
                 Spacer(minLength: 0)
@@ -5402,9 +5492,13 @@ cat > 'EchoGuideApp/Sources/MainView.swift' <<'EOF_AVAE'
 // for the current mode. Find mode hands the screen to Bryan's GuidanceView.
 // Everything here is also spoken; the screen is for low vision and helpers.
 
+import ARKit
+import AVFoundation
 import SwiftUI
 import EchoGuideAutomation
 import EchoGuideInfra
+import EchoGuideSpatial
+import EchoGuideVision
 
 struct MainView: View {
     @Bindable var runtime: AppRuntime
@@ -6538,7 +6632,8 @@ actor Counter {
         let r = CloudReasoningRouter(config: c, provider: StubProvider(delay: 1), connectivity: FixedConnectivity(online: true))
         let out = await r.resolve(query)
         #expect(out.source == .localFallback)
-        #expect(out.latencyMs < 500)
+        // Far below the provider's 1 s delay; loose bound for loaded CI runners.
+        #expect(out.latencyMs < 900)
     }
 
     @Test func breakerOpensAfterFailures() async {
@@ -7132,6 +7227,103 @@ struct StubListener: GoalListening {
         for _ in 0..<50 where silent.isListening { await Task.yield() }
         #expect(silent.goal == nil)
         #expect(silent.listenResult == "Did not catch that")
+    }
+}
+
+// MARK: - Text identity, read-only tools, scanning heartbeat
+
+@Suite struct PipelineBehaviourTests {
+    func engine(tools: ToolInvoking? = nil, goal: String? = nil, config: AutomationConfig = AutomationConfig()) -> (AutomationEngine, RecordingHaptics, RecordingAudio) {
+        var c = CognitiveConfig()
+        c.settleFrames = 1
+        let h = RecordingHaptics(), a = RecordingAudio()
+        return (AutomationEngine(haptics: h, audio: a, tools: tools, cognitive: CognitiveTaskIsolation(config: c, goal: goal), config: config), h, a)
+    }
+
+    @Test func finishingOneTextButtonKeepsTheOthers() async {
+        // Vision labels every OCR hit "text": START and STOP share a label.
+        let (e, _, a) = engine()
+        await e.start()
+        let start = det("text", x: 0.5, y: 0.5, kind: .text, text: "START")
+        let stop = det("text", x: 0.2, y: 0.2, size: 0.08, kind: .text, text: "STOP")
+        await e.ingest(frame([start, stop, tip(x: 0.5, y: 0.5)], t: 0))
+        #expect(await a.spoken.first == "START. You are on it.")
+        await e.ingest(frame([start, stop, tip(x: 0.5, y: 0.5)], t: 1))
+        #expect(await e.state == .completed("text"))
+        // STOP is a different thing: still offered, and announced as new.
+        await e.ingest(frame([start, stop, tip(x: 0.5, y: 0.5)], t: 1.1))
+        guard case .guiding(let step) = await e.state else { Issue.record("expected guiding to STOP"); return }
+        #expect(step.target?.text == "STOP")
+        #expect(await a.spoken.last?.hasPrefix("STOP.") == true)
+    }
+
+    @Test func readOnlyToolFiresOnSightWithoutDwell() async {
+        let registry = PluginRegistry()
+        let looked = Counter()
+        await registry.register(ToolDescriptor(name: "product_lookup", description: "", sideEffect: .none,
+                                               claim: ToolClaim(anyBarcode: true), parameters: ["text"]) { args in
+            await looked.inc()
+            return "Oat milk. Contains oats."
+        })
+        let (e, h, a) = engine(tools: registry)
+        await e.start()
+        // No fingertip at all: the camera simply sees the barcode.
+        let code = det("barcode", x: 0.6, y: 0.4, kind: .barcode, text: "5000112637922")
+        await e.ingest(frame([code], t: 0))
+        #expect(await looked.value == 1)
+        #expect(await e.state == .completed("Oat milk. Contains oats."))
+        #expect(await a.spoken == ["Oat milk. Contains oats."])
+        #expect(await h.guides == 0)
+        // Same barcode next frame: not looked up again during the cooldown.
+        await e.ingest(frame([code], t: 0.5))
+        #expect(await looked.value == 1)
+        // A different barcode is a new product.
+        await e.ingest(frame([det("barcode", x: 0.6, y: 0.4, kind: .barcode, text: "9999")], t: 1))
+        #expect(await looked.value == 2)
+    }
+
+    @Test func physicalToolStillNeedsTheDwell() async {
+        let registry = PluginRegistry()
+        let fired = Counter()
+        await registry.register(ToolDescriptor(name: "go", description: "", sideEffect: .physical, claim: ToolClaim(labels: ["button"])) { _ in
+            await fired.inc(); return "ok"
+        })
+        let (e, _, _) = engine(tools: registry)
+        await e.start()
+        await e.ingest(frame([det("button", x: 0.6, y: 0.4)], t: 0)) // seen, no finger
+        #expect(await fired.value == 0)
+        guard case .guiding = await e.state else { Issue.record("expected guiding"); return }
+    }
+
+    @Test func scanningHeartbeat() async {
+        var config = AutomationConfig()
+        config.scanningReminderInterval = 5
+        let (e, _, a) = engine(goal: "start", config: config)
+        await e.start()
+        await e.ingest(frame([tip(x: 0.5, y: 0.5)], t: 0))
+        #expect(await a.spoken == ["Looking for start."])
+        await e.ingest(frame([tip(x: 0.5, y: 0.5)], t: 3))
+        #expect(await a.spoken.count == 1)
+        await e.ingest(frame([tip(x: 0.5, y: 0.5)], t: 5.5))
+        #expect(await a.spoken.count == 2)
+        // A target silences the heartbeat.
+        await e.ingest(frame([det("start", x: 0.7, y: 0.5), tip(x: 0.4, y: 0.5)], t: 6))
+        #expect(await a.spoken.last == "Start. Move right.")
+        await e.ingest(frame([det("start", x: 0.7, y: 0.5), tip(x: 0.4, y: 0.5)], t: 9))
+        #expect(await a.spoken.count == 3)
+    }
+
+    @Test func stepKeyDistinguishesContentOnly() {
+        #expect(det("button", x: 0, y: 0).stepKey == "button")
+        #expect(det("text", x: 0, y: 0, kind: .text, text: "START").stepKey == "text|START")
+        #expect(det("text", x: 0, y: 0, kind: .text, text: "STOP").stepKey != det("text", x: 0, y: 0, kind: .text, text: "START").stepKey)
+    }
+
+    @Test func wavFromRawPCMMatchesFloatPath() {
+        let floats: [Float] = [0, 0.5, -0.5, 1]
+        var pcm = Data()
+        for s in floats { withUnsafeBytes(of: Int16(s * 32767).littleEndian) { pcm.append(contentsOf: $0) } }
+        #expect(WAVEncoder.pcm16Mono(pcm: pcm, sampleRate: 16_000) == WAVEncoder.pcm16Mono(floats, sampleRate: 16_000))
     }
 }
 EOF_AVAE

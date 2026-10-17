@@ -56,8 +56,11 @@ jobs:
             -scheme EchoGuideApp \
             -destination 'generic/platform=iOS Simulator' \
             -skipPackagePluginValidation \
-            CODE_SIGNING_ALLOWED=NO | tail -n 40
-          exit ${PIPESTATUS[0]}
+            CODE_SIGNING_ALLOWED=NO > build.log 2>&1
+          status=$?
+          grep -E "error:|warning: .*will be an error" build.log | sort -u | head -60 || true
+          tail -n 15 build.log
+          exit $status
 
   proxy-test:
     name: Proxy tests (Node)

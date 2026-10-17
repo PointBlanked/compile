@@ -3,9 +3,13 @@
 // for the current mode. Find mode hands the screen to Bryan's GuidanceView.
 // Everything here is also spoken; the screen is for low vision and helpers.
 
+import ARKit
+import AVFoundation
 import SwiftUI
 import EchoGuideAutomation
 import EchoGuideInfra
+import EchoGuideSpatial
+import EchoGuideVision
 
 struct MainView: View {
     @Bindable var runtime: AppRuntime

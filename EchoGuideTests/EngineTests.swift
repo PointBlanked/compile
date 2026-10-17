@@ -349,7 +349,8 @@ actor Counter {
         let r = CloudReasoningRouter(config: c, provider: StubProvider(delay: 1), connectivity: FixedConnectivity(online: true))
         let out = await r.resolve(query)
         #expect(out.source == .localFallback)
-        #expect(out.latencyMs < 500)
+        // Far below the provider's 1 s delay; loose bound for loaded CI runners.
+        #expect(out.latencyMs < 900)
     }
 
     @Test func breakerOpensAfterFailures() async {

@@ -66,8 +66,11 @@ jobs:
             DEVELOPMENT_TEAM="${{ secrets.APPLE_TEAM_ID }}" \
             CURRENT_PROJECT_VERSION="${{ inputs.build_number }}" \
             PRODUCT_BUNDLE_IDENTIFIER="${{ inputs.bundle_id }}" \
-            EG_PROXY_BASE_URL="${{ secrets.EG_PROXY_BASE_URL }}" | tail -n 60
-          exit ${PIPESTATUS[0]}
+            EG_PROXY_BASE_URL="${{ secrets.EG_PROXY_BASE_URL }}" > archive.log 2>&1
+          status=$?
+          grep -E "error:" archive.log | sort -u | head -60 || true
+          tail -n 25 archive.log
+          exit $status
 
       - name: Upload to TestFlight
         run: |
