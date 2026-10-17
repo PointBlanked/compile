@@ -75,6 +75,9 @@ public final class FrameDeltaEngine {
     /// automation engine needs a fresh look after a step completes).
     public func forceNextFrame() { forceNext = true }
 
+    /// How often a still scene is looked at again; nil only on motion.
+    public func setIdleRefresh(_ seconds: TimeInterval?) { config.idleRefresh = seconds }
+
     public func reset() {
         hasPrevious = false
         lastTrigger = -.infinity

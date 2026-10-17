@@ -104,6 +104,10 @@ on:
         description: "Bundle ID of the App Store Connect app record"
         required: true
         default: "app.echoguide.EchoGuide"
+      include_model:
+        description: "Export and bundle YOLO11n (AGPL-3.0: fine for internal testing; license before public release)"
+        type: boolean
+        default: true
 
 jobs:
   testflight:
@@ -125,6 +129,20 @@ jobs:
           [ -z "$ISSUER" ] && missing="$missing ASC_ISSUER_ID"
           [ -z "$P8" ] && missing="$missing ASC_KEY_P8_BASE64"
           if [ -n "$missing" ]; then echo "::error::Missing secrets:$missing"; exit 1; fi
+
+      - uses: actions/setup-python@v5
+        if: ${{ inputs.include_model }}
+        with:
+          python-version: "3.12"
+
+      - name: Export and bundle the object model
+        if: ${{ inputs.include_model }}
+        run: |
+          python -m pip install --quiet "ultralytics>=8.3" "coremltools>=8"
+          yolo export model=yolo11n.pt format=coreml int8=True nms=True imgsz=640
+          rm -rf EchoGuideApp/Resources/Models/yolo11n.mlpackage
+          mv yolo11n.mlpackage EchoGuideApp/Resources/Models/
+          ls EchoGuideApp/Resources/Models
 
       - name: Write API key
         env:
@@ -1904,6 +1922,9 @@ public final class FrameDeltaEngine {
     /// automation engine needs a fresh look after a step completes).
     public func forceNextFrame() { forceNext = true }
 
+    /// How often a still scene is looked at again; nil only on motion.
+    public func setIdleRefresh(_ seconds: TimeInterval?) { config.idleRefresh = seconds }
+
     public func reset() {
         hasPrevious = false
         lastTrigger = -.infinity
@@ -2060,6 +2081,10 @@ public final class PerceptionPipeline: @unchecked Sendable {
     }
 
     /// Ask for a fresh look on the next frame (step completed, user tapped).
+    public func setIdleRefresh(_ seconds: TimeInterval?) {
+        lock.withLock { delta.setIdleRefresh(seconds) }
+    }
+
     public func forceNextFrame() {
         lock.withLock { delta.forceNextFrame() }
     }
@@ -4160,7 +4185,7 @@ import CoreVideo
 import Vision
 
 public actor LocalVisionEngine {
-    public let config: LocalVisionConfig
+    public private(set) var config: LocalVisionConfig
     private let objectRequest: VNCoreMLRequest?
     private var frameCount: UInt64 = 0
     public private(set) var latency = LatencyWindow()
@@ -4184,6 +4209,9 @@ public actor LocalVisionEngine {
     }
 
     public var p95Ms: Double { latency.percentile(0.95) }
+
+    /// Read mode wants text on every frame; Explore and Find keep the cheaper cadence.
+    public func setTextEveryNthFrame(_ n: Int) { config.ocrEveryNthFrame = max(0, n) }
 
     public func process(_ frame: CameraFrame, orientation: CGImagePropertyOrientation = .right) -> VisionFrameResult {
         let timer = FrameTimer()
@@ -5246,6 +5274,20 @@ final class AppRuntime {
         mode = m
         if countsAsPrompt { await trials.notePrompt() }
         if m == .find { await automation?.start() } else { await automation?.stop() }
+        // Cadence per mode: Read looks at a still page often and reads text on
+        // every frame; Explore re-checks a still scene each second so nothing
+        // that walked in slowly is missed; Find relies on motion (the hand moves).
+        switch m {
+        case .read:
+            pipeline?.setIdleRefresh(0.5)
+            await vision?.setTextEveryNthFrame(1)
+        case .explore:
+            pipeline?.setIdleRefresh(1.0)
+            await vision?.setTextEveryNthFrame(3)
+        case .find:
+            pipeline?.setIdleRefresh(3.0)
+            await vision?.setTextEveryNthFrame(2)
+        }
         await agent?.setMode(m)
         pipeline?.forceNextFrame()
     }
@@ -5268,8 +5310,10 @@ final class AppRuntime {
 
     func startTrial(task: String, mode taskMode: String) async {
         let m: AgentMode = taskMode == "read" ? .read : taskMode == "find" ? .find : .explore
-        await trials.start(task: task, mode: taskMode, offline: !(cloudConfigured && online))
+        // Switch first, so the mode announcement does not count as the product's first cue.
         await setMode(m, countsAsPrompt: false)
+        try? await Task.sleep(nanoseconds: 2_500_000_000)
+        await trials.start(task: task, mode: taskMode, offline: !(cloudConfigured && online))
         if taskMode == "describe" { await describe() }
     }
 

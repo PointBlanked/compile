@@ -173,6 +173,20 @@ final class AppRuntime {
         mode = m
         if countsAsPrompt { await trials.notePrompt() }
         if m == .find { await automation?.start() } else { await automation?.stop() }
+        // Cadence per mode: Read looks at a still page often and reads text on
+        // every frame; Explore re-checks a still scene each second so nothing
+        // that walked in slowly is missed; Find relies on motion (the hand moves).
+        switch m {
+        case .read:
+            pipeline?.setIdleRefresh(0.5)
+            await vision?.setTextEveryNthFrame(1)
+        case .explore:
+            pipeline?.setIdleRefresh(1.0)
+            await vision?.setTextEveryNthFrame(3)
+        case .find:
+            pipeline?.setIdleRefresh(3.0)
+            await vision?.setTextEveryNthFrame(2)
+        }
         await agent?.setMode(m)
         pipeline?.forceNextFrame()
     }
@@ -195,8 +209,10 @@ final class AppRuntime {
 
     func startTrial(task: String, mode taskMode: String) async {
         let m: AgentMode = taskMode == "read" ? .read : taskMode == "find" ? .find : .explore
-        await trials.start(task: task, mode: taskMode, offline: !(cloudConfigured && online))
+        // Switch first, so the mode announcement does not count as the product's first cue.
         await setMode(m, countsAsPrompt: false)
+        try? await Task.sleep(nanoseconds: 2_500_000_000)
+        await trials.start(task: task, mode: taskMode, offline: !(cloudConfigured && online))
         if taskMode == "describe" { await describe() }
     }
 

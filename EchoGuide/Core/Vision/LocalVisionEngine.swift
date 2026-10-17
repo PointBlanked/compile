@@ -51,7 +51,7 @@ import CoreVideo
 import Vision
 
 public actor LocalVisionEngine {
-    public let config: LocalVisionConfig
+    public private(set) var config: LocalVisionConfig
     private let objectRequest: VNCoreMLRequest?
     private var frameCount: UInt64 = 0
     public private(set) var latency = LatencyWindow()
@@ -75,6 +75,9 @@ public actor LocalVisionEngine {
     }
 
     public var p95Ms: Double { latency.percentile(0.95) }
+
+    /// Read mode wants text on every frame; Explore and Find keep the cheaper cadence.
+    public func setTextEveryNthFrame(_ n: Int) { config.ocrEveryNthFrame = max(0, n) }
 
     public func process(_ frame: CameraFrame, orientation: CGImagePropertyOrientation = .right) -> VisionFrameResult {
         let timer = FrameTimer()

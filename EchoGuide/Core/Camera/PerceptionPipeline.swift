@@ -66,6 +66,10 @@ public final class PerceptionPipeline: @unchecked Sendable {
     }
 
     /// Ask for a fresh look on the next frame (step completed, user tapped).
+    public func setIdleRefresh(_ seconds: TimeInterval?) {
+        lock.withLock { delta.setIdleRefresh(seconds) }
+    }
+
     public func forceNextFrame() {
         lock.withLock { delta.forceNextFrame() }
     }
