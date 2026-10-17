@@ -1,4 +1,11 @@
 {
   "goal": null,
-  "plugins": { "productLookup": true }
+  "kokoroURL": "https://echoguide-voice.style.dev",
+  "plugins": { "productLookup": true },
+  "fence": {
+    "zones": [
+      { "name": "hob", "anchor": { "label": "oven" } },
+      { "name": "knife", "anchor": { "label": "knife" }, "warningMargin": 0.05 }
+    ]
+  }
 }
