@@ -21,6 +21,9 @@ public struct LocalVisionConfig: Sendable {
     /// on; Explore and Find keep the fast level inside the frame budget.
     public var accurateText = false
     public var detectFingertip = true
+    /// Read mode turns the object model off: it only needs text, and skipping
+    /// YOLO frees the budget for accurate OCR on every frame.
+    public var detectObjects = true
     /// Barcodes ride the OCR cadence: both are "read the label" work.
     public var detectBarcodes = true
     /// Keep at most this many detections; cognitive isolation picks one anyway.
@@ -86,12 +89,14 @@ public actor LocalVisionEngine {
     /// Read mode wants the accurate recogniser; the others want speed.
     public func setTextQuality(accurate: Bool) { config.accurateText = accurate }
 
+    public func setObjectDetection(enabled: Bool) { config.detectObjects = enabled }
+
     public func process(_ frame: CameraFrame, orientation: CGImagePropertyOrientation = .right) -> VisionFrameResult {
         let timer = FrameTimer()
         frameCount += 1
 
         var requests: [VNRequest] = []
-        if let objectRequest { requests.append(objectRequest) }
+        if config.detectObjects, let objectRequest { requests.append(objectRequest) }
 
         let hand = VNDetectHumanHandPoseRequest()
         hand.maximumHandCount = 1
@@ -119,7 +124,7 @@ public actor LocalVisionEngine {
 
         var detections: [Detection] = []
 
-        for case let obs as VNRecognizedObjectObservation in objectRequest?.results ?? [] {
+        for case let obs as VNRecognizedObjectObservation in (config.detectObjects ? objectRequest?.results : nil) ?? [] {
             guard let top = obs.labels.first, top.confidence >= config.minimumConfidence else { continue }
             let b = obs.boundingBox
             detections.append(Detection(

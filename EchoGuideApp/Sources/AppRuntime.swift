@@ -238,14 +238,17 @@ final class AppRuntime {
             pipeline?.setIdleRefresh(0.5)
             await vision?.setTextEveryNthFrame(1)
             await vision?.setTextQuality(accurate: true)
+            await vision?.setObjectDetection(enabled: false)
         case .explore:
             pipeline?.setIdleRefresh(1.0)
             await vision?.setTextEveryNthFrame(3)
             await vision?.setTextQuality(accurate: false)
+            await vision?.setObjectDetection(enabled: true)
         case .find:
             pipeline?.setIdleRefresh(3.0)
             await vision?.setTextEveryNthFrame(2)
             await vision?.setTextQuality(accurate: false)
+            await vision?.setObjectDetection(enabled: true)
         }
         await agent?.setMode(m)
         pipeline?.forceNextFrame()

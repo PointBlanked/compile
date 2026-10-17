@@ -710,6 +710,18 @@ struct StubListener: GoalListening {
         #expect(abs(r.height - 533.33) < 0.1)
     }
 
+    @Test func overlayFilterPerMode() {
+        let cup = det("cup", x: 0.5, y: 0.5), start = det("text", x: 0.7, y: 0.5, kind: .text, text: "START")
+        let code = det("barcode", x: 0.2, y: 0.2, kind: .barcode, text: "1"), tipD = tip(x: 0.1, y: 0.1), hand = det("hand", x: 0.1, y: 0.1)
+        let all = [cup, start, code, tipD, hand]
+        #expect(HUDFilter.all.visible(all, target: nil) == all)
+        #expect(HUDFilter.text.visible(all, target: nil) == [start])
+        #expect(HUDFilter.objects.visible(all, target: nil) == [cup, code, tipD, hand])
+        // Find guiding to a text button: that one text box is shown, other text is not.
+        let stop = det("text", x: 0.3, y: 0.8, kind: .text, text: "STOP")
+        #expect(HUDFilter.objects.visible(all + [stop], target: start) == [cup, start, code, tipD, hand])
+    }
+
     @Test func hudFrameHelpers() {
         let f = HUDFrame(detections: [det("cup", x: 0.5, y: 0.5), det("text", x: 0.2, y: 0.2, kind: .text, text: "A"), tip(x: 0.1, y: 0.1)], timestamp: 1, inferenceMs: 9)
         #expect(f.objects == 1)

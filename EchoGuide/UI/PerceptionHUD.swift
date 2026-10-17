@@ -71,19 +71,47 @@ public enum HUDGeometry {
 #if canImport(SwiftUI)
 import SwiftUI
 
+/// What the overlay draws in each mode.
+public enum HUDFilter: Sendable, Equatable {
+    /// Objects, barcodes, the hand and fingertip, plus the chosen target whatever its kind.
+    case objects
+    /// Text only.
+    case text
+    /// Everything.
+    case all
+
+    public func visible(_ detections: [Detection], target: Detection?) -> [Detection] {
+        switch self {
+        case .all:
+            return detections
+        case .text:
+            return detections.filter { $0.kind == .text }
+        case .objects:
+            return detections.filter { d in
+                d.kind != .text || (target.map { $0.kind == .text && $0.box.iou(d.box) > 0.5 } ?? false)
+            }
+        }
+    }
+}
+
 public struct PerceptionOverlay: View {
     public var frame: HUDFrame
     /// The one target the automation engine has isolated, if any.
     public var target: Detection?
     public var imageAspect: CGFloat
     public var showsLabels: Bool
+    public var filter: HUDFilter
 
-    public init(frame: HUDFrame, target: Detection? = nil, imageAspect: CGFloat = 9.0 / 16.0, showsLabels: Bool = true) {
+    public init(frame: HUDFrame, target: Detection? = nil, imageAspect: CGFloat = 9.0 / 16.0, showsLabels: Bool = true, filter: HUDFilter = .all) {
         self.frame = frame
         self.target = target
         self.imageAspect = imageAspect
         self.showsLabels = showsLabels
+        self.filter = filter
     }
+
+    private var shown: [Detection] { filter.visible(frame.detections, target: target) }
+    private var fingertip: Detection? { filter == .text ? nil : frame.fingertip }
 
     private static func color(for d: Detection) -> Color {
         switch d.kind {
@@ -107,7 +135,7 @@ public struct PerceptionOverlay: View {
                         ctx.stroke(Path(CGRect(origin: .zero, size: size).insetBy(dx: 3, dy: 3)), with: .color(.orange), lineWidth: 6)
                     }
 
-                    for d in frame.detections where d.kind != .fingertip {
+                    for d in shown where d.kind != .fingertip {
                         let r = HUDGeometry.rect(d.box, viewSize: size, imageAspect: imageAspect)
                         let isTarget = target.map { $0.label == d.label && $0.box.iou(d.box) > 0.5 } ?? false
                         let path = Path(roundedRect: r, cornerRadius: 6)
@@ -117,7 +145,7 @@ public struct PerceptionOverlay: View {
                         }
                     }
 
-                    if let tip = frame.fingertip {
+                    if let tip = fingertip {
                         let p = HUDGeometry.point(tip.box.mid, viewSize: size, imageAspect: imageAspect)
                         if let target {
                             let q = HUDGeometry.point(target.box.mid, viewSize: size, imageAspect: imageAspect)
@@ -132,7 +160,7 @@ public struct PerceptionOverlay: View {
                 }
 
                 if showsLabels {
-                    ForEach(Array(frame.detections.enumerated()), id: \.offset) { _, d in
+                    ForEach(Array(shown.enumerated()), id: \.offset) { _, d in
                         if d.kind != .fingertip {
                             let r = HUDGeometry.rect(d.box, viewSize: size, imageAspect: imageAspect)
                             let isTarget = target.map { $0.label == d.label && $0.box.iou(d.box) > 0.5 } ?? false

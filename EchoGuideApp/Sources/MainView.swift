@@ -24,6 +24,15 @@ struct MainView: View {
         }
     }
 
+    /// Read shows text only, Find shows objects and the target, Explore shows both.
+    private var hudFilter: HUDFilter {
+        switch runtime.mode {
+        case .read: return .text
+        case .find: return .objects
+        case .explore: return .all
+        }
+    }
+
     var body: some View {
         ZStack {
             // The camera is always up: a helper or a judge sees what the
@@ -31,7 +40,7 @@ struct MainView: View {
             CameraPreview(arSession: runtime.lidar?.session, captureSession: runtime.camera?.session, usesARKit: runtime.hasLiDAR)
                 .ignoresSafeArea()
                 .accessibilityHidden(true)
-            PerceptionOverlay(frame: runtime.hud, target: target, imageAspect: runtime.imageAspect)
+            PerceptionOverlay(frame: runtime.hud, target: target, imageAspect: runtime.imageAspect, filter: hudFilter)
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
