@@ -234,9 +234,6 @@ public enum FenceEvent: Sendable, Equatable {
     case approaching(zone: String, metres: Float?)
     /// Hand is inside a spatial hazard zone.
     case breached(zone: String)
-    /// User walked out of a safe location region.
-    case leftSafeArea(region: String)
-    case returnedToSafeArea(region: String)
 }
 
 // MARK: - Timing

@@ -1,7 +1,7 @@
 // Owner: Bryan. The screen is secondary: audio and haptics carry the product.
-// What is shown is for low-vision users and carers: one step, huge, yellow on
+// What is shown is for low-vision users and helpers: one step, huge, yellow on
 // black, Dynamic Type, and VoiceOver reads the same sentence the audio speaks.
-// A carer gets one big Pause/Resume control and the current goal; nothing
+// A helper gets one big Pause/Resume control and the current goal; nothing
 // else competes with the step.
 
 #if canImport(SwiftUI)
@@ -35,7 +35,7 @@ public final class GuidanceModel {
 
     public var isPaused: Bool { state == .idle }
 
-    /// Carer control. Pausing silences haptics; resuming returns to scanning.
+    /// Helper control. Pausing silences haptics; resuming returns to scanning.
     public func togglePaused() {
         guard let engine else { return }
         let resume = isPaused
@@ -60,11 +60,10 @@ public final class GuidanceModel {
         case .guiding(let step), .onTarget(let step): return step.instruction
         case .completed(let what): return "Done. \(what)"
         case .warning(let what): return "Stop. \(what.capitalizedFirst)"
-        case .outsideSafeArea(let region): return "You have left \(region)"
         }
     }
 
-    /// Secondary line: what happens next, for a carer reading over a shoulder.
+    /// Secondary line: what happens next, for a sighted helper reading over a shoulder.
     var detail: String? {
         switch state {
         case .idle: return "Tap Resume to start guiding"
@@ -73,15 +72,12 @@ public final class GuidanceModel {
         case .onTarget: return "Hold still"
         case .completed: return "Next step coming"
         case .warning: return "Move your hand away"
-        case .outsideSafeArea: return "Go back the way you came"
         }
     }
 
     var isWarning: Bool {
-        switch state {
-        case .warning, .outsideSafeArea: return true
-        default: return false
-        }
+        if case .warning = state { return true }
+        return false
     }
 
     var isOnTarget: Bool {
@@ -92,7 +88,7 @@ public final class GuidanceModel {
 
 public struct GuidanceView: View {
     @State private var model: GuidanceModel
-    /// Set to show the goal field; carers type "start" or "microwave".
+    /// Set to show the goal field; a helper types "start" or "microwave".
     public var showsGoalField: Bool
     @State private var goalDraft = ""
 

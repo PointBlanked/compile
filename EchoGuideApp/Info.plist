@@ -10,14 +10,6 @@
 	<string>EchoGuide watches through the camera to find the one thing you need and guide your hand to it.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>If you turn on voice, EchoGuide listens for requests like "find the start button".</string>
-	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>EchoGuide uses your location to tell your carer if you leave a safe area.</string>
-	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>EchoGuide uses your location, even when the screen is off, to tell your carer if you leave a safe area.</string>
-	<key>UIBackgroundModes</key>
-	<array>
-		<string>location</string>
-	</array>
 	<key>UIRequiredDeviceCapabilities</key>
 	<array>
 		<string>arm64</string>

@@ -417,8 +417,6 @@ public enum AutomationState: Sendable, Equatable {
     case completed(String)
     /// Hand inside a spatial hazard zone.
     case warning(String)
-    /// User has walked out of a safe location region (dementia wandering).
-    case outsideSafeArea(String)
 }
 
 public struct AutomationConfig: Sendable {
@@ -527,8 +525,6 @@ public actor AutomationEngine {
         let now = frame.timestamp
 
         if let fence, await handle(fence, at: now) { return }
-        // Wandering outside the safe area is cleared only by coming back.
-        if case .outsideSafeArea = state { return }
 
         // Recently finished targets are off the menu; prune expired ones.
         completedUntil = completedUntil.filter { $0.value > now }
@@ -655,20 +651,6 @@ public actor AutomationEngine {
                 await haptics.warn()
                 await audio.speak("Careful. \(zone.capitalizedFirst) is close.", azimuth: 0)
             }
-            return false
-        case .leftSafeArea(let region):
-            var told = false
-            if let tools {
-                let alert = ToolMatch(toolName: "notify_caregiver", sideEffect: .none, arguments: ["region": region])
-                told = (try? await tools.invoke(alert)) != nil
-            }
-            await audio.speak(told ? "You have left \(region). Your carer has been told." : "You have left \(region).", azimuth: 0)
-            transition(.outsideSafeArea(region))
-            return true
-        case .returnedToSafeArea(let region):
-            await audio.speak("You are back at \(region).", azimuth: 0)
-            // Only the wandering alert is cleared; a paused engine stays paused.
-            if case .outsideSafeArea = state { transition(.scanning) }
             return false
         }
     }
@@ -1033,7 +1015,8 @@ public final class PerceptionPipeline: @unchecked Sendable {
 EOF_AVAE
 
 cat > 'EchoGuide/Core/Cognitive/CognitiveTaskIsolation.swift' <<'EOF_AVAE'
-// Owner: Bryan. Step-anchoring for dementia and cognitive accessibility.
+// Owner: Bryan. Step-anchoring: one clear step at a time, so a blind or
+// low-vision user is never handed a list of things to choose between.
 // A frame can hold a dozen detections; the user gets exactly one. Rules:
 //   1. One target at a time, chosen by goal, closeness to the finger, size
 //      and confidence.
@@ -1450,9 +1433,6 @@ public enum FenceEvent: Sendable, Equatable {
     case approaching(zone: String, metres: Float?)
     /// Hand is inside a spatial hazard zone.
     case breached(zone: String)
-    /// User walked out of a safe location region.
-    case leftSafeArea(region: String)
-    case returnedToSafeArea(region: String)
 }
 
 // MARK: - Timing
@@ -1635,17 +1615,13 @@ public final class LiDARDepthEngine: NSObject, ARSessionDelegate, DepthProviding
 EOF_AVAE
 
 cat > 'EchoGuide/Core/Fence/DigitalFenceEngine.swift' <<'EOF_AVAE'
-// Owner: Bryan. The digital fence, in two layers:
+// Owner: Bryan. The digital fence: hazard zones the camera can see (hob, oven
+// door, stair edge, knife block). Zones come from a detected label ("oven") or
+// a fixed region of the frame. The fingertip approaching a zone triggers a
+// warning before contact; LiDAR depth tightens it when available.
 //
-//  1. Spatial fence: hazard zones the camera can see (hob, oven door, stair
-//     edge, knife block). Zones come from a detected label ("oven") or a fixed
-//     region of the frame. The fingertip approaching a zone triggers a warning
-//     before contact; LiDAR depth tightens it when available.
-//  2. Location fence: safe areas (home, day centre) for dementia wandering.
-//     Leaving one is reported once after a dwell, never on GPS jitter.
-//
-// Both layers only *report* FenceEvents. AutomationEngine decides what the
-// user feels and hears; caregiver alerts go through a plugin tool.
+// The fence only *reports* FenceEvents. AutomationEngine decides what the
+// user feels and hears.
 
 import Foundation
 import EchoGuideContracts
@@ -1755,130 +1731,6 @@ public struct SpatialFence: Sendable {
         }
     }
 }
-
-// MARK: - Location fence
-
-public struct GeoCoordinate: Sendable, Equatable, Codable {
-    public var latitude: Double
-    public var longitude: Double
-
-    public init(latitude: Double, longitude: Double) {
-        self.latitude = latitude
-        self.longitude = longitude
-    }
-
-    /// Haversine distance in metres.
-    public func distance(to o: GeoCoordinate) -> Double {
-        let r = 6_371_000.0
-        let dLat = (o.latitude - latitude) * .pi / 180
-        let dLon = (o.longitude - longitude) * .pi / 180
-        let a = sin(dLat / 2) * sin(dLat / 2)
-            + cos(latitude * .pi / 180) * cos(o.latitude * .pi / 180) * sin(dLon / 2) * sin(dLon / 2)
-        return 2 * r * atan2(a.squareRoot(), (1 - a).squareRoot())
-    }
-}
-
-public struct SafeArea: Sendable, Equatable, Codable {
-    public var name: String
-    public var center: GeoCoordinate
-    public var radiusMetres: Double
-
-    public init(name: String, center: GeoCoordinate, radiusMetres: Double) {
-        self.name = name
-        self.center = center
-        self.radiusMetres = radiusMetres
-    }
-}
-
-/// Pure state machine over location fixes. Feed it CLLocation updates; it emits
-/// at most one event per real crossing.
-public struct LocationFence: Sendable {
-    public var areas: [SafeArea]
-    /// Must be outside every area for this long before `leftSafeArea` fires.
-    public var exitDwell: TimeInterval
-    /// Fixes worse than this are ignored (indoor GPS can be 100 m+ off).
-    public var maxAccuracyMetres: Double
-
-    /// Name of the area the last good fix was inside, nil when outside all.
-    public private(set) var insideArea: String?
-    private var outsideSince: TimeInterval?
-    private var reportedExit = false
-    private var lastArea: String?
-
-    /// True once an exit has been reported and not yet cancelled by a return.
-    public var isOutside: Bool { reportedExit }
-
-    public init(areas: [SafeArea], exitDwell: TimeInterval = 45, maxAccuracyMetres: Double = 65) {
-        self.areas = areas
-        self.exitDwell = exitDwell
-        self.maxAccuracyMetres = maxAccuracyMetres
-    }
-
-    public mutating func update(_ c: GeoCoordinate, accuracyMetres: Double, at t: TimeInterval) -> FenceEvent? {
-        guard accuracyMetres <= maxAccuracyMetres else { return nil }
-
-        // Inside if the fix is within radius, giving the benefit of the doubt for accuracy.
-        let area = areas.first { c.distance(to: $0.center) <= $0.radiusMetres + accuracyMetres / 2 }
-
-        if let area {
-            insideArea = area.name
-            lastArea = area.name
-            outsideSince = nil
-            if reportedExit {
-                reportedExit = false
-                return .returnedToSafeArea(region: area.name)
-            }
-            return nil
-        }
-
-        insideArea = nil
-        if outsideSince == nil { outsideSince = t }
-        if !reportedExit, let since = outsideSince, t - since >= exitDwell {
-            reportedExit = true
-            return .leftSafeArea(region: lastArea ?? "safe area")
-        }
-        return nil
-    }
-}
-
-#if canImport(CoreLocation) && os(iOS)
-import CoreLocation
-
-/// Bridges CoreLocation to LocationFence. Needs "Always" authorization and the
-/// location background mode for wandering alerts to work with the screen off.
-public final class LocationFenceMonitor: NSObject, CLLocationManagerDelegate, @unchecked Sendable {
-    private let manager = CLLocationManager()
-    private var fence: LocationFence
-    private let onEvent: @Sendable (FenceEvent) -> Void
-
-    public init(areas: [SafeArea], onEvent: @escaping @Sendable (FenceEvent) -> Void) {
-        fence = LocationFence(areas: areas)
-        self.onEvent = onEvent
-        super.init()
-        manager.delegate = self
-        manager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
-        manager.distanceFilter = 10
-        manager.allowsBackgroundLocationUpdates = true
-        manager.pausesLocationUpdatesAutomatically = false
-    }
-
-    public func start() {
-        manager.requestAlwaysAuthorization()
-        manager.startUpdatingLocation()
-    }
-
-    public func stop() { manager.stopUpdatingLocation() }
-
-    public func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        for l in locations {
-            let c = GeoCoordinate(latitude: l.coordinate.latitude, longitude: l.coordinate.longitude)
-            if let e = fence.update(c, accuracyMetres: l.horizontalAccuracy, at: l.timestamp.timeIntervalSince1970) {
-                onEvent(e)
-            }
-        }
-    }
-}
-#endif
 EOF_AVAE
 
 cat > 'EchoGuide/Core/Haptics/SpatialHapticEngine.swift' <<'EOF_AVAE'
@@ -2044,16 +1896,10 @@ cat > 'EchoGuide/Core/Plugins/BuiltInPlugins.swift' <<'EOF_AVAE'
 //  * HomeAssistantPlugin   press the button for the user (microwave, kettle,
 //                          lights, thermostat) through one Home Assistant hub,
 //                          which already integrates thousands of appliances.
-//  * CaregiverAlerts       tell the carer when the location fence trips. Alerts
-//                          are written to a disk outbox first, so one sent
-//                          offline is delivered when the phone reconnects.
 //  * ProductLookupPlugin   barcode -> product name and allergens (Open Food Facts).
 
 import Foundation
 import EchoGuideContracts
-#if canImport(CryptoKit)
-import CryptoKit
-#endif
 
 /// Looks up a secret (token, signing key) by name. Keychain in the app; a
 /// dictionary in tests. Secrets never live in the manifest.
@@ -2105,119 +1951,6 @@ public enum HomeAssistantPlugin {
             }
         }
     }
-}
-
-// MARK: - Caregiver alerts
-
-public struct CaregiverAlert: Sendable, Equatable, Codable {
-    public var id: UUID
-    public var event: String
-    public var region: String
-    public var at: Date
-}
-
-/// Thrown when the alert is safely queued but not yet delivered, so the caller
-/// does not tell the user "your carer has been told" when that is not true yet.
-public struct CaregiverAlertQueued: Error, Equatable {}
-
-public actor CaregiverAlerts {
-    private let webhook: URL
-    private let transport: HTTPTransport
-    private let outboxURL: URL?
-    private let signingSecret: String?
-    private var outbox: [CaregiverAlert]
-
-    /// `outboxURL` persists undelivered alerts across app launches; nil keeps
-    /// them in memory only (tests).
-    public init(webhook: URL, transport: HTTPTransport, outboxURL: URL?, signingSecret: String? = nil) {
-        self.webhook = webhook
-        self.transport = transport
-        self.outboxURL = outboxURL
-        self.signingSecret = signingSecret
-        if let outboxURL, let data = try? Data(contentsOf: outboxURL),
-           let saved = try? Self.decoder.decode([CaregiverAlert].self, from: data) {
-            outbox = saved
-        } else {
-            outbox = []
-        }
-    }
-
-    public var pending: Int { outbox.count }
-
-    /// Queue, then try to deliver everything queued. True when this alert went out.
-    @discardableResult
-    public func send(event: String, region: String, at date: Date = Date()) async -> Bool {
-        let alert = CaregiverAlert(id: UUID(), event: event, region: region, at: date)
-        outbox.append(alert)
-        save()
-        await flush()
-        return !outbox.contains(alert)
-    }
-
-    /// Call on reconnect (NWPathMonitor) and on app launch.
-    public func flush() async {
-        var remaining: [CaregiverAlert] = []
-        for alert in outbox {
-            do {
-                try await deliver(alert)
-            } catch {
-                remaining.append(alert)
-            }
-        }
-        outbox = remaining
-        save()
-    }
-
-    public var tool: ToolDescriptor {
-        ToolDescriptor(name: "notify_caregiver", description: "Tell the carer the user left a safe area",
-                       sideEffect: .none, parameters: ["region"]) { [self] args in
-            let delivered = await self.send(event: "left_safe_area", region: args["region"] ?? "safe area")
-            if !delivered { throw CaregiverAlertQueued() }
-            return "Your carer has been told."
-        }
-    }
-
-    private func deliver(_ alert: CaregiverAlert) async throws {
-        var req = URLRequest(url: webhook)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 5
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        // The receiver dedupes on this, so a retry after a lost response is safe.
-        req.setValue(alert.id.uuidString, forHTTPHeaderField: "Idempotency-Key")
-        let body = try Self.encoder.encode(alert)
-        req.httpBody = body
-        if let signingSecret { req.setValue(Self.signature(body, secret: signingSecret), forHTTPHeaderField: "X-EchoGuide-Signature") }
-        let (_, http) = try await transport.send(req)
-        guard (200..<300).contains(http.statusCode) else { throw HTTPStatusError(status: http.statusCode) }
-    }
-
-    private func save() {
-        guard let outboxURL, let data = try? Self.encoder.encode(outbox) else { return }
-        try? data.write(to: outboxURL, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-    }
-
-    /// Hex HMAC-SHA256 of the body, so the receiver can reject forged alerts.
-    static func signature(_ body: Data, secret: String) -> String {
-        #if canImport(CryptoKit)
-        let mac = HMAC<SHA256>.authenticationCode(for: body, using: SymmetricKey(data: Data(secret.utf8)))
-        return "sha256=" + mac.map { String(format: "%02x", $0) }.joined()
-        #else
-        return ""
-        #endif
-    }
-
-    static let encoder: JSONEncoder = {
-        let e = JSONEncoder()
-        e.dateEncodingStrategy = .iso8601
-        e.outputFormatting = .sortedKeys
-        return e
-    }()
-
-    static let decoder: JSONDecoder = {
-        let d = JSONDecoder()
-        d.dateDecodingStrategy = .iso8601
-        return d
-    }()
 }
 
 // MARK: - Product lookup
@@ -2331,7 +2064,6 @@ cat > 'EchoGuide/Core/Plugins/PluginManifest.swift' <<'EOF_AVAE'
 //     "entities": [ { "name": "microwave_start", "doneSentence": "Microwave started.",
 //                     "entityId": "switch.microwave", "service": "switch.turn_on",
 //                     "textContains": ["start"], "sideEffect": "physical" } ] },
-//   "caregiver": { "webhookURL": "https://care.example.com/alerts", "signingSecret": "care_hmac" },
 //   "productLookup": true,
 //   "remoteServers": [ { "endpoint": "https://plugins.example.com/mcp",
 //                        "claims": { "thermostat_set": { "labels": ["thermostat"] } },
@@ -2346,11 +2078,6 @@ public struct PluginManifest: Sendable, Codable, Equatable {
         public var baseURL: URL
         public var tokenSecret: String
         public var entities: [HomeAssistantEntity]
-    }
-
-    public struct Caregiver: Sendable, Codable, Equatable {
-        public var webhookURL: URL
-        public var signingSecret: String?
     }
 
     public struct Claim: Sendable, Codable, Equatable {
@@ -2372,7 +2099,6 @@ public struct PluginManifest: Sendable, Codable, Equatable {
     }
 
     public var homeAssistant: HomeAssistant?
-    public var caregiver: Caregiver?
     public var productLookup: Bool?
     public var remoteServers: [RemoteServer]?
 
@@ -2382,8 +2108,6 @@ public struct PluginManifest: Sendable, Codable, Equatable {
 }
 
 public struct InstalledPlugins: Sendable {
-    /// Keep a handle so the app can `flush()` on reconnect and launch.
-    public var caregiver: CaregiverAlerts?
     /// Remote servers that could not be reached; their tools are missing until retried.
     public var failedRemotes: [URL]
 }
@@ -2393,8 +2117,8 @@ extension PluginRegistry {
     /// remote server cannot shadow a built-in by registering the same name.
     @discardableResult
     public func install(_ manifest: PluginManifest, secrets: @escaping SecretProvider,
-                        transport: HTTPTransport = URLSessionTransport(), outboxURL: URL? = nil) async -> InstalledPlugins {
-        var installed = InstalledPlugins(caregiver: nil, failedRemotes: [])
+                        transport: HTTPTransport = URLSessionTransport()) async -> InstalledPlugins {
+        var installed = InstalledPlugins(failedRemotes: [])
 
         if let ha = manifest.homeAssistant {
             let secret = ha.tokenSecret
@@ -2402,13 +2126,6 @@ extension PluginRegistry {
                                                   token: { await secrets(secret) }) {
                 register(tool)
             }
-        }
-
-        if let c = manifest.caregiver {
-            let signing: String? = if let name = c.signingSecret { await secrets(name) } else { nil }
-            let alerts = CaregiverAlerts(webhook: c.webhookURL, transport: transport, outboxURL: outboxURL, signingSecret: signing)
-            register(await alerts.tool)
-            installed.caregiver = alerts
         }
 
         if manifest.productLookup == true {
@@ -3377,9 +3094,9 @@ EOF_AVAE
 
 cat > 'EchoGuide/UI/GuidanceView.swift' <<'EOF_AVAE'
 // Owner: Bryan. The screen is secondary: audio and haptics carry the product.
-// What is shown is for low-vision users and carers: one step, huge, yellow on
+// What is shown is for low-vision users and helpers: one step, huge, yellow on
 // black, Dynamic Type, and VoiceOver reads the same sentence the audio speaks.
-// A carer gets one big Pause/Resume control and the current goal; nothing
+// A helper gets one big Pause/Resume control and the current goal; nothing
 // else competes with the step.
 
 #if canImport(SwiftUI)
@@ -3413,7 +3130,7 @@ public final class GuidanceModel {
 
     public var isPaused: Bool { state == .idle }
 
-    /// Carer control. Pausing silences haptics; resuming returns to scanning.
+    /// Helper control. Pausing silences haptics; resuming returns to scanning.
     public func togglePaused() {
         guard let engine else { return }
         let resume = isPaused
@@ -3438,11 +3155,10 @@ public final class GuidanceModel {
         case .guiding(let step), .onTarget(let step): return step.instruction
         case .completed(let what): return "Done. \(what)"
         case .warning(let what): return "Stop. \(what.capitalizedFirst)"
-        case .outsideSafeArea(let region): return "You have left \(region)"
         }
     }
 
-    /// Secondary line: what happens next, for a carer reading over a shoulder.
+    /// Secondary line: what happens next, for a sighted helper reading over a shoulder.
     var detail: String? {
         switch state {
         case .idle: return "Tap Resume to start guiding"
@@ -3451,15 +3167,12 @@ public final class GuidanceModel {
         case .onTarget: return "Hold still"
         case .completed: return "Next step coming"
         case .warning: return "Move your hand away"
-        case .outsideSafeArea: return "Go back the way you came"
         }
     }
 
     var isWarning: Bool {
-        switch state {
-        case .warning, .outsideSafeArea: return true
-        default: return false
-        }
+        if case .warning = state { return true }
+        return false
     }
 
     var isOnTarget: Bool {
@@ -3470,7 +3183,7 @@ public final class GuidanceModel {
 
 public struct GuidanceView: View {
     @State private var model: GuidanceModel
-    /// Set to show the goal field; carers type "start" or "microwave".
+    /// Set to show the goal field; a helper types "start" or "microwave".
     public var showsGoalField: Bool
     @State private var goalDraft = ""
 
@@ -3897,14 +3610,6 @@ cat > 'EchoGuideApp/Info.plist' <<'EOF_AVAE'
 	<string>EchoGuide watches through the camera to find the one thing you need and guide your hand to it.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>If you turn on voice, EchoGuide listens for requests like "find the start button".</string>
-	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>EchoGuide uses your location to tell your carer if you leave a safe area.</string>
-	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>EchoGuide uses your location, even when the screen is off, to tell your carer if you leave a safe area.</string>
-	<key>UIBackgroundModes</key>
-	<array>
-		<string>location</string>
-	</array>
 	<key>UIRequiredDeviceCapabilities</key>
 	<array>
 		<string>arm64</string>
@@ -3939,8 +3644,7 @@ EOF_AVAE
 cat > 'EchoGuideApp/Resources/echoguide.sample.json' <<'EOF_AVAE'
 {
   "goal": null,
-  "plugins": { "productLookup": true },
-  "safeAreas": []
+  "plugins": { "productLookup": true }
 }
 EOF_AVAE
 
@@ -3958,7 +3662,6 @@ import EchoGuideVision
 /// care provider's setup flow); the bundled sample is the fallback.
 struct AppConfig: Decodable {
     var plugins: PluginManifest?
-    var safeAreas: [SafeArea]?
     /// Start narrowed to one task ("start"), nil for open scanning.
     var goal: String?
 
@@ -4055,7 +3758,6 @@ cat > 'EchoGuideApp/Sources/AppRuntime.swift' <<'EOF_AVAE'
 //   LiDAR (ARKit) or CameraFeed -> PerceptionPipeline -> SpatialFence -> AutomationEngine
 //                                                                          |-> haptics, audio
 //                                                                          |-> plugins, router
-//   LocationFenceMonitor ---------------------------------------------------^
 //   VoiceLoop (optional) -> goal / question
 
 import Foundation
@@ -4081,7 +3783,6 @@ final class AppRuntime {
     private var vision: LocalVisionEngine?
     private var lidar: LiDARDepthEngine?
     private var camera: CameraFeed?
-    private var location: LocationFenceMonitor?
     private var voiceIO: VoiceAudioIO?
     private var stt: DeepgramSTTClient?
     private var background: [Task<Void, Never>] = []
@@ -4118,12 +3819,8 @@ final class AppRuntime {
         let router = CloudReasoningRouter(config: routerConfig, provider: provider, connectivity: connectivity)
 
         let registry = PluginRegistry()
-        var caregiver: CaregiverAlerts?
         if let manifest = config.plugins {
-            let outbox = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-                .appendingPathComponent("caregiver-outbox.json")
-            let installed = await registry.install(manifest, secrets: { Keychain.read($0) }, outboxURL: outbox)
-            caregiver = installed.caregiver
+            let installed = await registry.install(manifest, secrets: { Keychain.read($0) })
             for url in installed.failedRemotes { log.warning("Plugin server unreachable: \(url.absoluteString, privacy: .public)") }
         }
 
@@ -4161,25 +3858,6 @@ final class AppRuntime {
             }
         }
 
-        // Location fence (dementia wandering).
-        if let areas = config.safeAreas, !areas.isEmpty {
-            let monitor = LocationFenceMonitor(areas: areas) { event in
-                Task { await automation.ingest(fence: event, at: Date().timeIntervalSince1970) }
-            }
-            monitor.start()
-            location = monitor
-        }
-
-        // Deliver caregiver alerts queued while offline.
-        if let caregiver {
-            background.append(Task {
-                while !Task.isCancelled {
-                    if await connectivity.isOnline() { await caregiver.flush() }
-                    try? await Task.sleep(nanoseconds: 30_000_000_000)
-                }
-            })
-        }
-
         if AppSettings.voiceEnabled, let proxy = AppSettings.proxyBase {
             await startVoice(proxy: proxy, audio: audio, automation: automation, router: router, deviceToken: deviceToken)
         }
@@ -4191,7 +3869,6 @@ final class AppRuntime {
         background.forEach { $0.cancel() }
         lidar?.stop()
         camera?.stop()
-        location?.stop()
         voiceIO?.stopCapture()
         await stt?.stop()
         await automation?.stop()
@@ -4364,7 +4041,7 @@ struct EchoGuideApp: App {
 }
 
 enum AudioSessionSetup {
-    /// Voice mode needs the mic. Keep mixing and ducking so a carer's call or
+    /// Voice mode needs the mic. Keep mixing and ducking so a phone call or
     /// music is never silenced, and route to the speaker, not the earpiece.
     static func enableRecording() throws {
         let s = AVAudioSession.sharedInstance()
@@ -4541,18 +4218,6 @@ struct StubProvider: ReasoningProvider {
         #expect(SpatialFence.kitchenDefaults.evaluate(frame([det("oven", x: 0.5, y: 0.5)], t: 0)) == nil)
     }
 
-    @Test func locationFenceNeedsDwellAndIgnoresJitter() {
-        let home = GeoCoordinate(latitude: 51.5145, longitude: -0.1165)
-        var fence = LocationFence(areas: [SafeArea(name: "home", center: home, radiusMetres: 80)])
-        #expect(fence.update(home, accuracyMetres: 10, at: 0) == nil)
-
-        let away = GeoCoordinate(latitude: 51.5175, longitude: -0.1165) // ~330 m north
-        #expect(fence.update(away, accuracyMetres: 300, at: 10) == nil) // bad fix ignored
-        #expect(fence.update(away, accuracyMetres: 10, at: 20) == nil)
-        #expect(fence.update(away, accuracyMetres: 10, at: 70) == .leftSafeArea(region: "home"))
-        #expect(fence.update(away, accuracyMetres: 10, at: 90) == nil) // reported once
-        #expect(fence.update(home, accuracyMetres: 10, at: 200) == .returnedToSafeArea(region: "home"))
-    }
 }
 
 // MARK: - Bryan + Maxwell: haptics, depth, audio math
@@ -4855,18 +4520,6 @@ struct TableDepth: DepthProviding {
         #expect(fence.evaluate(frame([tip(x: 0.5, y: 0.5)], t: 0)) == nil)
     }
 
-    @Test func locationFenceExposesWhereTheUserIs() {
-        let home = GeoCoordinate(latitude: 51.5145, longitude: -0.1165)
-        var fence = LocationFence(areas: [SafeArea(name: "home", center: home, radiusMetres: 80)], exitDwell: 10)
-        _ = fence.update(home, accuracyMetres: 5, at: 0)
-        #expect(fence.insideArea == "home")
-        #expect(!fence.isOutside)
-        let away = GeoCoordinate(latitude: 51.5175, longitude: -0.1165)
-        _ = fence.update(away, accuracyMetres: 5, at: 1)
-        #expect(fence.insideArea == nil)
-        #expect(fence.update(away, accuracyMetres: 5, at: 12) == .leftSafeArea(region: "home"))
-        #expect(fence.isOutside)
-    }
 }
 
 @Suite struct CognitiveIsolationTests {
@@ -4997,39 +4650,6 @@ struct TableDepth: DepthProviding {
         await e.ingest(frame([det("start", x: 0.5, y: 0.5), tip(x: 0.3, y: 0.5)], t: 7))
         guard case .guiding(let again) = await e.state else { Issue.record("expected guiding to start"); return }
         #expect(again.targetLabel == "start")
-    }
-
-    @Test func wanderingIsStickyUntilReturn() async {
-        let (e, _, a) = engine()
-        await e.start()
-        await e.ingest(fence: .leftSafeArea(region: "home"), at: 0)
-        #expect(await e.state == .outsideSafeArea("home"))
-        #expect(await a.spoken == ["You have left home."])
-        // Frames do not clear a wandering alert.
-        await e.ingest(frame([det("button", x: 0.7, y: 0.5), tip(x: 0.4, y: 0.5)], t: 1))
-        #expect(await e.state == .outsideSafeArea("home"))
-        await e.ingest(fence: .returnedToSafeArea(region: "home"), at: 60)
-        #expect(await e.state == .scanning)
-    }
-
-    @Test func caregiverToldWhenToolExists() async {
-        let registry = PluginRegistry()
-        let told = Counter()
-        await registry.register(ToolDescriptor(name: "notify_caregiver", description: "", sideEffect: .none, parameters: ["region"]) { args in
-            await told.inc()
-            return "Carer told: left \(args["region"] ?? "")."
-        })
-        let (e, _, a) = engine(tools: registry)
-        await e.start()
-        await e.ingest(fence: .leftSafeArea(region: "home"), at: 0)
-        #expect(await told.value == 1)
-        #expect(await a.spoken == ["You have left home. Your carer has been told."])
-    }
-
-    @Test func returnDoesNotUnpause() async {
-        let (e, _, _) = engine()
-        await e.ingest(fence: .returnedToSafeArea(region: "home"), at: 0)
-        #expect(await e.state == .idle)
     }
 
     @Test func stopSilencesAndForgets() async {
@@ -5210,41 +4830,6 @@ func waitUntil(_ timeout: TimeInterval = 2, _ condition: () async -> Bool) async
         await #expect(throws: HTTPStatusError(status: 401)) { try await tool.handler([:]) }
     }
 
-    @Test func caregiverAlertQueuesOfflineAndDeliversLater() async throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let outbox = dir.appendingPathComponent("outbox.json")
-        let transport = StubTransport { _ in throw URLError(.notConnectedToInternet) }
-        let alerts = CaregiverAlerts(webhook: URL(string: "https://care.example/alerts")!, transport: transport,
-                                     outboxURL: outbox, signingSecret: "s3cret")
-
-        // Offline: the tool must not claim the carer was told.
-        let tool = await alerts.tool
-        await #expect(throws: CaregiverAlertQueued()) { try await tool.handler(["region": "home"]) }
-        #expect(await alerts.pending == 1)
-
-        // Survives a relaunch.
-        let relaunched = CaregiverAlerts(webhook: URL(string: "https://care.example/alerts")!, transport: transport,
-                                         outboxURL: outbox, signingSecret: "s3cret")
-        #expect(await relaunched.pending == 1)
-
-        // Back online: delivered once, signed, with an idempotency key.
-        transport.respond { _ in (200, Data()) }
-        await relaunched.flush()
-        #expect(await relaunched.pending == 0)
-        let sent = try #require(transport.requests.last)
-        #expect(sent.value(forHTTPHeaderField: "Idempotency-Key") != nil)
-        #expect(sent.value(forHTTPHeaderField: "X-EchoGuide-Signature")?.hasPrefix("sha256=") == true)
-    }
-
-    @Test func signatureIsStableHMAC() {
-        // RFC 4231-style sanity: same input, same output, 64 hex chars.
-        let a = CaregiverAlerts.signature(Data("x".utf8), secret: "k")
-        #expect(a == CaregiverAlerts.signature(Data("x".utf8), secret: "k"))
-        #expect(a.count == "sha256=".count + 64)
-        #expect(a != CaregiverAlerts.signature(Data("y".utf8), secret: "k"))
-    }
-
     @Test func productLookupParsesAndCaches() async {
         let json = #"{"status":1,"product":{"product_name":"Baked Beans","brands":"Heinz, Kraft","allergens_tags":["en:gluten","en:milk"]}}"#
         let transport = StubTransport { _ in (200, Data(json.utf8)) }
@@ -5277,7 +4862,6 @@ func waitUntil(_ timeout: TimeInterval = 2, _ condition: () async -> Bool) async
         "entities": [ { "name": "microwave_start", "doneSentence": "Microwave started.",
                         "entityId": "switch.microwave", "service": "switch.turn_on",
                         "textContains": ["start"], "sideEffect": "physical" } ] },
-      "caregiver": { "webhookURL": "https://care.example.com/alerts", "signingSecret": "care_hmac" },
       "productLookup": true,
       "remoteServers": [ { "endpoint": "http://127.0.0.1:9/mcp" } ]
     }
@@ -5286,10 +4870,9 @@ func waitUntil(_ timeout: TimeInterval = 2, _ condition: () async -> Bool) async
     @Test func installsEveryToolAndReportsDeadRemotes() async throws {
         let manifest = try PluginManifest.load(Data(json.utf8))
         let registry = PluginRegistry()
-        let secrets: SecretProvider = { ["ha_token": "t", "care_hmac": "h"][$0] }
+        let secrets: SecretProvider = { ["ha_token": "t"][$0] }
         let installed = await registry.install(manifest, secrets: secrets, transport: StubTransport())
-        #expect(await registry.toolNames == ["microwave_start", "notify_caregiver", "lookup_product"])
-        #expect(installed.caregiver != nil)
+        #expect(await registry.toolNames == ["microwave_start", "lookup_product"])
         #expect(installed.failedRemotes == [URL(string: "http://127.0.0.1:9/mcp")!])
     }
 
@@ -5416,7 +4999,7 @@ EOF_AVAE
 cat > 'README.md' <<'EOF_AVAE'
 # AutoVision Audio Engine (EchoGuide)
 
-Hands-free spatial vision for people with visual impairment or dementia. The camera watches. When something changes, the engine works out the **one** next step and guides the hand there with haptic pulses and directional audio. It calls a tool only when the user holds their finger on the target. The phone screen is optional.
+Hands-free spatial vision for blind and low-vision people. The camera watches. When something changes, the engine works out the **one** next step and guides the hand there with haptic pulses and directional audio. It calls a tool only when the user holds their finger on the target. The phone screen is optional.
 
 * NOT A MEDICAL DEVICE OR FDA APPROVED CURRENTLY JUST FOR TESTING
 
@@ -5449,10 +5032,7 @@ The split follows the pipeline: Maxwell owns everything up to "a detection with 
 
 ## Digital fence (Bryan)
 
-There are two layers. Each one only reports a `FenceEvent`, and `AutomationEngine` decides how the user hears or feels it.
-
-- **Spatial fence:** hazard zones the camera can see, such as the hob or a knife. A zone follows a detected label or covers a fixed part of the frame. When the fingertip comes near a zone, the user gets "Careful" and a warning pulse. When it enters the zone, they get "Stop", the warning preempts all other guidance, and any dwell in progress is cancelled so a physical tool cannot fire straight after a hazard. If LiDAR is available, `SpatialFence.evaluate(_:depth:)` samples the hand and the centre of every zone through `DepthProviding`, so a hob at 1.2 m and a knife at 0.4 m each get their own distance; a hand that only overlaps a zone on screen is an approach, not a breach.
-- **Location fence:** safe areas for dementia wandering. A position must stay outside the area for 45 s before it counts as leaving, and fixes with poor accuracy are ignored. The event is reported once, and a `notify_caregiver` MCP tool is called if one is registered. The engine enters `outsideSafeArea`, which camera frames do not clear; only `returnedToSafeArea` does, and a paused engine stays paused.
+The fence only reports a `FenceEvent`; `AutomationEngine` decides how the user hears or feels it. It covers hazard zones the camera can see, such as the hob or a knife. A zone follows a detected label or covers a fixed part of the frame. When the fingertip comes near a zone, the user gets "Careful" and a warning pulse. When it enters the zone, they get "Stop", the warning preempts all other guidance, and any dwell in progress is cancelled so a physical tool cannot fire straight after a hazard. If LiDAR is available, `SpatialFence.evaluate(_:depth:)` samples the hand and the centre of every zone through `DepthProviding`, so a hob at 1.2 m and a knife at 0.4 m each get their own distance; a hand that only overlaps a zone on screen is an approach, not a breach.
 
 ## Automation (Bryan)
 
@@ -5461,7 +5041,7 @@ There are two layers. Each one only reports a `FenceEvent`, and `AutomationEngin
 - A target that drops out of the frame keeps its last haptic cue for `lostTargetTimeout` (1.2 s), then haptics stop and the engine goes back to scanning. It never announces, confirms or completes against a remembered box.
 - A finished target is excluded for `completedCooldown` (8 s), so "done" moves on to the next step instead of guiding the finger back to the same button.
 - On target, the guidance pulse train stops and a double tap plays once; hovering does not buzz.
-- `GuidanceView` shows the step huge and yellow on black, a second line for carers ("Hold still", "Follow the pulses"), a goal field, and one big Pause/Resume button.
+- `GuidanceView` shows the step huge and yellow on black, a second line for a sighted helper ("Hold still", "Follow the pulses"), a goal field, and one big Pause/Resume button.
 
 ## Targets
 
@@ -5484,7 +5064,7 @@ Read these honestly:
 ## Build
 
 ```bash
-swift build && swift test        # macOS host: pure logic, 69 tests (plus `cd proxy && node --test`: 6)
+swift build && swift test        # macOS host: pure logic, 62 tests (plus `cd proxy && node --test`: 6)
 ```
 
 The iOS-only paths (ARKit, the camera, the haptic actuator) are behind `#if canImport(...) && os(iOS)`. The `ios-build` CI job compiles them with `xcodebuild` for the iOS Simulator. Real latency numbers need a device.
@@ -5495,9 +5075,9 @@ Open `EchoGuideApp/EchoGuideApp.xcodeproj` in Xcode 16+, set your team, and run 
 
 - With LiDAR, ARKit owns the camera and `LiDARDepthEngine` feeds the pipeline. Without LiDAR, `CameraFeed` does.
 - `PerceptionPipeline` → `SpatialFence` → `AutomationEngine` → haptics, audio, plugins and router.
-- The location fence, the caregiver outbox flush (every 30 s when online) and the optional voice loop start here too.
+- The optional voice loop starts here too.
 
-Per-home setup goes in `Application Support/echoguide.json` (plugins, safe areas, starting goal); the bundled `echoguide.sample.json` is the fallback. Secrets (the proxy `device_token`, Home Assistant token, webhook signing key) are read from the Keychain, service `EchoGuide`.
+Per-home setup goes in `Application Support/echoguide.json` (plugins, starting goal); the bundled `echoguide.sample.json` is the fallback. Secrets (the proxy `device_token`, Home Assistant token) are read from the Keychain, service `EchoGuide`.
 
 **Model:** run the `export-model` workflow (Actions tab), download the `.mlpackage`, and drop it in `EchoGuideApp/Resources/Models/`. It is compiled on first launch. Without it, the app runs hands, text and barcodes only.
 
@@ -5522,7 +5102,7 @@ Off by default; the product works without it. With voice on (the `voiceEnabled` 
 
 ## Plugins (MCP)
 
-Built-in tools: **Home Assistant** (presses the control for the user through one hub that already integrates thousands of appliances), **caregiver alerts** (signed webhook, idempotent, saved to a disk outbox so an alert raised offline is delivered on reconnect; the user is told "your carer has been told" only once it has actually gone out), and **product lookup** (barcode to product name and allergens via Open Food Facts; QR codes never leave the device). A per-home `PluginManifest` JSON sets all of this up without a code change, and secrets come from the Keychain, never from the manifest.
+Built-in tools: **Home Assistant** (presses the control for the user through one hub that already integrates thousands of appliances), and **product lookup** (barcode to product name and allergens via Open Food Facts; QR codes never leave the device). A per-home `PluginManifest` JSON sets all of this up without a code change, and secrets come from the Keychain, never from the manifest.
 
 `PluginRegistry` serves MCP `initialize`, `tools/list` and `tools/call` over JSON-RPC 2.0. `MCPHTTPClient` connects to remote MCP servers over Streamable HTTP. An example FastMCP server is in `plugins/smart_home_server.py`.
 
@@ -5531,7 +5111,7 @@ Remote tools are registered as `physical` unless told otherwise. A physical tool
 ## Not built yet
 
 - The OpenAI Realtime API (multi-turn). The router uses one-shot Chat Completions.
-- A care-provider setup flow that writes `echoguide.json` and the Keychain secrets (today: by hand or MDM).
+- A setup flow that writes `echoguide.json` and the Keychain secrets (today: by hand).
 - Real measurements: run the on-device benchmark on an A17-class iPhone and put the numbers in the targets table.
 EOF_AVAE
 
@@ -5551,13 +5131,6 @@ def microwave_start(text: str = "") -> str:
     """Start the paired smart microwave."""
     # Call the appliance vendor API here.
     return "Microwave started."
-
-
-@mcp.tool
-def notify_caregiver(region: str) -> str:
-    """Tell the caregiver the user left a safe area."""
-    # Send SMS / push via your provider here.
-    return f"Carer told: left {region}."
 
 
 if __name__ == "__main__":

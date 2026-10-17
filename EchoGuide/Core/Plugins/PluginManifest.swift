@@ -7,7 +7,6 @@
 //     "entities": [ { "name": "microwave_start", "doneSentence": "Microwave started.",
 //                     "entityId": "switch.microwave", "service": "switch.turn_on",
 //                     "textContains": ["start"], "sideEffect": "physical" } ] },
-//   "caregiver": { "webhookURL": "https://care.example.com/alerts", "signingSecret": "care_hmac" },
 //   "productLookup": true,
 //   "remoteServers": [ { "endpoint": "https://plugins.example.com/mcp",
 //                        "claims": { "thermostat_set": { "labels": ["thermostat"] } },
@@ -22,11 +21,6 @@ public struct PluginManifest: Sendable, Codable, Equatable {
         public var baseURL: URL
         public var tokenSecret: String
         public var entities: [HomeAssistantEntity]
-    }
-
-    public struct Caregiver: Sendable, Codable, Equatable {
-        public var webhookURL: URL
-        public var signingSecret: String?
     }
 
     public struct Claim: Sendable, Codable, Equatable {
@@ -48,7 +42,6 @@ public struct PluginManifest: Sendable, Codable, Equatable {
     }
 
     public var homeAssistant: HomeAssistant?
-    public var caregiver: Caregiver?
     public var productLookup: Bool?
     public var remoteServers: [RemoteServer]?
 
@@ -58,8 +51,6 @@ public struct PluginManifest: Sendable, Codable, Equatable {
 }
 
 public struct InstalledPlugins: Sendable {
-    /// Keep a handle so the app can `flush()` on reconnect and launch.
-    public var caregiver: CaregiverAlerts?
     /// Remote servers that could not be reached; their tools are missing until retried.
     public var failedRemotes: [URL]
 }
@@ -69,8 +60,8 @@ extension PluginRegistry {
     /// remote server cannot shadow a built-in by registering the same name.
     @discardableResult
     public func install(_ manifest: PluginManifest, secrets: @escaping SecretProvider,
-                        transport: HTTPTransport = URLSessionTransport(), outboxURL: URL? = nil) async -> InstalledPlugins {
-        var installed = InstalledPlugins(caregiver: nil, failedRemotes: [])
+                        transport: HTTPTransport = URLSessionTransport()) async -> InstalledPlugins {
+        var installed = InstalledPlugins(failedRemotes: [])
 
         if let ha = manifest.homeAssistant {
             let secret = ha.tokenSecret
@@ -78,13 +69,6 @@ extension PluginRegistry {
                                                   token: { await secrets(secret) }) {
                 register(tool)
             }
-        }
-
-        if let c = manifest.caregiver {
-            let signing: String? = if let name = c.signingSecret { await secrets(name) } else { nil }
-            let alerts = CaregiverAlerts(webhook: c.webhookURL, transport: transport, outboxURL: outboxURL, signingSecret: signing)
-            register(await alerts.tool)
-            installed.caregiver = alerts
         }
 
         if manifest.productLookup == true {

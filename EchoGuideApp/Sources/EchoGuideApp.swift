@@ -35,7 +35,7 @@ struct EchoGuideApp: App {
 }
 
 enum AudioSessionSetup {
-    /// Voice mode needs the mic. Keep mixing and ducking so a carer's call or
+    /// Voice mode needs the mic. Keep mixing and ducking so a phone call or
     /// music is never silenced, and route to the speaker, not the earpiece.
     static func enableRecording() throws {
         let s = AVAudioSession.sharedInstance()

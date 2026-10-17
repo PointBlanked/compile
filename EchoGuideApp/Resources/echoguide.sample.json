@@ -1,5 +1,4 @@
 {
   "goal": null,
-  "plugins": { "productLookup": true },
-  "safeAreas": []
+  "plugins": { "productLookup": true }
 }

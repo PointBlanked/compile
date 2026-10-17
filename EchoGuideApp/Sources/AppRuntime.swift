@@ -5,7 +5,6 @@
 //   LiDAR (ARKit) or CameraFeed -> PerceptionPipeline -> SpatialFence -> AutomationEngine
 //                                                                          |-> haptics, audio
 //                                                                          |-> plugins, router
-//   LocationFenceMonitor ---------------------------------------------------^
 //   VoiceLoop (optional) -> goal / question
 
 import Foundation
@@ -31,7 +30,6 @@ final class AppRuntime {
     private var vision: LocalVisionEngine?
     private var lidar: LiDARDepthEngine?
     private var camera: CameraFeed?
-    private var location: LocationFenceMonitor?
     private var voiceIO: VoiceAudioIO?
     private var stt: DeepgramSTTClient?
     private var background: [Task<Void, Never>] = []
@@ -68,12 +66,8 @@ final class AppRuntime {
         let router = CloudReasoningRouter(config: routerConfig, provider: provider, connectivity: connectivity)
 
         let registry = PluginRegistry()
-        var caregiver: CaregiverAlerts?
         if let manifest = config.plugins {
-            let outbox = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-                .appendingPathComponent("caregiver-outbox.json")
-            let installed = await registry.install(manifest, secrets: { Keychain.read($0) }, outboxURL: outbox)
-            caregiver = installed.caregiver
+            let installed = await registry.install(manifest, secrets: { Keychain.read($0) })
             for url in installed.failedRemotes { log.warning("Plugin server unreachable: \(url.absoluteString, privacy: .public)") }
         }
 
@@ -111,25 +105,6 @@ final class AppRuntime {
             }
         }
 
-        // Location fence (dementia wandering).
-        if let areas = config.safeAreas, !areas.isEmpty {
-            let monitor = LocationFenceMonitor(areas: areas) { event in
-                Task { await automation.ingest(fence: event, at: Date().timeIntervalSince1970) }
-            }
-            monitor.start()
-            location = monitor
-        }
-
-        // Deliver caregiver alerts queued while offline.
-        if let caregiver {
-            background.append(Task {
-                while !Task.isCancelled {
-                    if await connectivity.isOnline() { await caregiver.flush() }
-                    try? await Task.sleep(nanoseconds: 30_000_000_000)
-                }
-            })
-        }
-
         if AppSettings.voiceEnabled, let proxy = AppSettings.proxyBase {
             await startVoice(proxy: proxy, audio: audio, automation: automation, router: router, deviceToken: deviceToken)
         }
@@ -141,7 +116,6 @@ final class AppRuntime {
         background.forEach { $0.cancel() }
         lidar?.stop()
         camera?.stop()
-        location?.stop()
         voiceIO?.stopCapture()
         await stt?.stop()
         await automation?.stop()

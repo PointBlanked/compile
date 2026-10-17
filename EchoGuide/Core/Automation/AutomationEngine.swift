@@ -20,8 +20,6 @@ public enum AutomationState: Sendable, Equatable {
     case completed(String)
     /// Hand inside a spatial hazard zone.
     case warning(String)
-    /// User has walked out of a safe location region (dementia wandering).
-    case outsideSafeArea(String)
 }
 
 public struct AutomationConfig: Sendable {
@@ -130,8 +128,6 @@ public actor AutomationEngine {
         let now = frame.timestamp
 
         if let fence, await handle(fence, at: now) { return }
-        // Wandering outside the safe area is cleared only by coming back.
-        if case .outsideSafeArea = state { return }
 
         // Recently finished targets are off the menu; prune expired ones.
         completedUntil = completedUntil.filter { $0.value > now }
@@ -258,20 +254,6 @@ public actor AutomationEngine {
                 await haptics.warn()
                 await audio.speak("Careful. \(zone.capitalizedFirst) is close.", azimuth: 0)
             }
-            return false
-        case .leftSafeArea(let region):
-            var told = false
-            if let tools {
-                let alert = ToolMatch(toolName: "notify_caregiver", sideEffect: .none, arguments: ["region": region])
-                told = (try? await tools.invoke(alert)) != nil
-            }
-            await audio.speak(told ? "You have left \(region). Your carer has been told." : "You have left \(region).", azimuth: 0)
-            transition(.outsideSafeArea(region))
-            return true
-        case .returnedToSafeArea(let region):
-            await audio.speak("You are back at \(region).", azimuth: 0)
-            // Only the wandering alert is cleared; a paused engine stays paused.
-            if case .outsideSafeArea = state { transition(.scanning) }
             return false
         }
     }

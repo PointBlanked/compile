@@ -163,18 +163,6 @@ struct StubProvider: ReasoningProvider {
         #expect(SpatialFence.kitchenDefaults.evaluate(frame([det("oven", x: 0.5, y: 0.5)], t: 0)) == nil)
     }
 
-    @Test func locationFenceNeedsDwellAndIgnoresJitter() {
-        let home = GeoCoordinate(latitude: 51.5145, longitude: -0.1165)
-        var fence = LocationFence(areas: [SafeArea(name: "home", center: home, radiusMetres: 80)])
-        #expect(fence.update(home, accuracyMetres: 10, at: 0) == nil)
-
-        let away = GeoCoordinate(latitude: 51.5175, longitude: -0.1165) // ~330 m north
-        #expect(fence.update(away, accuracyMetres: 300, at: 10) == nil) // bad fix ignored
-        #expect(fence.update(away, accuracyMetres: 10, at: 20) == nil)
-        #expect(fence.update(away, accuracyMetres: 10, at: 70) == .leftSafeArea(region: "home"))
-        #expect(fence.update(away, accuracyMetres: 10, at: 90) == nil) // reported once
-        #expect(fence.update(home, accuracyMetres: 10, at: 200) == .returnedToSafeArea(region: "home"))
-    }
 }
 
 // MARK: - Bryan + Maxwell: haptics, depth, audio math

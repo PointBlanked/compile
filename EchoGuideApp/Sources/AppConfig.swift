@@ -11,7 +11,6 @@ import EchoGuideVision
 /// care provider's setup flow); the bundled sample is the fallback.
 struct AppConfig: Decodable {
     var plugins: PluginManifest?
-    var safeAreas: [SafeArea]?
     /// Start narrowed to one task ("start"), nil for open scanning.
     var goal: String?
 

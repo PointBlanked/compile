@@ -57,18 +57,6 @@ struct TableDepth: DepthProviding {
         #expect(fence.evaluate(frame([tip(x: 0.5, y: 0.5)], t: 0)) == nil)
     }
 
-    @Test func locationFenceExposesWhereTheUserIs() {
-        let home = GeoCoordinate(latitude: 51.5145, longitude: -0.1165)
-        var fence = LocationFence(areas: [SafeArea(name: "home", center: home, radiusMetres: 80)], exitDwell: 10)
-        _ = fence.update(home, accuracyMetres: 5, at: 0)
-        #expect(fence.insideArea == "home")
-        #expect(!fence.isOutside)
-        let away = GeoCoordinate(latitude: 51.5175, longitude: -0.1165)
-        _ = fence.update(away, accuracyMetres: 5, at: 1)
-        #expect(fence.insideArea == nil)
-        #expect(fence.update(away, accuracyMetres: 5, at: 12) == .leftSafeArea(region: "home"))
-        #expect(fence.isOutside)
-    }
 }
 
 @Suite struct CognitiveIsolationTests {
@@ -199,39 +187,6 @@ struct TableDepth: DepthProviding {
         await e.ingest(frame([det("start", x: 0.5, y: 0.5), tip(x: 0.3, y: 0.5)], t: 7))
         guard case .guiding(let again) = await e.state else { Issue.record("expected guiding to start"); return }
         #expect(again.targetLabel == "start")
-    }
-
-    @Test func wanderingIsStickyUntilReturn() async {
-        let (e, _, a) = engine()
-        await e.start()
-        await e.ingest(fence: .leftSafeArea(region: "home"), at: 0)
-        #expect(await e.state == .outsideSafeArea("home"))
-        #expect(await a.spoken == ["You have left home."])
-        // Frames do not clear a wandering alert.
-        await e.ingest(frame([det("button", x: 0.7, y: 0.5), tip(x: 0.4, y: 0.5)], t: 1))
-        #expect(await e.state == .outsideSafeArea("home"))
-        await e.ingest(fence: .returnedToSafeArea(region: "home"), at: 60)
-        #expect(await e.state == .scanning)
-    }
-
-    @Test func caregiverToldWhenToolExists() async {
-        let registry = PluginRegistry()
-        let told = Counter()
-        await registry.register(ToolDescriptor(name: "notify_caregiver", description: "", sideEffect: .none, parameters: ["region"]) { args in
-            await told.inc()
-            return "Carer told: left \(args["region"] ?? "")."
-        })
-        let (e, _, a) = engine(tools: registry)
-        await e.start()
-        await e.ingest(fence: .leftSafeArea(region: "home"), at: 0)
-        #expect(await told.value == 1)
-        #expect(await a.spoken == ["You have left home. Your carer has been told."])
-    }
-
-    @Test func returnDoesNotUnpause() async {
-        let (e, _, _) = engine()
-        await e.ingest(fence: .returnedToSafeArea(region: "home"), at: 0)
-        #expect(await e.state == .idle)
     }
 
     @Test func stopSilencesAndForgets() async {

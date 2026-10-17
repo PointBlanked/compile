@@ -1,4 +1,5 @@
-// Owner: Bryan. Step-anchoring for dementia and cognitive accessibility.
+// Owner: Bryan. Step-anchoring: one clear step at a time, so a blind or
+// low-vision user is never handed a list of things to choose between.
 // A frame can hold a dozen detections; the user gets exactly one. Rules:
 //   1. One target at a time, chosen by goal, closeness to the finger, size
 //      and confidence.

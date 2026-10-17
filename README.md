@@ -1,6 +1,6 @@
 # AutoVision Audio Engine (EchoGuide)
 
-Hands-free spatial vision for people with visual impairment or dementia. The camera watches. When something changes, the engine works out the **one** next step and guides the hand there with haptic pulses and directional audio. It calls a tool only when the user holds their finger on the target. The phone screen is optional.
+Hands-free spatial vision for blind and low-vision people. The camera watches. When something changes, the engine works out the **one** next step and guides the hand there with haptic pulses and directional audio. It calls a tool only when the user holds their finger on the target. The phone screen is optional.
 
 * NOT A MEDICAL DEVICE OR FDA APPROVED CURRENTLY JUST FOR TESTING
 
@@ -33,10 +33,7 @@ The split follows the pipeline: Maxwell owns everything up to "a detection with 
 
 ## Digital fence (Bryan)
 
-There are two layers. Each one only reports a `FenceEvent`, and `AutomationEngine` decides how the user hears or feels it.
-
-- **Spatial fence:** hazard zones the camera can see, such as the hob or a knife. A zone follows a detected label or covers a fixed part of the frame. When the fingertip comes near a zone, the user gets "Careful" and a warning pulse. When it enters the zone, they get "Stop", the warning preempts all other guidance, and any dwell in progress is cancelled so a physical tool cannot fire straight after a hazard. If LiDAR is available, `SpatialFence.evaluate(_:depth:)` samples the hand and the centre of every zone through `DepthProviding`, so a hob at 1.2 m and a knife at 0.4 m each get their own distance; a hand that only overlaps a zone on screen is an approach, not a breach.
-- **Location fence:** safe areas for dementia wandering. A position must stay outside the area for 45 s before it counts as leaving, and fixes with poor accuracy are ignored. The event is reported once, and a `notify_caregiver` MCP tool is called if one is registered. The engine enters `outsideSafeArea`, which camera frames do not clear; only `returnedToSafeArea` does, and a paused engine stays paused.
+The fence only reports a `FenceEvent`; `AutomationEngine` decides how the user hears or feels it. It covers hazard zones the camera can see, such as the hob or a knife. A zone follows a detected label or covers a fixed part of the frame. When the fingertip comes near a zone, the user gets "Careful" and a warning pulse. When it enters the zone, they get "Stop", the warning preempts all other guidance, and any dwell in progress is cancelled so a physical tool cannot fire straight after a hazard. If LiDAR is available, `SpatialFence.evaluate(_:depth:)` samples the hand and the centre of every zone through `DepthProviding`, so a hob at 1.2 m and a knife at 0.4 m each get their own distance; a hand that only overlaps a zone on screen is an approach, not a breach.
 
 ## Automation (Bryan)
 
@@ -45,7 +42,7 @@ There are two layers. Each one only reports a `FenceEvent`, and `AutomationEngin
 - A target that drops out of the frame keeps its last haptic cue for `lostTargetTimeout` (1.2 s), then haptics stop and the engine goes back to scanning. It never announces, confirms or completes against a remembered box.
 - A finished target is excluded for `completedCooldown` (8 s), so "done" moves on to the next step instead of guiding the finger back to the same button.
 - On target, the guidance pulse train stops and a double tap plays once; hovering does not buzz.
-- `GuidanceView` shows the step huge and yellow on black, a second line for carers ("Hold still", "Follow the pulses"), a goal field, and one big Pause/Resume button.
+- `GuidanceView` shows the step huge and yellow on black, a second line for a sighted helper ("Hold still", "Follow the pulses"), a goal field, and one big Pause/Resume button.
 
 ## Targets
 
@@ -68,7 +65,7 @@ Read these honestly:
 ## Build
 
 ```bash
-swift build && swift test        # macOS host: pure logic, 69 tests (plus `cd proxy && node --test`: 6)
+swift build && swift test        # macOS host: pure logic, 62 tests (plus `cd proxy && node --test`: 6)
 ```
 
 The iOS-only paths (ARKit, the camera, the haptic actuator) are behind `#if canImport(...) && os(iOS)`. The `ios-build` CI job compiles them with `xcodebuild` for the iOS Simulator. Real latency numbers need a device.
@@ -79,9 +76,9 @@ Open `EchoGuideApp/EchoGuideApp.xcodeproj` in Xcode 16+, set your team, and run 
 
 - With LiDAR, ARKit owns the camera and `LiDARDepthEngine` feeds the pipeline. Without LiDAR, `CameraFeed` does.
 - `PerceptionPipeline` → `SpatialFence` → `AutomationEngine` → haptics, audio, plugins and router.
-- The location fence, the caregiver outbox flush (every 30 s when online) and the optional voice loop start here too.
+- The optional voice loop starts here too.
 
-Per-home setup goes in `Application Support/echoguide.json` (plugins, safe areas, starting goal); the bundled `echoguide.sample.json` is the fallback. Secrets (the proxy `device_token`, Home Assistant token, webhook signing key) are read from the Keychain, service `EchoGuide`.
+Per-home setup goes in `Application Support/echoguide.json` (plugins, starting goal); the bundled `echoguide.sample.json` is the fallback. Secrets (the proxy `device_token`, Home Assistant token) are read from the Keychain, service `EchoGuide`.
 
 **Model:** run the `export-model` workflow (Actions tab), download the `.mlpackage`, and drop it in `EchoGuideApp/Resources/Models/`. It is compiled on first launch. Without it, the app runs hands, text and barcodes only.
 
@@ -106,7 +103,7 @@ Off by default; the product works without it. With voice on (the `voiceEnabled` 
 
 ## Plugins (MCP)
 
-Built-in tools: **Home Assistant** (presses the control for the user through one hub that already integrates thousands of appliances), **caregiver alerts** (signed webhook, idempotent, saved to a disk outbox so an alert raised offline is delivered on reconnect; the user is told "your carer has been told" only once it has actually gone out), and **product lookup** (barcode to product name and allergens via Open Food Facts; QR codes never leave the device). A per-home `PluginManifest` JSON sets all of this up without a code change, and secrets come from the Keychain, never from the manifest.
+Built-in tools: **Home Assistant** (presses the control for the user through one hub that already integrates thousands of appliances), and **product lookup** (barcode to product name and allergens via Open Food Facts; QR codes never leave the device). A per-home `PluginManifest` JSON sets all of this up without a code change, and secrets come from the Keychain, never from the manifest.
 
 `PluginRegistry` serves MCP `initialize`, `tools/list` and `tools/call` over JSON-RPC 2.0. `MCPHTTPClient` connects to remote MCP servers over Streamable HTTP. An example FastMCP server is in `plugins/smart_home_server.py`.
 
@@ -115,5 +112,5 @@ Remote tools are registered as `physical` unless told otherwise. A physical tool
 ## Not built yet
 
 - The OpenAI Realtime API (multi-turn). The router uses one-shot Chat Completions.
-- A care-provider setup flow that writes `echoguide.json` and the Keychain secrets (today: by hand or MDM).
+- A setup flow that writes `echoguide.json` and the Keychain secrets (today: by hand).
 - Real measurements: run the on-device benchmark on an A17-class iPhone and put the numbers in the targets table.

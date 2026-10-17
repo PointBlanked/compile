@@ -158,41 +158,6 @@ func waitUntil(_ timeout: TimeInterval = 2, _ condition: () async -> Bool) async
         await #expect(throws: HTTPStatusError(status: 401)) { try await tool.handler([:]) }
     }
 
-    @Test func caregiverAlertQueuesOfflineAndDeliversLater() async throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let outbox = dir.appendingPathComponent("outbox.json")
-        let transport = StubTransport { _ in throw URLError(.notConnectedToInternet) }
-        let alerts = CaregiverAlerts(webhook: URL(string: "https://care.example/alerts")!, transport: transport,
-                                     outboxURL: outbox, signingSecret: "s3cret")
-
-        // Offline: the tool must not claim the carer was told.
-        let tool = await alerts.tool
-        await #expect(throws: CaregiverAlertQueued()) { try await tool.handler(["region": "home"]) }
-        #expect(await alerts.pending == 1)
-
-        // Survives a relaunch.
-        let relaunched = CaregiverAlerts(webhook: URL(string: "https://care.example/alerts")!, transport: transport,
-                                         outboxURL: outbox, signingSecret: "s3cret")
-        #expect(await relaunched.pending == 1)
-
-        // Back online: delivered once, signed, with an idempotency key.
-        transport.respond { _ in (200, Data()) }
-        await relaunched.flush()
-        #expect(await relaunched.pending == 0)
-        let sent = try #require(transport.requests.last)
-        #expect(sent.value(forHTTPHeaderField: "Idempotency-Key") != nil)
-        #expect(sent.value(forHTTPHeaderField: "X-EchoGuide-Signature")?.hasPrefix("sha256=") == true)
-    }
-
-    @Test func signatureIsStableHMAC() {
-        // RFC 4231-style sanity: same input, same output, 64 hex chars.
-        let a = CaregiverAlerts.signature(Data("x".utf8), secret: "k")
-        #expect(a == CaregiverAlerts.signature(Data("x".utf8), secret: "k"))
-        #expect(a.count == "sha256=".count + 64)
-        #expect(a != CaregiverAlerts.signature(Data("y".utf8), secret: "k"))
-    }
-
     @Test func productLookupParsesAndCaches() async {
         let json = #"{"status":1,"product":{"product_name":"Baked Beans","brands":"Heinz, Kraft","allergens_tags":["en:gluten","en:milk"]}}"#
         let transport = StubTransport { _ in (200, Data(json.utf8)) }
@@ -225,7 +190,6 @@ func waitUntil(_ timeout: TimeInterval = 2, _ condition: () async -> Bool) async
         "entities": [ { "name": "microwave_start", "doneSentence": "Microwave started.",
                         "entityId": "switch.microwave", "service": "switch.turn_on",
                         "textContains": ["start"], "sideEffect": "physical" } ] },
-      "caregiver": { "webhookURL": "https://care.example.com/alerts", "signingSecret": "care_hmac" },
       "productLookup": true,
       "remoteServers": [ { "endpoint": "http://127.0.0.1:9/mcp" } ]
     }
@@ -234,10 +198,9 @@ func waitUntil(_ timeout: TimeInterval = 2, _ condition: () async -> Bool) async
     @Test func installsEveryToolAndReportsDeadRemotes() async throws {
         let manifest = try PluginManifest.load(Data(json.utf8))
         let registry = PluginRegistry()
-        let secrets: SecretProvider = { ["ha_token": "t", "care_hmac": "h"][$0] }
+        let secrets: SecretProvider = { ["ha_token": "t"][$0] }
         let installed = await registry.install(manifest, secrets: secrets, transport: StubTransport())
-        #expect(await registry.toolNames == ["microwave_start", "notify_caregiver", "lookup_product"])
-        #expect(installed.caregiver != nil)
+        #expect(await registry.toolNames == ["microwave_start", "lookup_product"])
         #expect(installed.failedRemotes == [URL(string: "http://127.0.0.1:9/mcp")!])
     }
 

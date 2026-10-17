@@ -15,12 +15,5 @@ def microwave_start(text: str = "") -> str:
     return "Microwave started."
 
 
-@mcp.tool
-def notify_caregiver(region: str) -> str:
-    """Tell the caregiver the user left a safe area."""
-    # Send SMS / push via your provider here.
-    return f"Carer told: left {region}."
-
-
 if __name__ == "__main__":
     mcp.run(transport="http", port=8765)
