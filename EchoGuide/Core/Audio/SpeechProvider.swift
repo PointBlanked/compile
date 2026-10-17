@@ -1,0 +1,143 @@
+// Owner: Bryan. Pluggable text-to-speech. The default voice is the on-device
+// AVSpeechSynthesizer, which always works. An open-weight Kokoro voice can be
+// layered on top through any server that speaks the OpenAI audio API, such as
+// Kokoro-FastAPI on a laptop or Raspberry Pi in the home:
+//
+//     docker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:latest
+//
+// The provider returns a WAV; SpatialAudioEngine plays it and falls back to
+// the on-device voice on any error or timeout, so Airplane Mode still works.
+
+import Foundation
+
+/// Produces a playable audio file (WAV) for a short phrase.
+public protocol SpeechSynthesizing: Sendable {
+    func synthesize(_ text: String) async throws -> Data
+}
+
+public enum SpeechProviderError: Error, Equatable {
+    case badStatus(Int)
+    case emptyAudio
+    case timeout
+}
+
+/// Kokoro-82M through an OpenAI-compatible `/v1/audio/speech` endpoint.
+public struct KokoroSpeechProvider: SpeechSynthesizing {
+    public typealias Transport = @Sendable (URLRequest) async throws -> (Data, URLResponse)
+
+    public var baseURL: URL
+    /// Kokoro voice id, e.g. "af_heart", "bf_emma", or a blend "af_bella(2)+af_sky(1)".
+    public var voice: String
+    public var speed: Double
+    /// Per-request budget. A spoken cue that arrives late is worse than the
+    /// on-device voice arriving now.
+    public var timeout: TimeInterval
+    private let transport: Transport
+
+    public init(baseURL: URL, voice: String = "af_heart", speed: Double = 1.0, timeout: TimeInterval = 1.5,
+                transport: Transport? = nil) {
+        self.baseURL = baseURL
+        self.voice = voice
+        self.speed = speed
+        self.timeout = timeout
+        self.transport = transport ?? { request in try await URLSession.shared.data(for: request) }
+    }
+
+    public func request(for text: String) -> URLRequest {
+        var r = URLRequest(url: baseURL.appendingPathComponent("v1/audio/speech"))
+        r.httpMethod = "POST"
+        r.timeoutInterval = timeout
+        r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = [
+            "model": "kokoro",
+            "input": text,
+            "voice": voice,
+            "response_format": "wav",
+            "speed": speed,
+        ]
+        r.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        return r
+    }
+
+    public func synthesize(_ text: String) async throws -> Data {
+        let (data, response) = try await withTimeout(timeout) { try await transport(request(for: text)) }
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw SpeechProviderError.badStatus(http.statusCode)
+        }
+        guard data.count > 44 else { throw SpeechProviderError.emptyAudio } // a WAV header alone is 44 bytes
+        return data
+    }
+}
+
+/// Runs `body` or throws `SpeechProviderError.timeout`, whichever comes first.
+func withTimeout<T: Sendable>(_ seconds: TimeInterval, _ body: @escaping @Sendable () async throws -> T) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await body() }
+        group.addTask {
+            try await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+            throw SpeechProviderError.timeout
+        }
+        guard let first = try await group.next() else { throw SpeechProviderError.timeout }
+        group.cancelAll()
+        return first
+    }
+}
+
+/// Phrases repeat ("Start. Move right.", "Hold still"), so synthesized audio
+/// is kept by text. Bounded, least recently used out first.
+public actor SpeechCache {
+    private var store: [String: Data] = [:]
+    private var order: [String] = []
+    public let capacity: Int
+
+    public init(capacity: Int = 64) { self.capacity = max(1, capacity) }
+
+    public var count: Int { store.count }
+
+    public func get(_ text: String) -> Data? {
+        guard let d = store[text] else { return nil }
+        order.removeAll { $0 == text }
+        order.append(text)
+        return d
+    }
+
+    public func put(_ text: String, _ data: Data) {
+        if store[text] == nil, store.count >= capacity, let oldest = order.first {
+            order.removeFirst()
+            store[oldest] = nil
+        }
+        store[text] = data
+        order.removeAll { $0 == text }
+        order.append(text)
+    }
+}
+
+/// Which phrases may interrupt which. A hazard or wandering alert cuts off
+/// anything; a routine instruction never cuts off an alert still playing.
+public enum SpeechPolicy {
+    public static func isUrgent(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespaces)
+        return t.hasPrefix("Stop") || t.hasPrefix("Careful") || t.hasPrefix("You have left")
+    }
+}
+
+public enum SpeechSource: String, Sendable {
+    case onDevice
+    case kokoro
+}
+
+/// Minimal 16-bit mono WAV writer, for tests and for caching on-device audio.
+public enum WAVEncoder {
+    public static func pcm16Mono(_ samples: [Float], sampleRate: Int) -> Data {
+        var d = Data()
+        func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        let dataBytes = UInt32(samples.count * 2)
+        d.append(contentsOf: Array("RIFF".utf8)); u32(36 + dataBytes); d.append(contentsOf: Array("WAVE".utf8))
+        d.append(contentsOf: Array("fmt ".utf8)); u32(16); u16(1); u16(1)
+        u32(UInt32(sampleRate)); u32(UInt32(sampleRate * 2)); u16(2); u16(16)
+        d.append(contentsOf: Array("data".utf8)); u32(dataBytes)
+        for s in samples { u16(UInt16(bitPattern: Int16(max(-1, min(1, s)) * 32767))) }
+        return d
+    }
+}

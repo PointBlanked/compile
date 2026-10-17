@@ -34,7 +34,21 @@ public actor SpatialAudioEngine: SpatialAudioCueing {
     private var started = false
     private var observers: [NSObjectProtocol] = []
 
-    public init() {}
+    private let speech: SpeechSynthesizing?
+    private let cache: SpeechCache
+    private var speechPlayer: AVAudioPlayer?
+    private var speechDelegate: SpeechPlayerDelegate?
+    private var urgentUntil: TimeInterval = -.infinity
+    /// Where the last phrase came from, for telemetry and tests.
+    public private(set) var lastSpeechSource: SpeechSource = .onDevice
+    public private(set) var lastSpoken: String?
+
+    /// `speech` is an optional better voice (Kokoro). Without one, or whenever
+    /// it fails or is slow, the on-device synthesizer speaks instead.
+    public init(speech: SpeechSynthesizing? = nil, cacheCapacity: Int = 64) {
+        self.speech = speech
+        self.cache = SpeechCache(capacity: cacheCapacity)
+    }
 
     /// Builds the graph once; (re)starts the engine whenever it is down.
     /// A phone call, a route change (headphones out) or backgrounding stops
@@ -98,14 +112,77 @@ public actor SpatialAudioEngine: SpatialAudioCueing {
     }
 
     public func speak(_ text: String, azimuth: Float) async {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        let urgent = SpeechPolicy.isUrgent(text)
+        // A routine instruction never talks over a hazard or wandering alert.
+        if !urgent, isSpeaking, Date().timeIntervalSince1970 < urgentUntil { return }
+
         // Spoken words carry the instruction; a ping first gives the direction.
         await ping(azimuth: azimuth, elevation: 0)
-        if synth.isSpeaking { synth.stopSpeaking(at: .word) }
+        stopSpeaking()
+        lastSpoken = text
+
+        if let wav = await synthesized(text) {
+            do {
+                let p = try AVAudioPlayer(data: wav)
+                let d = SpeechPlayerDelegate()
+                p.delegate = d
+                speechDelegate = d
+                speechPlayer = p
+                p.prepareToPlay()
+                if p.play() {
+                    lastSpeechSource = .kokoro
+                    if urgent { urgentUntil = Date().timeIntervalSince1970 + p.duration }
+                    return
+                }
+            } catch {}
+            speechPlayer = nil
+        }
+
+        lastSpeechSource = .onDevice
         let u = AVSpeechUtterance(string: text)
         u.rate = AVSpeechUtteranceDefaultSpeechRate * 0.95
         u.prefersAssistiveTechnologySettings = true
+        // ~3 words/s at this rate, generous so the alert is not talked over.
+        if urgent { urgentUntil = Date().timeIntervalSince1970 + Double(text.split(separator: " ").count) / 2.5 }
         synth.speak(u)
     }
+
+    public var isSpeaking: Bool { synth.isSpeaking || (speechPlayer?.isPlaying ?? false) }
+
+    private func stopSpeaking() {
+        if synth.isSpeaking { synth.stopSpeaking(at: .word) }
+        speechPlayer?.stop()
+        speechPlayer = nil
+    }
+
+    /// Cached or freshly synthesized WAV, nil when there is no provider or it
+    /// failed (the caller then uses the on-device voice).
+    private func synthesized(_ text: String) async -> Data? {
+        guard let speech else { return nil }
+        if let hit = await cache.get(text) { return hit }
+        guard let wav = try? await speech.synthesize(text) else { return nil }
+        await cache.put(text, wav)
+        return wav
+    }
+
+    /// Synthesize phrases the demo will need ("Hold still", "Stop. Hob.") so
+    /// the first time they are spoken is as fast as the second.
+    public func prewarm(_ phrases: [String]) async {
+        guard speech != nil else { return }
+        for p in phrases where await cache.get(p) == nil {
+            _ = await synthesized(p)
+        }
+    }
+
+    public var cachedPhrases: Int {
+        get async { await cache.count }
+    }
+
+    /// Keeps the player alive until it finishes; AVAudioPlayer needs a delegate
+    /// object with a stable lifetime to report completion.
+    private final class SpeechPlayerDelegate: NSObject, AVAudioPlayerDelegate {}
 
     /// 60 ms 1.2 kHz sine with a short fade, cheap to schedule repeatedly.
     private static func makePing(format: AVAudioFormat) -> AVAudioPCMBuffer? {

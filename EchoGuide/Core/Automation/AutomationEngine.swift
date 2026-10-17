@@ -61,6 +61,10 @@ public actor AutomationEngine {
     private var lastFenceWarning: [String: TimeInterval] = [:]
     private var routedLabels: Set<String> = []
     private var continuations: [UUID: AsyncStream<AutomationState>.Continuation] = [:]
+    private var cautionContinuations: [UUID: AsyncStream<String?>.Continuation] = [:]
+    /// Hazard zone the hand is approaching right now, nil when clear. Spoken
+    /// as "Careful", shown on screen as a banner; it never changes `state`.
+    public private(set) var caution: String?
 
     public init(
         haptics: HapticCueing,
@@ -92,11 +96,30 @@ public actor AutomationEngine {
 
     private func removeContinuation(_ id: UUID) { continuations[id] = nil }
 
+    /// For the UI: the zone being approached, nil when the hand is clear.
+    public func cautions() -> AsyncStream<String?> {
+        AsyncStream { c in
+            let id = UUID()
+            c.yield(caution)
+            cautionContinuations[id] = c
+            c.onTermination = { [weak self] _ in Task { await self?.removeCautionContinuation(id) } }
+        }
+    }
+
+    private func removeCautionContinuation(_ id: UUID) { cautionContinuations[id] = nil }
+
+    private func setCaution(_ zone: String?) {
+        guard zone != caution else { return }
+        caution = zone
+        for c in cautionContinuations.values { c.yield(zone) }
+    }
+
     /// Narrow the engine to one task ("start", "microwave"); nil for open scanning.
     public func setGoal(_ goal: String?) {
         isolation.goal = goal
         isolation.reset()
         completedUntil = [:]
+        routedLabels = []
         lastSpokenLabel = nil
         onTargetSince = nil
     }
@@ -110,6 +133,7 @@ public actor AutomationEngine {
 
     public func stop() async {
         forgetTarget()
+        setCaution(nil)
         transition(.idle)
         await haptics.stop()
     }
@@ -127,6 +151,7 @@ public actor AutomationEngine {
         guard state != .idle else { return }
         let now = frame.timestamp
 
+        if case .approaching(let zone, _)? = fence { setCaution(zone) } else { setCaution(nil) }
         if let fence, await handle(fence, at: now) { return }
 
         // Recently finished targets are off the menu; prune expired ones.
@@ -231,6 +256,8 @@ public actor AutomationEngine {
             await audio.speak(said, azimuth: 0)
             transition(.completed(said))
         } catch {
+            // Not excluded: the user should be able to settle on it and try again.
+            completedUntil[step.targetLabel] = nil
             await audio.speak("That did not work.", azimuth: 0)
             transition(.completed(step.targetLabel))
         }

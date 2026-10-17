@@ -11,12 +11,31 @@ import EchoGuideContracts
 
 // MARK: - Spatial fence
 
-public struct SpatialFenceZone: Sendable, Equatable {
-    public enum Anchor: Sendable, Equatable {
+public struct SpatialFenceZone: Sendable, Equatable, Codable {
+    public enum Anchor: Sendable, Equatable, Codable {
         /// Follows any detection with this label, e.g. "oven".
         case label(String)
         /// Fixed region of the frame, for a fixed camera mount.
         case region(ImageRect)
+
+        // JSON a carer can write by hand: {"label": "oven"} or
+        // {"region": {"x": 0, "y": 0.8, "width": 1, "height": 0.2}}.
+        private enum CodingKeys: String, CodingKey { case label, region }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            if let l = try c.decodeIfPresent(String.self, forKey: .label) { self = .label(l); return }
+            if let r = try c.decodeIfPresent(ImageRect.self, forKey: .region) { self = .region(r); return }
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "anchor needs \"label\" or \"region\""))
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            switch self {
+            case .label(let l): try c.encode(l, forKey: .label)
+            case .region(let r): try c.encode(r, forKey: .region)
+            }
+        }
     }
 
     public var name: String
@@ -32,9 +51,19 @@ public struct SpatialFenceZone: Sendable, Equatable {
         self.warningMargin = warningMargin
         self.warningDepthMetres = warningDepthMetres
     }
+
+    private enum CodingKeys: String, CodingKey { case name, anchor, warningMargin, warningDepthMetres }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        anchor = try c.decode(Anchor.self, forKey: .anchor)
+        warningMargin = try c.decodeIfPresent(Float.self, forKey: .warningMargin) ?? 0.08
+        warningDepthMetres = try c.decodeIfPresent(Float.self, forKey: .warningDepthMetres) ?? 0.35
+    }
 }
 
-public struct SpatialFence: Sendable {
+public struct SpatialFence: Sendable, Equatable, Codable {
     public var zones: [SpatialFenceZone]
 
     public init(zones: [SpatialFenceZone]) { self.zones = zones }
@@ -113,4 +142,36 @@ public struct SpatialFence: Sendable {
             return frame.targets.filter { $0.label == label }.map(\.box)
         }
     }
+}
+
+// MARK: - Per-home configuration
+
+/// Hazard zones for one home, loaded from JSON next to the plugin manifest,
+/// so a helper can add "the hob is the thing labelled oven" with no code change:
+///
+///     { "zones": [ { "name": "hob", "anchor": { "label": "oven" }, "warningMargin": 0.08 },
+///                  { "name": "stairs", "anchor": { "region": { "x": 0, "y": 0.8, "width": 1, "height": 0.2 } } } ] }
+///
+/// A missing or empty file falls back to `SpatialFence.kitchenDefaults`.
+public struct FenceConfig: Sendable, Equatable, Codable {
+    public var zones: [SpatialFenceZone]
+
+    public init(zones: [SpatialFenceZone] = SpatialFence.kitchenDefaults.zones) {
+        self.zones = zones
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        zones = try c.decodeIfPresent([SpatialFenceZone].self, forKey: .zones) ?? SpatialFence.kitchenDefaults.zones
+    }
+
+    public static func load(from data: Data) throws -> FenceConfig {
+        try JSONDecoder().decode(FenceConfig.self, from: data)
+    }
+
+    public static func load(from url: URL) throws -> FenceConfig {
+        try load(from: Data(contentsOf: url))
+    }
+
+    public var spatialFence: SpatialFence { SpatialFence(zones: zones) }
 }

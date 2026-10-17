@@ -119,9 +119,14 @@ public struct CognitiveTaskIsolation: Sendable {
         return true
     }
 
+    /// A goal can be several words ("start microwave", from the voice
+    /// listener): any word of it on the label or the recognised text matches,
+    /// so "start" on a button and "microwave" on the appliance both count.
     private func matches(_ d: Detection, _ goal: String) -> Bool {
-        let g = goal.lowercased()
-        return d.label.lowercased().contains(g) || (d.text?.lowercased().contains(g) ?? false)
+        let label = d.label.lowercased(), text = d.text?.lowercased() ?? ""
+        let words = goal.lowercased().split(separator: " ").filter { $0.count >= 2 }
+        guard !words.isEmpty else { return false }
+        return words.contains { label.contains($0) || text.contains($0) }
     }
 
     private func isSame(_ a: Detection, _ b: Detection) -> Bool {

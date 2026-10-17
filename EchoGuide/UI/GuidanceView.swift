@@ -9,15 +9,37 @@ import SwiftUI
 import Observation
 import EchoGuideContracts
 
+/// Anything that can listen for a spoken goal and return the goal words.
+/// `VoiceGoalListener` (Audio) satisfies this with a one-line extension in
+/// the app target: `extension VoiceGoalListener: GoalListening {}`.
+public protocol GoalListening: Sendable {
+    func listen() async throws -> String?
+}
+
 @MainActor
 @Observable
 public final class GuidanceModel {
     public private(set) var state: AutomationState = .idle
     public private(set) var goal: String?
+    /// Hazard zone the hand is approaching, for the amber banner.
+    public private(set) var caution: String?
+    public private(set) var isListening = false
+    /// Short feedback after a listening attempt ("Heard: start", "Did not catch that").
+    public private(set) var listenResult: String?
     private var engine: AutomationEngine?
+    private var listener: GoalListening?
     private var task: Task<Void, Never>?
+    private var cautionTask: Task<Void, Never>?
 
-    public init() {}
+    public init(listener: GoalListening? = nil) {
+        self.listener = listener
+    }
+
+    /// A model pinned to one state, for SwiftUI previews and tests.
+    public init(previewState: AutomationState, goal: String? = nil) {
+        state = previewState
+        self.goal = goal
+    }
 
     public func bind(to engine: AutomationEngine) {
         self.engine = engine
@@ -25,6 +47,12 @@ public final class GuidanceModel {
         task = Task { [weak self] in
             for await s in await engine.states() {
                 self?.state = s
+            }
+        }
+        cautionTask?.cancel()
+        cautionTask = Task { [weak self] in
+            for await c in await engine.cautions() {
+                self?.caution = c
             }
         }
         Task { [weak self] in
@@ -50,6 +78,32 @@ public final class GuidanceModel {
         self.goal = value
         guard let engine else { return }
         Task { await engine.setGoal(value) }
+    }
+
+    public var canListen: Bool { listener != nil }
+
+    /// Mic button: one short listening window, then the goal is set from what
+    /// was said. Pauses nothing; guidance carries on underneath.
+    public func listenForGoal() {
+        guard let listener, !isListening else { return }
+        isListening = true
+        listenResult = nil
+        Task { [weak self] in
+            let heard = try? await listener.listen()
+            guard let self else { return }
+            self.isListening = false
+            if let heard, !heard.isEmpty {
+                self.setGoal(heard)
+                self.listenResult = "Heard: \(heard)"
+            } else {
+                self.listenResult = "Did not catch that"
+            }
+        }
+    }
+
+    /// Banner text for an approaching hazard, in the words the audio speaks.
+    var cautionLine: String? {
+        caution.map { "Careful. \($0.capitalizedFirst) is close." }
     }
 
     /// The one line that matters, in the words the audio speaks.
@@ -84,6 +138,20 @@ public final class GuidanceModel {
         if case .onTarget = state { return true }
         return false
     }
+
+    /// SF Symbol for the one direction the audio speaks, or nil when there is
+    /// nothing to point at. Mirrors `CognitiveTaskIsolation.direction`: the
+    /// larger axis wins, so the arrow and the words never disagree.
+    var arrowSymbol: String? {
+        guard case .guiding(let step) = state, case .align(let dx, let dy) = step.guidance else { return nil }
+        return Self.arrowSymbol(dx: dx, dy: dy)
+    }
+
+    static func arrowSymbol(dx: Float, dy: Float) -> String? {
+        guard (dx * dx + dy * dy).squareRoot() > Alignment.tolerance else { return nil }
+        if abs(dx) >= abs(dy) { return dx > 0 ? "arrow.right" : "arrow.left" }
+        return dy > 0 ? "arrow.down" : "arrow.up"
+    }
 }
 
 public struct GuidanceView: View {
@@ -113,6 +181,13 @@ public struct GuidanceView: View {
             VStack(spacing: 16) {
                 Spacer(minLength: 0)
 
+                if let arrow = model.arrowSymbol {
+                    Image(systemName: arrow)
+                        .font(.system(size: 96, weight: .black))
+                        .foregroundStyle(foreground)
+                        .accessibilityHidden(true) // the headline already says the direction
+                }
+
                 Text(model.headline)
                     .font(.system(.largeTitle, design: .rounded, weight: .heavy))
                     .foregroundStyle(foreground)
@@ -127,6 +202,17 @@ public struct GuidanceView: View {
                         .foregroundStyle(foreground.opacity(0.8))
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 24)
+                }
+
+                if let caution = model.cautionLine, !model.isWarning {
+                    Label(caution, systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(.title2, design: .rounded, weight: .bold))
+                        .foregroundStyle(.black)
+                        .padding(.vertical, 12)
+                        .padding(.horizontal, 20)
+                        .background(Color.orange, in: RoundedRectangle(cornerRadius: 16))
+                        .padding(.horizontal, 24)
+                        .accessibilityAddTraits(.updatesFrequently)
                 }
 
                 Spacer(minLength: 0)
@@ -155,7 +241,19 @@ public struct GuidanceView: View {
 
     private var goalField: some View {
         HStack(spacing: 12) {
-            TextField("Goal, e.g. start", text: $goalDraft)
+            if model.canListen {
+                Button(action: model.listenForGoal) {
+                    Image(systemName: model.isListening ? "waveform" : "mic.fill")
+                        .font(.system(.title, weight: .bold))
+                        .frame(width: 60, height: 60)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(model.isListening ? .red : .blue)
+                .disabled(model.isListening)
+                .accessibilityLabel(model.isListening ? "Listening" : "Say the goal")
+                .accessibilityHint("Say what to find, for example start button")
+            }
+            TextField(model.listenResult ?? "Goal, e.g. start", text: $goalDraft)
                 .font(.system(.title3, design: .rounded))
                 .textFieldStyle(.roundedBorder)
                 .submitLabel(.done)
