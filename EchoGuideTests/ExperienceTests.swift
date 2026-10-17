@@ -681,3 +681,39 @@ struct StubListener: GoalListening {
         #expect(WAVEncoder.pcm16Mono(pcm: pcm, sampleRate: 16_000) == WAVEncoder.pcm16Mono(floats, sampleRate: 16_000))
     }
 }
+
+// MARK: - Screen overlay geometry
+
+@Suite struct HUDGeometryTests {
+    @Test func portraitFeedFillsPhoneHeightAndCropsSides() {
+        // 9:16 image on a 390x844 view: height-limited? 844/1 = 844 vs 390/0.5625 = 693 -> scale 844, width 474, cropped 42 px each side.
+        let t = HUDGeometry.transform(viewSize: CGSize(width: 390, height: 844), imageAspect: 9.0 / 16.0)
+        #expect(abs(t.scale - 844) < 0.01)
+        #expect(abs(t.offsetY) < 0.01)
+        #expect(t.offsetX < 0) // image wider than view: sides cropped
+        #expect(abs(t.offsetX - (390 - 0.5625 * 844) / 2) < 0.01)
+        // Image centre lands on view centre.
+        let c = HUDGeometry.point(.center, viewSize: CGSize(width: 390, height: 844), imageAspect: 9.0 / 16.0)
+        #expect(abs(c.x - 195) < 0.01)
+        #expect(abs(c.y - 422) < 0.01)
+    }
+
+    @Test func squareViewCropsTopAndBottomOfPortraitImage() {
+        let size = CGSize(width: 400, height: 400)
+        let t = HUDGeometry.transform(viewSize: size, imageAspect: 3.0 / 4.0)
+        // Width-limited: scale so image width (0.75) covers 400 -> 533.3; image height 533 > 400, cropped top and bottom.
+        #expect(abs(t.scale - 400 / 0.75) < 0.01)
+        #expect(abs(t.offsetX) < 0.01)
+        #expect(t.offsetY < 0)
+        let r = HUDGeometry.rect(ImageRect(x: 0, y: 0, width: 1, height: 1), viewSize: size, imageAspect: 3.0 / 4.0)
+        #expect(abs(r.width - 400) < 0.01)
+        #expect(abs(r.height - 533.33) < 0.1)
+    }
+
+    @Test func hudFrameHelpers() {
+        let f = HUDFrame(detections: [det("cup", x: 0.5, y: 0.5), det("text", x: 0.2, y: 0.2, kind: .text, text: "A"), tip(x: 0.1, y: 0.1)], timestamp: 1, inferenceMs: 9)
+        #expect(f.objects == 1)
+        #expect(f.fingertip?.kind == .fingertip)
+        #expect(HUDGeometry.transform(viewSize: .zero, imageAspect: 1).scale == 1)
+    }
+}

@@ -33,6 +33,13 @@ final class AppRuntime {
 
     private(set) var mode: AgentMode = .explore
     private(set) var caption = ""
+    /// The last few sentences spoken, newest last, for the on-screen ticker.
+    private(set) var captions: [String] = []
+    /// What the phone perceives right now, for the overlay (about 15 Hz).
+    private(set) var hud = HUDFrame()
+    private var lastHUDAt: TimeInterval = -.infinity
+    /// Width / height of the upright camera image the overlay maps onto.
+    var imageAspect: CGFloat { hasLiDAR ? 3.0 / 4.0 : 9.0 / 16.0 }
     private(set) var started = false
     private(set) var hasLiDAR = false
     private(set) var hasModel = false
@@ -89,7 +96,7 @@ final class AppRuntime {
         let speech: SpeechSynthesizing? = config.kokoroURL.map { KokoroSpeechProvider(baseURL: $0) }
         let trials = self.trials
         let audio = ObservedAudio(SpatialAudioEngine(speech: speech)) { [weak self] text in
-            Task { @MainActor in self?.caption = text }
+            Task { @MainActor in self?.noteCaption(text) }
             Task { await trials.noteSpoken() }
         }
         let haptics = ObservedHaptics(SpatialHapticEngine()) { Task { await trials.noteHaptic() } }
@@ -118,9 +125,10 @@ final class AppRuntime {
 
         // Pipeline: frame -> detections -> fence -> agent (and automation in Find).
         let fence = (config.fence ?? FenceConfig()).spatialFence
-        let pipeline = PerceptionPipeline(vision: vision) { result, _ in
+        let pipeline = PerceptionPipeline(vision: vision) { [weak self] result, _ in
             // Depth is sampled per zone, so two hazards at different distances are judged separately.
             let event = await fence.evaluate(result, depth: lidar)
+            Task { @MainActor in self?.publishHUD(result, fence: event) }
             if await agent.ingest(result, fence: event) {
                 await automation.ingest(result, fence: event)
             }
@@ -165,6 +173,21 @@ final class AppRuntime {
         lidar?.stop()
         camera?.stop()
         await automation?.stop()
+    }
+
+    // MARK: - Screen
+
+    private func noteCaption(_ text: String) {
+        caption = text
+        captions.append(text)
+        if captions.count > 4 { captions.removeFirst(captions.count - 4) }
+    }
+
+    /// Throttled to ~15 Hz: the screen does not need every inferred frame.
+    private func publishHUD(_ result: VisionFrameResult, fence: FenceEvent?) {
+        guard result.timestamp - lastHUDAt >= 0.066 || fence != nil else { return }
+        lastHUDAt = result.timestamp
+        hud = HUDFrame(detections: result.detections, fence: fence, timestamp: result.timestamp, inferenceMs: result.inferenceMs)
     }
 
     // MARK: - User actions

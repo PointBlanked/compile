@@ -159,6 +159,102 @@ public final class GuidanceModel {
     }
 }
 
+/// Compact Find-mode panel for the bottom of a camera screen: the step in
+/// huge type, the arrow, the dwell ring while holding, the caution banner,
+/// and a one-row goal entry with the mic. Same model as GuidanceView.
+public struct GuidancePanel: View {
+    @State private var model: GuidanceModel
+    @State private var goalDraft = ""
+    public var dwellSeconds: TimeInterval
+
+    public init(model: GuidanceModel, dwellSeconds: TimeInterval = 0.8) {
+        _model = State(initialValue: model)
+        self.dwellSeconds = dwellSeconds
+    }
+
+    private var accent: Color {
+        if model.isWarning { return .red }
+        if model.isOnTarget || model.isCompleted { return .green }
+        return .yellow
+    }
+
+    public var body: some View {
+        VStack(spacing: 10) {
+            if let caution = model.cautionLine, !model.isWarning {
+                Label(caution, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(.headline, design: .rounded, weight: .bold))
+                    .foregroundStyle(.black)
+                    .padding(.vertical, 8).padding(.horizontal, 14)
+                    .background(Color.orange, in: Capsule())
+            }
+
+            HStack(spacing: 14) {
+                if model.isOnTarget {
+                    DwellRing(active: true, duration: dwellSeconds).frame(width: 64, height: 64)
+                } else if let arrow = model.arrowSymbol {
+                    Image(systemName: arrow)
+                        .font(.system(size: 52, weight: .black))
+                        .foregroundStyle(accent)
+                        .frame(width: 64, height: 64)
+                        .accessibilityHidden(true)
+                } else if model.isCompleted {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 52, weight: .black))
+                        .foregroundStyle(.green)
+                        .frame(width: 64, height: 64)
+                        .accessibilityHidden(true)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(model.headline)
+                        .font(.system(.title, design: .rounded, weight: .heavy))
+                        .foregroundStyle(accent)
+                        .minimumScaleFactor(0.6)
+                        .lineLimit(2)
+                    if let detail = model.detail {
+                        Text(detail)
+                            .font(.system(.subheadline, design: .rounded, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.8))
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(model.headline)
+            .accessibilityValue(model.detail ?? "")
+
+            HStack(spacing: 10) {
+                if model.canListen {
+                    Button(action: model.listenForGoal) {
+                        Image(systemName: model.isListening ? "waveform" : "mic.fill")
+                            .font(.system(.title2, weight: .bold))
+                            .frame(width: 52, height: 44)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(model.isListening ? .red : .blue)
+                    .disabled(model.isListening)
+                    .accessibilityLabel(model.isListening ? "Listening" : "Say the goal")
+                }
+                TextField(model.listenResult ?? "What to find, e.g. start", text: $goalDraft)
+                    .font(.system(.body, design: .rounded))
+                    .textFieldStyle(.roundedBorder)
+                    .submitLabel(.done)
+                    .onSubmit { model.setGoal(goalDraft) }
+                    .accessibilityLabel("Goal")
+                if model.goal != nil {
+                    Button("Clear") { goalDraft = ""; model.setGoal(nil) }
+                        .font(.system(.body, design: .rounded, weight: .semibold))
+                        .foregroundStyle(.yellow)
+                }
+            }
+        }
+        .padding(14)
+        .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 20))
+        .overlay(RoundedRectangle(cornerRadius: 20).stroke(accent.opacity(0.6), lineWidth: 2))
+        .animation(.easeInOut(duration: 0.2), value: model.isWarning)
+        .onAppear { goalDraft = model.goal ?? "" }
+    }
+}
+
 public struct GuidanceView: View {
     @State private var model: GuidanceModel
     /// Set to show the goal field; a helper types "start" or "microwave".
